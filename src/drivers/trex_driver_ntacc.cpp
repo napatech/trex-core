@@ -33,6 +33,7 @@ std::string& get_ntacc_so_string(void) {
 
 CTRexExtendedDriverBaseNtAcc::CTRexExtendedDriverBaseNtAcc(){
     m_cap = TREX_DRV_CAP_DROP_Q | TREX_DRV_CAP_DROP_PKTS_IF_LNK_DOWN ;
+    m_cap |= TREX_DRV_DEFAULT_ASTF_MULTI_CORE;
     TAILQ_INIT(&lh_fid);
     // The current rte_flow.h is not C++ includable so rte_flow wrappers
     // have been made in libntacc
@@ -60,11 +61,7 @@ int CTRexExtendedDriverBaseNtAcc::get_min_sample_rate(void){
 }
 
 void CTRexExtendedDriverBaseNtAcc::get_dpdk_drv_params(CTrexDpdkParams &p) {
-    p.rx_data_q_num = 1;
-    p.rx_drop_q_num = 1;
-    p.rx_desc_num_data_q = RX_DESC_NUM_DATA_Q;
-    p.rx_desc_num_drop_q = RX_DESC_NUM_DROP_Q;
-    p.tx_desc_num = TX_DESC_NUM;
+    CTRexExtendedDriverBase::get_dpdk_drv_params(p);
     p.rx_mbuf_type = MBUF_9k;
 }
 void CTRexExtendedDriverBaseNtAcc::update_configuration(port_cfg_t * cfg){
