@@ -375,6 +375,9 @@ static uint16_t eth_ntacc_rx(void *queue,
       return 0;
 
     for (i = 0; i < nb_pkts; i++) {
+      if (i < nb_pkts - 1)
+        rte_prefetch0(bufs[i+1]);
+
       mbuf = bufs[i];
       rte_mbuf_refcnt_set(mbuf, 1);
       rte_pktmbuf_reset(mbuf);
@@ -406,7 +409,7 @@ static uint16_t eth_ntacc_rx(void *queue,
       if (data_len <= mbuf_len) {
         /* Packet will fit in the mbuf, go ahead and copy */
         mbuf->pkt_len = mbuf->data_len = data_len;
-				rte_memcpy((u_char *)mbuf->buf_addr + mbuf->data_off, (uint8_t *)dyn3 + dyn3->descrLength, mbuf->data_len);
+				rte_memcpy((u_char *)mbuf->buf_addr + mbuf->data_off, (uint8_t *)dyn3 + dyn3->descrLength, data_len);
 #ifdef COPY_OFFSET0
         mbuf->data_off += dyn3->offset0;
 #endif
@@ -874,6 +877,11 @@ static int eth_dev_start(struct rte_eth_dev *dev)
     }
   }
 
+  /* Create hash mode filters */
+  if (CreateHashModeHash(&internals->rss_conf, internals, NULL, 61) != 0) {
+    return -ENOMEM;
+  }
+
 #ifndef DO_NOT_CREATE_DEFAULT_FILTER
   _dev_flow_isolate(dev, 0, &error);
 #endif
@@ -975,14 +983,6 @@ static int eth_dev_configure(struct rte_eth_dev *dev __rte_unused)
       internals->rss_conf.rss_key_len = 0;
     }
     internals->rss_conf.rss_hf = conf->rss_hf;
-
-    /* Update hash mode filters */
-    rte_spinlock_lock(&internals->lock);
-    FlushHash(internals);
-    rte_spinlock_unlock(&internals->lock);
-    if (CreateHashModeHash(&internals->rss_conf, internals, NULL, 61) != 0) {
-      return -ENOMEM;
-    }
   }
   else {
     internals->rss_conf.rss_hf = 0;
