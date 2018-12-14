@@ -194,18 +194,6 @@ static uint32_t _log_out_of_memory_errors(const char *func)
   return ENOMEM;
 }
 
-#ifdef RTE_CONTIGUOUS_MEMORY_BATCHING
-static void _seg_release_cb(struct rte_mbuf *mbuf)
-{
-	struct batch_ctrl *batchCtl = (struct batch_ctrl *)((u_char *)mbuf->userdata);
-	struct ntacc_rx_queue *rx_q = batchCtl->queue;
-
-  (*_NT_NetRxRelease)(rx_q->pNetRx, batchCtl->pSeg);
-
-	/* swap poniter back */
-	mbuf->buf_addr = batchCtl->orig_buf_addr;
-}
-#endif
 
 
 static void _write_to_file(int fd, const char *buffer)
@@ -275,441 +263,276 @@ int DoNtpl(const char *ntplStr, uint32_t *pNtplID, struct pmd_internals *interna
   return 0;
 }
 
-static uint16_t eth_ntacc_rx(void *queue,
-                             struct rte_mbuf **bufs,
-                             uint16_t nb_pkts)
+static int eth_ntacc_rx_jumbo(struct rte_mempool *mb_pool,
+                              struct rte_mbuf *mbuf,
+                              const u_char *data,
+                              uint16_t data_len)
 {
-  struct rte_mbuf *mbuf;
-  struct ntacc_rx_queue *rx_q = queue;
-#ifdef USE_SW_STAT
-  uint32_t bytes = 0;
-#endif
-  uint16_t num_rx = 0;
+  struct rte_mbuf *m = mbuf;
 
-  if (unlikely(rx_q->pNetRx == NULL || nb_pkts == 0))
-    return 0;
+  /* Copy the first segment. */
+  uint16_t len = rte_pktmbuf_tailroom(mbuf);
 
-  // Do we have any segment
-  if (rx_q->pSeg == NULL) {
-    int status = (*_NT_NetRxGet)(rx_q->pNetRx, &rx_q->pSeg, 0);
-    if (status != NT_SUCCESS) {
-      if (rx_q->pSeg != NULL) {
-        (*_NT_NetRxRelease)(rx_q->pNetRx, rx_q->pSeg);
-        rx_q->pSeg = NULL;
-      }
-      return 0;
-    }
+  rte_memcpy(rte_pktmbuf_append(mbuf, len), data, len);
+  data_len -= len;
+  data += len;
 
-    if (likely(NT_NET_GET_SEGMENT_LENGTH(rx_q->pSeg))) {
-      _nt_net_build_pkt_netbuf(rx_q->pSeg, &rx_q->pkt);
+  while (data_len > 0) {
+    /* Allocate next mbuf and point to that. */
+    m->next = rte_pktmbuf_alloc(mb_pool);
+
+    if (unlikely(!m->next))
+      return -1;
+
+    m = m->next;
+
+    /* Headroom is not needed in chained mbufs. */
+    rte_pktmbuf_prepend(m, rte_pktmbuf_headroom(m));
+    m->pkt_len = 0;
+    m->data_len = 0;
+
+    /* Copy next segment. */
+    len = RTE_MIN(rte_pktmbuf_tailroom(m), data_len);
+    rte_memcpy(rte_pktmbuf_append(m, len), data, len);
+
+    mbuf->nb_segs++;
+    data_len -= len;
+    data += len;
+  }
+  return mbuf->nb_segs;
+}
+
+static __rte_always_inline uint16_t eth_ntacc_convert_pkt_to_mbuf(NtDyn3Descr_t *dyn3,
+  struct rte_mbuf *mbuf,
+  struct ntacc_rx_queue *rx_q)
+{
+  rte_pktmbuf_reset(mbuf);
+  rte_mbuf_refcnt_set(mbuf, 1);
+
+  switch (dyn3->descrLength)
+  {
+  case 22:
+    // We do have a color value defined
+    mbuf->hash.fdir.hi = ((dyn3->color_hi << 14) & 0xFFFFC000) | dyn3->color_lo;
+    mbuf->ol_flags |= PKT_RX_FDIR_ID | PKT_RX_FDIR;
+    break;
+  case 24:
+    // We do have a colormask set for protocol lookup
+    mbuf->packet_type = ((dyn3->color_hi << 14) & 0xFFFFC000) | dyn3->color_lo;
+    if (mbuf->packet_type != 0) {
+      mbuf->hash.fdir.lo = dyn3->offset0;
+      mbuf->hash.fdir.hi = dyn3->offset1;
+      mbuf->ol_flags |= PKT_RX_FDIR_FLX | PKT_RX_FDIR;
     }
-    else {
-      (*_NT_NetRxRelease)(rx_q->pNetRx, rx_q->pSeg);
-      rx_q->pSeg = NULL;
-      return 0;
-    }
+    break;
+  case 26:
+    // We do have a hash value defined
+    mbuf->hash.rss = dyn3->color_hi;
+    mbuf->ol_flags |= PKT_RX_RSS_HASH;
+    break;
   }
 
-#ifdef RTE_CONTIGUOUS_MEMORY_BATCHING
-  if (rx_q->cmbatch) {
-    struct batch_ctrl *batchCtl;
-    uint64_t countPackets;
+  if (rx_q->tsMultiplier) {
+    mbuf->timestamp = dyn3->timestamp * rx_q->tsMultiplier;
+    mbuf->ol_flags |= PKT_RX_TIMESTAMP;
+  }
+  mbuf->port = rx_q->in_port + (dyn3->rxPort - rx_q->local_port);
 
-    if (unlikely(rte_mempool_get_bulk(rx_q->mb_pool, (void **)bufs, 1) != 0)) {
+  const uint16_t data_len = (uint16_t)(dyn3->capLength - dyn3->descrLength - 4);
+  if (likely(data_len <= rx_q->buf_size)) {
+    /* Packet will fit in the mbuf, go ahead and copy */
+    mbuf->pkt_len = mbuf->data_len = data_len;
+    rte_memcpy((u_char *)mbuf->buf_addr + RTE_PKTMBUF_HEADROOM, (uint8_t*)dyn3 + dyn3->descrLength, mbuf->data_len);
+#ifdef COPY_OFFSET0
+    mbuf->data_off = RTE_PKTMBUF_HEADROOM + dyn3->offset0;
+#endif
+  } else {
+    /* Try read jumbo frame into multi mbufs. */
+    if (unlikely(eth_ntacc_rx_jumbo(rx_q->mb_pool, mbuf, (uint8_t*)dyn3 + dyn3->descrLength, data_len) == -1))
       return 0;
+  }
+  return data_len + 4;
+}
+
+
+static __rte_always_inline void eth_ntacc_rx_get_ring(struct ntacc_rx_queue *rx_q)
+{
+  int status;
+  NtNetRx_t cmd;
+  cmd.cmd = NT_NETRX_READ_CMD_GET_RING_CONTROL;
+  if ((status = _NT_NetRxRead(rx_q->pNetRx, &cmd)) != NT_SUCCESS) {
+    if (status != NT_STATUS_TRYAGAIN) {
+      _log_nt_errors(status, "Failed to get ring control of the RX ring", __func__);
     }
+    return;
+  }
+  rte_memcpy(&rx_q->ringControl, &cmd.u.ringControl, sizeof(rx_q->ringControl));
+  rx_q->offR = *rx_q->ringControl.pRead;
+  rx_q->offW = *rx_q->ringControl.pWrite & rx_q->ringControl.mask;
+}
 
-    mbuf = bufs[0];
+static uint16_t eth_ntacc_rx(void *queue,
+  struct rte_mbuf **bufs,
+  const uint16_t nb_pkts)
+{
+  struct ntacc_rx_queue *rx_q = queue;
 
-    rte_mbuf_refcnt_set(mbuf, 1);
-    rte_pktmbuf_reset(mbuf);
+  if (unlikely(rx_q->pNetRx == NULL || nb_pkts == 0)) {
+    return 0;
+  }
 
-    batchCtl = (struct batch_ctrl *)((u_char *)mbuf->buf_addr + RTE_PKTMBUF_HEADROOM);
-    batchCtl->queue = queue;
-    batchCtl->pSeg = rx_q->pSeg;
+  if (unlikely(rx_q->ringControl.ring == NULL)) {
+    eth_ntacc_rx_get_ring(rx_q);
+    return 0;
+  }
 
-    /* Hand over release responsibility and ownership */
-    rx_q->pSeg = NULL;
+  uint64_t offR = rx_q->offR;
+  uint64_t offW = rx_q->offW;
 
-    mbuf->port = rx_q->in_port;
-    mbuf->ol_flags |= PKT_BATCH;
-    mbuf->cmbatch_release_cb = _seg_release_cb;
+  /* Check if we have packets */
+  if (unlikely(offR == offW)) {
+    rx_q->offW = *rx_q->ringControl.pWrite & rx_q->ringControl.mask;
+    return 0;
+  }
 
-    /* let userdata point to original mbuf address where batchCtl is placed */
-    mbuf->userdata = (void *)batchCtl;
+  /* Allocate buffers */
+  if (unlikely(rte_mempool_get_bulk(rx_q->mb_pool, (void **)bufs, nb_pkts) != 0)) {
+    return 0;
+  }
 
-    /* save buf_addr */
-    batchCtl->orig_buf_addr = mbuf->buf_addr;
+  uint16_t num_rx = 0;
+  uint32_t bytes = 0;
+  uint8_t *ring;
+  if (offR > rx_q->ringControl.size) {
+    ring = rx_q->ringControl.ring + (offR - rx_q->ringControl.size);
+  }
+  else {
+    ring = rx_q->ringControl.ring + offR;
+  }
 
-    NtDyn3Descr_t *hdr = (NtDyn3Descr_t*)batchCtl->pSeg->hHdr;
-    mbuf->buf_addr = (uint8_t *)batchCtl->pSeg->hHdr;
-    mbuf->data_off = 0;
+  while((offR != offW) && (num_rx < nb_pkts)) {
+    struct rte_mbuf *mbuf = bufs[num_rx];
 
-    mbuf->data_len = hdr->capLength;
-    mbuf->pkt_len = (uint32_t)batchCtl->pSeg->length;
+    NtDyn3Descr_t *dyn3 = (NtDyn3Descr_t*)(ring);
+    bytes += eth_ntacc_convert_pkt_to_mbuf(dyn3, mbuf, rx_q);
     num_rx++;
 
-    /* do packet count */
-    mbuf->batch_nb_packet = 0;
-    countPackets = 0;
-    do {
-      countPackets++;
-    } while (_nt_net_get_next_packet(batchCtl->pSeg, NT_NET_GET_SEGMENT_LENGTH(batchCtl->pSeg), &rx_q->pkt)>0);
-    mbuf->batch_nb_packet = countPackets;
-
-#ifdef USE_SW_STAT
-    rx_q->rx_pkts += mbuf->batch_nb_packet;
-    rx_q->rx_bytes += batchCtl->pSeg->length - mbuf->batch_nb_packet * hdr->descrLength;
-#endif
-    return num_rx;
-  }
-  else
-#endif
-  {
-    NtDyn3Descr_t *dyn3;
-    uint16_t i;
-    uint16_t mbuf_len;
-    uint16_t data_len;
-
-    if (rte_mempool_get_bulk(rx_q->mb_pool, (void **)bufs, nb_pkts) != 0)
-      return 0;
-
-    for (i = 0; i < nb_pkts; i++) {
-      if (i < nb_pkts - 1)
-        rte_prefetch0(bufs[i+1]);
-
-      mbuf = bufs[i];
-      rte_mbuf_refcnt_set(mbuf, 1);
-      rte_pktmbuf_reset(mbuf);
-
-      dyn3 = _NT_NET_GET_PKT_DESCR_PTR_DYN3(&rx_q->pkt);
-
-      if (dyn3->descrLength == 20) {
-        // We do have a hash value defined
-        mbuf->hash.rss = dyn3->color_hi;
-        mbuf->ol_flags |= PKT_RX_RSS_HASH;
-      }
-      else {
-        // We do have a color value defined
-        mbuf->hash.fdir.hi = ((dyn3->color_hi << 14) & 0xFFFFC000) | dyn3->color_lo;
-        mbuf->ol_flags |= PKT_RX_FDIR_ID | PKT_RX_FDIR;
-      }
-
-      if (rx_q->tsMultiplier) {
-        mbuf->timestamp = dyn3->timestamp * rx_q->tsMultiplier;
-        mbuf->ol_flags |= PKT_RX_TIMESTAMP;
-      }
-      mbuf->port = rx_q->in_port + (dyn3->rxPort - rx_q->local_port);
-
-      data_len = (uint16_t)(dyn3->capLength - dyn3->descrLength - 4);
-      mbuf_len = rte_pktmbuf_tailroom(mbuf);
-#ifdef USE_SW_STAT
-      bytes += data_len+4;
-#endif
-      if (data_len <= mbuf_len) {
-        /* Packet will fit in the mbuf, go ahead and copy */
-        mbuf->pkt_len = mbuf->data_len = data_len;
-				rte_memcpy((u_char *)mbuf->buf_addr + mbuf->data_off, (uint8_t *)dyn3 + dyn3->descrLength, data_len);
-#ifdef COPY_OFFSET0
-        mbuf->data_off += dyn3->offset0;
-#endif
-      } else {
-        /* Try read jumbo frame into multi mbufs. */
-        struct rte_mbuf *m;
-        const u_char *data;
-        uint16_t total_len = data_len;
-
-        mbuf->pkt_len = total_len;
-        mbuf->data_len = mbuf_len;
-        data = (u_char *)dyn3 + dyn3->descrLength;
-        rte_memcpy((u_char *)mbuf->buf_addr + mbuf->data_off, data, mbuf_len);
-        data_len -= mbuf_len;
-        data += mbuf_len;
-
-        m = mbuf;
-        while (data_len > 0) {
-          /* Allocate next mbuf and point to that. */
-          m->next = rte_pktmbuf_alloc(rx_q->mb_pool);
-          if (unlikely(!m->next))
-            return 0;
-
-          m = m->next;
-          /* Copy next segment. */
-          mbuf_len = RTE_MIN(rte_pktmbuf_tailroom(m), data_len);
-          rte_memcpy((u_char *)m->buf_addr + m->data_off, data, mbuf_len);
-
-          m->pkt_len = total_len;
-          m->data_len = mbuf_len;
-
-          mbuf->nb_segs++;
-          data_len -= mbuf_len;
-          data += mbuf_len;
-        }
-      }
-      num_rx++;
-
-      /* Get the next packet if any */
-      if (_nt_net_get_next_packet(rx_q->pSeg, NT_NET_GET_SEGMENT_LENGTH(rx_q->pSeg), &rx_q->pkt) == 0 ) {
-        (*_NT_NetRxRelease)(rx_q->pNetRx, rx_q->pSeg);
-        rx_q->pSeg = NULL;
-        break;
-      }
+    offR += dyn3->capLength;
+    ring += dyn3->capLength;
+    if (offR >= (2*rx_q->ringControl.size)) {
+      offR -= (2*rx_q->ringControl.size);
     }
-#ifdef USE_SW_STAT
-    rx_q->rx_pkts+=num_rx;
-    rx_q->rx_bytes+=bytes;
-#endif
-    if (num_rx < nb_pkts) {
-      rte_mempool_put_bulk(rx_q->mb_pool, (void * const *)(bufs + num_rx), nb_pkts-num_rx);
-    }
-    return num_rx;
   }
+  /* Refresh the HW pointer */
+  *rx_q->ringControl.pRead = offR;
+  rx_q->offR = offR;
+
+#ifdef USE_SW_STAT
+  rx_q->rx_pkts+=num_rx;
+  rx_q->rx_bytes+=bytes;
+#endif
+
+  if (unlikely(num_rx < nb_pkts)) {
+    rte_mempool_put_bulk(rx_q->mb_pool, (void * const *)(bufs + num_rx), nb_pkts-num_rx);
+  }
+  return num_rx;
 }
 
 /*
  * Callback to handle sending packets through a real NIC.
  */
-#if 0
 static uint16_t eth_ntacc_tx(void *queue,
                              struct rte_mbuf **bufs,
                              uint16_t nb_pkts)
 {
   unsigned i;
-  int ret;
   struct ntacc_tx_queue *tx_q = queue;
-  NtNetBuf_t hNetBufTx;
-
-  if (unlikely(tx_q == NULL || tx_q->pNetTx == NULL || nb_pkts == 0)) {
-    return 0;
-  }
-
-  for (i = 0; i < nb_pkts; i++) {
-    struct rte_mbuf *mbuf = bufs[i];
-    // Get a TX buffer for this packet
-    ret = (*_NT_NetTxGet)(tx_q->pNetTx, &hNetBufTx, tx_q->port, MAX(mbuf->data_len + 4, 64), NT_NETTX_PACKET_OPTION_L2, -1);
-    if(unlikely(ret != NT_SUCCESS)) {
-      char errorBuffer[NT_ERRBUF_SIZE]; // Error buffer
-      NT_ExplainError(ret, errorBuffer, NT_ERRBUF_SIZE);
-      PMD_NTACC_LOG(ERR, "Failed to get a tx buffer: %s\n", errorBuffer);
-#ifdef USE_SW_STAT
-      tx_q->err_pkts += (nb_pkts - i);
-#endif
-      return i;
-    }
-    NT_NET_SET_PKT_TXNOW(hNetBufTx, 1);
-    rte_memcpy(NT_NET_GET_PKT_L2_PTR(hNetBufTx), rte_pktmbuf_mtod(mbuf, u_char *), mbuf->data_len);
-
-    // Release the TX buffer and the packet will be transmitted
-    ret = (*_NT_NetTxRelease)(tx_q->pNetTx, hNetBufTx);
-    if(unlikely(ret != NT_SUCCESS)) {
-      char errorBuffer[NT_ERRBUF_SIZE]; // Error buffer
-      NT_ExplainError(ret, errorBuffer, NT_ERRBUF_SIZE);
-      PMD_NTACC_LOG(ERR, "Failed to tx a packet: %s\n", errorBuffer);
-#ifdef USE_SW_STAT
-      tx_q->err_pkts += (nb_pkts - i);
-#endif
-      return i;
-    }
-
-    rte_pktmbuf_free(bufs[i]);
-  }
-#ifdef USE_SW_STAT
-      tx_q->tx_pkts += i;
-#endif
-  return i;
-}
-#elif 0
-static uint16_t eth_ntacc_tx(void *queue,
-                             struct rte_mbuf **bufs,
-                             uint16_t nb_pkts)
-{
-  int status;
-  struct ntacc_tx_queue *tx_q = queue;
-  struct NtNetBuf_s *hNetBufTx;
-  struct NtNetBuf_s pktNetBuf;
-  uint32_t spaceLeftInSegment;
-  uint32_t tx_pkts;
-  uint32_t packetsInSegment;
-  struct rte_mbuf *mbuf;
-
-  if (unlikely(tx_q == NULL || tx_q->pNetTx == NULL || nb_pkts == 0)) {
-    return 0;
-  }
-
-  spaceLeftInSegment = 0;
-  packetsInSegment = 0;
-  tx_pkts = 0;
-  mbuf = bufs[tx_pkts];
-  while (tx_pkts < nb_pkts) {
-    for (;;) {
-      if (spaceLeftInSegment == 0) {
-        do {
-          // Get a TX segment of size SEGMENT_LENGTH
-          if((status = (*_NT_NetTxGet)(tx_q->pNetTx, &hNetBufTx, tx_q->port, SEGMENT_LENGTH, NT_NETTX_SEGMENT_OPTION_RAW, 1000)) != NT_SUCCESS) {
-            if(status != NT_STATUS_TIMEOUT) {
-              char errorBuffer[NT_ERRBUF_SIZE]; // Error buffer
-              NT_ExplainError(status, errorBuffer, NT_ERRBUF_SIZE);
-              PMD_NTACC_LOG(ERR, "Failed to get a tx segment: %s\n", errorBuffer);
-#ifdef USE_SW_STAT
-              tx_q->err_pkts += (nb_pkts - tx_pkts);
-#endif
-              return tx_pkts;
-            }
-          }
-        }
-        while (status == NT_STATUS_TIMEOUT);
-        spaceLeftInSegment = SEGMENT_LENGTH;
-        packetsInSegment = 0;
-        // Get a packet buffer pointer from the segment.
-        _nt_net_build_pkt_netbuf(hNetBufTx, &pktNetBuf);
-      }
-
-      // Build the packet
-      NT_NET_SET_PKT_CLEAR_DESCR_NT((&pktNetBuf));
-      NT_NET_SET_PKT_DESCR_TYPE_NT((&pktNetBuf));
-      NT_NET_SET_PKT_RECALC_L2_CRC((&pktNetBuf), 1);
-      NT_NET_SET_PKT_TXPORT((&pktNetBuf), tx_q->port);
-      NT_NET_UPDATE_PKT_L2_PTR((&pktNetBuf));
-      NT_NET_SET_PKT_CAP_LENGTH((&pktNetBuf), (uint16_t)mbuf->data_len + 4);
-      NT_NET_SET_PKT_WIRE_LENGTH((&pktNetBuf), (uint16_t)mbuf->data_len + 4);
-      NT_NET_SET_PKT_TXNOW((&pktNetBuf), 1);
-
-      rte_memcpy(NT_NET_GET_PKT_L2_PTR((&pktNetBuf)), rte_pktmbuf_mtod(mbuf, u_char *), mbuf->data_len);
-
-      // Release buffer
-      rte_pktmbuf_free(bufs[tx_pkts]);
-
-      // Packets in the segment
-      tx_pkts++;
-      packetsInSegment++;
-
-      // Move the pointer to next packet and get the length of the remining space in the segment
-      spaceLeftInSegment = _nt_net_get_next_packet(hNetBufTx, NT_NET_GET_SEGMENT_LENGTH(hNetBufTx), &pktNetBuf);
-
-      if (tx_pkts >= nb_pkts) {
-        // No more packet. Transmit now
-        break;
-      }
-
-      // Get the next packet size to next transmit.
-      mbuf = bufs[tx_pkts];
-
-      // Check if we have space for more packets including a 64 byte dummy packet.
-      if (spaceLeftInSegment < (mbuf->data_len + 4 + 2 * NT_DESCR_NT_LENGTH + 64)) {
-        // Check if we have space for excately one packet.
-        if(spaceLeftInSegment != (mbuf->data_len + 4 + NT_DESCR_NT_LENGTH)) {
-          // No more space in segment. Transmit now
-          break;
-        }
-      }
-    }
-
-    // Fill the segment with dummy packets
-    while (spaceLeftInSegment > 0) {
-      if (spaceLeftInSegment > 9000) {
-        // Create an 8K dummy packet
-        NT_NET_SET_PKT_CLEAR_DESCR_NT((&pktNetBuf));
-        NT_NET_SET_PKT_DESCR_TYPE_NT((&pktNetBuf));
-        NT_NET_SET_PKT_CAP_LENGTH((&pktNetBuf), 8196);
-        NT_NET_SET_PKT_WIRE_LENGTH((&pktNetBuf), 8196);
-        NT_NET_SET_PKT_TXIGNORE((&pktNetBuf), 1);
-        spaceLeftInSegment = _nt_net_get_next_packet(hNetBufTx, NT_NET_GET_SEGMENT_LENGTH(hNetBufTx), &pktNetBuf);
-      }
-      else {
-        // Create a dummy packet
-        NT_NET_SET_PKT_CLEAR_DESCR_NT((&pktNetBuf));
-        NT_NET_SET_PKT_DESCR_TYPE_NT((&pktNetBuf));
-        NT_NET_SET_PKT_CAP_LENGTH((&pktNetBuf), spaceLeftInSegment - NT_DESCR_NT_LENGTH);
-        NT_NET_SET_PKT_WIRE_LENGTH((&pktNetBuf), spaceLeftInSegment - NT_DESCR_NT_LENGTH);
-        NT_NET_SET_PKT_TXIGNORE((&pktNetBuf), 1);
-        spaceLeftInSegment = 0;
-      }
-    }
-
-    // Release the TX buffer and the segment will be transmitted
-    if((status = (*_NT_NetTxRelease)(tx_q->pNetTx, hNetBufTx)) != NT_SUCCESS) {
-      char errorBuffer[NT_ERRBUF_SIZE]; // Error buffer
-      NT_ExplainError(status, errorBuffer, NT_ERRBUF_SIZE);
-      PMD_NTACC_LOG(ERR, "Failed to get a tx segment: %s\n", errorBuffer);
-#ifdef USE_SW_STAT
-      tx_q->err_pkts += (nb_pkts - tx_pkts - packetsInSegment);
-#endif
-      return tx_pkts - packetsInSegment;
-    }
-    spaceLeftInSegment = 0;
-    packetsInSegment = 0;
-  }
-#ifdef USE_SW_STAT
-      tx_q->tx_pkts += tx_pkts;
-#endif
-  return tx_pkts;
-}
-#else
-static uint16_t eth_ntacc_tx(void *queue,
-                             struct rte_mbuf **bufs,
-                             uint16_t nb_pkts)
-{
-  unsigned i;
-  int ret;
-  struct ntacc_tx_queue *tx_q = queue;
-#ifdef USE_SW_STAT
   uint32_t bytes=0;
-#endif
-
   if (unlikely(tx_q == NULL || tx_q->pNetTx == NULL || nb_pkts == 0)) {
     return 0;
   }
+  uint64_t spaceLeft;
+  uint64_t offR, offW, off=0;
+  uint8_t *dst, *ring;
+  offR = *tx_q->ringControl.pRead;
+  offW = *tx_q->ringControl.pWrite;
+  ring =  tx_q->ringControl.ring + offW;
+  if (offW >= offR) {
+    spaceLeft = tx_q->ringControl.size - (offW - offR);
+  } else {
+    spaceLeft = tx_q->ringControl.size - ((offW+(2*tx_q->ringControl.size)) - offR);
+  }
+  if (offW >= tx_q->ringControl.size) {
+    ring -= tx_q->ringControl.size; // Rebase the dst pointer
+  }
 
   for (i = 0; i < nb_pkts; i++) {
-    uint16_t wLen;
+    dst = ring + off;
     struct rte_mbuf *mbuf = bufs[i];
-    struct NtNetTxFragment_s frag[10]; // Need fragments enough for a jumbo packet */
-    uint8_t fragCnt = 0;
-    frag[fragCnt].data = rte_pktmbuf_mtod(mbuf, u_char *);
-    frag[fragCnt++].size = mbuf->data_len;
-    wLen = mbuf->data_len + 4;
+    /* Detect packet size */
+    uint16_t sLen;
+    uint16_t wLen = mbuf->data_len + 4; // Make room for FCS
     if (unlikely(mbuf->nb_segs > 1)) {
       while (mbuf->next) {
         mbuf = mbuf->next;
-        frag[fragCnt].data = rte_pktmbuf_mtod(mbuf, u_char *);
-        frag[fragCnt++].size = mbuf->data_len;
         wLen += mbuf->data_len;
       }
+      // Reset the pointer
+      mbuf = bufs[i];
     }
     /* Check if packet needs padding or is too big to transmit */
     if (unlikely(wLen < tx_q->minTxPktSize)) {
-      frag[fragCnt].data = rte_pktmbuf_mtod(mbuf, u_char *);
-      frag[fragCnt++].size = tx_q->minTxPktSize - wLen;
+      wLen = tx_q->minTxPktSize; // Add padding
+      //TODO: There is a data leak issue here. If wLen is just extended
+      //the memory in the ring is not zero'ed and padding will contain
+      //data from previous packets. For performance reasons this has not been
+      //addressed, but the fix is to memset() the padding area.
     }
     if (unlikely(wLen > tx_q->maxTxPktSize)) {
       /* Packet is too big. Drop it as an error and continue */
-#ifdef USE_SW_STAT
       tx_q->err_pkts++;
-#endif
       rte_pktmbuf_free(bufs[i]);
       continue;
     }
-    ret = (*_NT_NetTxAddPacket)(tx_q->pNetTx, tx_q->port, frag, fragCnt, 0);
-    if (unlikely(ret != NT_SUCCESS)) {
-      /* unsent packets is not expected to be freed */
-#ifdef USE_SW_STAT
-      tx_q->err_pkts++;
-#endif
+    // 8B align wireLength and add 16B descriptor
+    sLen = ((wLen + 7) & ~7) + 16;
+    // Do we have space for this packet
+    if (likely(spaceLeft >= sLen)) {
+      // Add packet descriptor
+      *((uint64_t*)dst)=0;
+      *((uint64_t*)dst+1)=(0x0100000040100000LL | (uint64_t)wLen<<32 | sLen);
+      // Copy the packet to the destination
+      rte_memcpy(dst + 16, rte_pktmbuf_mtod(mbuf, u_char *), mbuf->data_len);
+      dst += (16 + mbuf->data_len);
+      if (unlikely(mbuf->nb_segs > 1)) {
+        while (mbuf->next) {
+          mbuf = mbuf->next;
+          rte_memcpy(dst, rte_pktmbuf_mtod(mbuf, u_char *), mbuf->data_len);
+          dst += mbuf->data_len;
+        }
+      }
+      off += sLen;
+      bytes += wLen;
+      spaceLeft -= sLen;
+      rte_pktmbuf_free(bufs[i]);
+    } else {
+      // We cannot place more packets
       break;
     }
-#ifdef USE_SW_STAT
-    bytes += wLen;
-#endif
-    rte_pktmbuf_free(bufs[i]);
   }
+  // Update the write offset
+  offW += off;
+  if (offW >= (2*tx_q->ringControl.size)) {
+    offW -= (2*tx_q->ringControl.size);
+  }
+  *tx_q->ringControl.pWrite = offW;
+
 #ifdef USE_SW_STAT
   tx_q->tx_pkts += i;
   tx_q->tx_bytes += bytes;
 #endif
-
   return i;
 }
-#endif
 
 static int create_stream_table(struct pmd_internals *internals)
 {
@@ -892,6 +715,7 @@ static int eth_dev_start(struct rte_eth_dev *dev)
         _log_nt_errors(status, "NT_NetRxOpen() failed", __func__);
         goto StartError;
       }
+      memset(&rx_q[queue].ringControl, 0, sizeof(rx_q[queue].ringControl));
       eth_rx_queue_start(dev, queue);
     }
   }
@@ -905,6 +729,15 @@ static int eth_dev_start(struct rte_eth_dev *dev)
         }
         PMD_NTACC_LOG(DEBUG, "NT_NetTxOpen() Not optimal hostbuffer found on a neighbour numa node\n");
       }
+      /* Get the ring control structure */
+      NtNetTx_t cmd;
+      cmd.cmd = NT_NETTX_READ_CMD_GET_RING_CONTROL;
+      cmd.u.ringControl.port = internals->port;
+      if ((status = _NT_NetTxRead(tx_q[queue].pNetTx, &cmd)) != NT_SUCCESS) {
+        _log_nt_errors(status, "Failed to get ring control of the TX ring.", __func__);
+        goto StartError;
+      }
+      rte_memcpy(&tx_q[queue].ringControl, &cmd.u.ringControl, sizeof(tx_q[queue].ringControl));
     }
     tx_q[queue].plock = &port_locks[tx_q[queue].port];
   }
@@ -942,6 +775,7 @@ static void eth_dev_stop(struct rte_eth_dev *dev)
           (void)(*_NT_NetRxClose)(rx_q[queue].pNetRx);
           rx_q[queue].pNetRx = NULL;
       }
+      memset(&rx_q[queue].ringControl, 0, sizeof(rx_q[queue].ringControl));
       eth_rx_queue_stop(dev, queue);
     }
   }
@@ -1161,8 +995,7 @@ static int eth_stats_get(struct rte_eth_dev *dev,
   for (queue = 0; queue < RTE_ETHDEV_QUEUE_STAT_CNTRS; queue++) {
     igb_stats->q_ipackets[queue] = pStatData->u.query_v2.data.stream.streamid[internals->rxq[queue].stream_id].forward.pkts;
     igb_stats->q_ibytes[queue] =  pStatData->u.query_v2.data.stream.streamid[internals->rxq[queue].stream_id].forward.octets;
-    igb_stats->q_errors[queue] = internals->txq[queue].err_pkts;
-
+    igb_stats->q_errors[queue] = pStatData->u.query_v2.data.stream.streamid[internals->rxq[queue].stream_id].drop.pkts;
   }
   rte_free(pStatData);
   return 0;
@@ -1225,6 +1058,9 @@ static void eth_dev_close(struct rte_eth_dev *dev)
     rte_free(internals->adapter);
   }
   rte_free(dev->data->dev_private);
+  dev->data->dev_private = NULL;
+  dev->data->mac_addrs = NULL;
+
   rte_eth_dev_release_port(dev);
 
   deviceCount--;

@@ -75,6 +75,9 @@ struct rte_flow {
 };
 
 struct ntacc_rx_queue {
+  uint64_t offW;
+  uint64_t offR;
+  struct NtNetRxHbRing_s ringControl;
   NtNetBuf_t             pSeg;    /* The current segment we are working with */
   NtNetStreamRx_t        pNetRx;
   struct rte_mempool    *mb_pool;
@@ -99,6 +102,7 @@ struct ntacc_rx_queue {
 } __rte_cache_aligned;
 
 struct ntacc_tx_queue {
+  struct NtNetTxHbRing_s ringControl;
   NtNetStreamTx_t        pNetTx;
 #ifdef USE_SW_STAT
   volatile uint64_t      tx_pkts;
