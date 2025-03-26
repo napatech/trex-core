@@ -31,7 +31,7 @@
 #endif
 
 #include <rte_common.h>
-#include <rte_dev.h>
+#include <dev_driver.h>
 #include <rte_errno.h>
 #include <ethdev_driver.h>
 #include <ethdev_pci.h>
@@ -292,6 +292,7 @@ mlx4_dev_start(struct rte_eth_dev *dev)
 {
 	struct mlx4_priv *priv = dev->data->dev_private;
 	struct rte_flow_error error;
+	uint16_t i;
 	int ret;
 
 	if (priv->started)
@@ -327,6 +328,12 @@ mlx4_dev_start(struct rte_eth_dev *dev)
 	dev->rx_pkt_burst = mlx4_rx_burst;
 	/* Enable datapath on secondary process. */
 	mlx4_mp_req_start_rxtx(dev);
+
+	for (i = 0; i < dev->data->nb_rx_queues; i++)
+		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
+	for (i = 0; i < dev->data->nb_tx_queues; i++)
+		dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
+
 	return 0;
 err:
 	mlx4_dev_stop(dev);
@@ -345,6 +352,7 @@ static int
 mlx4_dev_stop(struct rte_eth_dev *dev)
 {
 	struct mlx4_priv *priv = dev->data->dev_private;
+	uint16_t i;
 
 	if (!priv->started)
 		return 0;
@@ -358,6 +366,11 @@ mlx4_dev_stop(struct rte_eth_dev *dev)
 	mlx4_flow_sync(priv, NULL);
 	mlx4_rxq_intr_disable(priv);
 	mlx4_rss_deinit(priv);
+
+	for (i = 0; i < dev->data->nb_rx_queues; i++)
+		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
+	for (i = 0; i < dev->data->nb_tx_queues; i++)
+		dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
 
 	return 0;
 }
@@ -804,10 +817,7 @@ mlx4_pci_probe(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 		DEBUG("checking device \"%s\"", list[i]->name);
 		if (mlx4_ibv_device_to_pci_addr(list[i], &pci_addr))
 			continue;
-		if ((pci_dev->addr.domain != pci_addr.domain) ||
-		    (pci_dev->addr.bus != pci_addr.bus) ||
-		    (pci_dev->addr.devid != pci_addr.devid) ||
-		    (pci_dev->addr.function != pci_addr.function))
+		if (rte_pci_addr_cmp(&pci_dev->addr, &pci_addr) != 0)
 			continue;
 		vf = (pci_dev->id.device_id ==
 		      PCI_DEVICE_ID_MELLANOX_CONNECTX3VF);
@@ -877,6 +887,8 @@ mlx4_pci_probe(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 		snprintf(name, sizeof(name), "%s port %u",
 			 mlx4_glue->get_device_name(ibv_dev), port);
 		if (rte_eal_process_type() == RTE_PROC_SECONDARY) {
+			int fd;
+
 			eth_dev = rte_eth_dev_attach_secondary(name);
 			if (eth_dev == NULL) {
 				ERROR("can not attach rte ethdev");
@@ -899,13 +911,14 @@ mlx4_pci_probe(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 			if (err)
 				goto err_secondary;
 			/* Receive command fd from primary process. */
-			err = mlx4_mp_req_verbs_cmd_fd(eth_dev);
-			if (err < 0) {
+			fd = mlx4_mp_req_verbs_cmd_fd(eth_dev);
+			if (fd < 0) {
 				err = rte_errno;
 				goto err_secondary;
 			}
 			/* Remap UAR for Tx queues. */
-			err = mlx4_tx_uar_init_secondary(eth_dev, err);
+			err = mlx4_tx_uar_init_secondary(eth_dev, fd);
+			close(fd);
 			if (err) {
 				err = rte_errno;
 				goto err_secondary;

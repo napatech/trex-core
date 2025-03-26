@@ -121,16 +121,12 @@ int rte_intr_callback_unregister(const struct rte_intr_handle *intr_handle,
  *  - On success, return the number of callback entities marked for remove.
  *  - On failure, a negative value.
  */
-__rte_experimental
 int
 rte_intr_callback_unregister_pending(const struct rte_intr_handle *intr_handle,
 				rte_intr_callback_fn cb_fn, void *cb_arg,
 				rte_intr_unregister_callback_fn ucb_fn);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * Loop until rte_intr_callback_unregister() succeeds.
  * After a call to this function,
  * the callback provided by the specified interrupt handle is unregistered.
@@ -147,7 +143,6 @@ rte_intr_callback_unregister_pending(const struct rte_intr_handle *intr_handle,
  *  - On success, return the number of callback entities removed.
  *  - On failure, a negative value.
  */
-__rte_experimental
 int
 rte_intr_callback_unregister_sync(const struct rte_intr_handle *intr_handle,
 				rte_intr_callback_fn cb, void *cb_arg);
@@ -177,9 +172,6 @@ int rte_intr_enable(const struct rte_intr_handle *intr_handle);
 int rte_intr_disable(const struct rte_intr_handle *intr_handle);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * It acknowledges an interrupt raised for the specified handle.
  *
  * This function should be called at the end of each interrupt handler either
@@ -193,27 +185,18 @@ int rte_intr_disable(const struct rte_intr_handle *intr_handle);
  *  - On success, zero.
  *  - On failure, a negative value.
  */
-__rte_experimental
 int rte_intr_ack(const struct rte_intr_handle *intr_handle);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * Check if currently executing in interrupt context
  *
  * @return
  *  - non zero in case of interrupt context
  *  - zero in case of process context
  */
-__rte_experimental
-int
-rte_thread_is_intr(void);
+int rte_thread_is_intr(void);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * It allocates memory for interrupt instance. API takes flag as an argument
  * which define from where memory should be allocated i.e. using DPDK memory
  * management library APIs or normal heap allocation.
@@ -231,30 +214,21 @@ rte_thread_is_intr(void);
  *  - On success, address of interrupt handle.
  *  - On failure, NULL.
  */
-__rte_experimental
 struct rte_intr_handle *
 rte_intr_instance_alloc(uint32_t flags);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
- * This API is used to free the memory allocated for interrupt handle
- * resources.
+ * Free the memory allocated for interrupt handle resources.
  *
  * @param intr_handle
- *  Interrupt handle address.
- *
+ *  Interrupt handle allocated with rte_intr_instance_alloc().
+ *  If intr_handle is NULL, no operation is performed.
  */
-__rte_experimental
 void
 rte_intr_instance_free(struct rte_intr_handle *intr_handle);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
- * This API is used to set the fd field of interrupt handle with user provided
+ * Set the fd field of interrupt handle with user provided
  * file descriptor.
  *
  * @param intr_handle
@@ -266,14 +240,10 @@ rte_intr_instance_free(struct rte_intr_handle *intr_handle);
  *  - On success, zero.
  *  - On failure, a negative value and rte_errno is set.
  */
-__rte_experimental
 int
 rte_intr_fd_set(struct rte_intr_handle *intr_handle, int fd);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * Returns the fd field of the given interrupt handle instance.
  *
  * @param intr_handle
@@ -283,15 +253,11 @@ rte_intr_fd_set(struct rte_intr_handle *intr_handle, int fd);
  *  - On success, fd field.
  *  - On failure, a negative value.
  */
-__rte_experimental
 int
 rte_intr_fd_get(const struct rte_intr_handle *intr_handle);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
- * This API is used to set the type field of interrupt handle with user provided
+ * Set the type field of interrupt handle with user provided
  * interrupt type.
  *
  * @param intr_handle
@@ -303,15 +269,11 @@ rte_intr_fd_get(const struct rte_intr_handle *intr_handle);
  *  - On success, zero.
  *  - On failure, a negative value and rte_errno is set.
  */
-__rte_experimental
 int
 rte_intr_type_set(struct rte_intr_handle *intr_handle,
 		  enum rte_intr_handle_type type);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * Returns the type field of the given interrupt handle instance.
  *
  * @param intr_handle
@@ -321,7 +283,6 @@ rte_intr_type_set(struct rte_intr_handle *intr_handle,
  *  - On success, interrupt type
  *  - On failure, RTE_INTR_HANDLE_UNKNOWN.
  */
-__rte_experimental
 enum rte_intr_handle_type
 rte_intr_type_get(const struct rte_intr_handle *intr_handle);
 
@@ -452,7 +413,7 @@ rte_intr_instance_dup(const struct rte_intr_handle *src);
 
 /**
  * @internal
- * This API is used to set the device fd field of interrupt handle with user
+ * Set the device fd field of interrupt handle with user
  * provided dev fd. Device fd corresponds to VFIO device fd or UIO config fd.
  *
  * @param intr_handle
@@ -485,7 +446,7 @@ rte_intr_dev_fd_get(const struct rte_intr_handle *intr_handle);
 
 /**
  * @internal
- * This API is used to set the max intr field of interrupt handle with user
+ * Set the max intr field of interrupt handle with user
  * provided max intr value.
  *
  * @param intr_handle
@@ -518,7 +479,7 @@ rte_intr_max_intr_get(const struct rte_intr_handle *intr_handle);
 
 /**
  * @internal
- * This API is used to set the number of event fd field of interrupt handle
+ * Set the number of event fd field of interrupt handle
  * with user provided available event file descriptor value.
  *
  * @param intr_handle
@@ -572,7 +533,7 @@ rte_intr_nb_intr_get(const struct rte_intr_handle *intr_handle);
 
 /**
  * @internal
- * This API is used to set the event fd counter size field of interrupt handle
+ * Set the event fd counter size field of interrupt handle
  * with user provided efd counter size.
  *
  * @param intr_handle
@@ -607,7 +568,7 @@ rte_intr_efd_counter_size_get(const struct rte_intr_handle *intr_handle);
 
 /**
  * @internal
- * This API is used to set the event fd array index with the given fd.
+ * Set the event fd array index with the given fd.
  *
  * @param intr_handle
  *  pointer to the interrupt handle.
@@ -643,7 +604,7 @@ rte_intr_efds_index_get(const struct rte_intr_handle *intr_handle, int index);
 
 /**
  * @internal
- * This API is used to set the epoll event object array index with the given
+ * Set the epoll event object array index with the given
  * elist instance.
  *
  * @param intr_handle
@@ -779,7 +740,7 @@ rte_intr_event_list_update(struct rte_intr_handle *intr_handle, int size);
 
 /**
  * @internal
- * This API returns the Windows handle of the given interrupt instance.
+ * Returns the Windows handle of the given interrupt instance.
  *
  * @param intr_handle
  *  pointer to the interrupt handle.
@@ -794,7 +755,7 @@ rte_intr_instance_windows_handle_get(struct rte_intr_handle *intr_handle);
 
 /**
  * @internal
- * This API set the Windows handle for the given interrupt instance.
+ * Set the Windows handle for the given interrupt instance.
  *
  * @param intr_handle
  *  pointer to the interrupt handle.

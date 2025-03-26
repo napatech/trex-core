@@ -72,7 +72,6 @@ LIBABIVER := 1
 #
 SRCS-$(CONFIG_RTE_LIBRTE_PMD_NTACC) += rte_eth_ntacc.c
 SRCS-$(CONFIG_RTE_LIBRTE_PMD_NTACC) += filter_ntacc.c
-SRCS-$(CONFIG_RTE_LIBRTE_PMD_NTACC) += nt_compat.c
 
 #
 # Export include files

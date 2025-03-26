@@ -2,6 +2,7 @@
  * Copyright(c) 2010-2018 Intel Corporation
  */
 
+#include <errno.h>
 #include <unistd.h>
 #include <string.h>
 
@@ -10,6 +11,7 @@
 #include <rte_vfio.h>
 #include <rte_eal.h>
 
+#include "eal_private.h"
 #include "eal_vfio.h"
 
 /**
@@ -32,7 +34,7 @@ vfio_mp_primary(const struct rte_mp_msg *msg, const void *peer)
 		(const struct vfio_mp_param *)msg->param;
 
 	if (msg->len_param != sizeof(*m)) {
-		RTE_LOG(ERR, EAL, "vfio received invalid message!\n");
+		EAL_LOG(ERR, "vfio received invalid message!");
 		return -1;
 	}
 
@@ -94,7 +96,7 @@ vfio_mp_primary(const struct rte_mp_msg *msg, const void *peer)
 		break;
 	}
 	default:
-		RTE_LOG(ERR, EAL, "vfio received invalid message!\n");
+		EAL_LOG(ERR, "vfio received invalid message!");
 		return -1;
 	}
 

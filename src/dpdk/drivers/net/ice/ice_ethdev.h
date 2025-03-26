@@ -5,14 +5,17 @@
 #ifndef _ICE_ETHDEV_H_
 #define _ICE_ETHDEV_H_
 
+#include <rte_compat.h>
 #include <rte_kvargs.h>
 #include <rte_time.h>
 
 #include <ethdev_driver.h>
+#include <rte_tm_driver.h>
 
 #include "base/ice_common.h"
 #include "base/ice_adminq_cmd.h"
 #include "base/ice_flow.h"
+#include "base/ice_sched.h"
 
 #define ICE_ADMINQ_LEN               32
 #define ICE_SBIOQ_LEN                32
@@ -21,8 +24,8 @@
 #define ICE_ADMINQ_BUF_SZ            4096
 #define ICE_SBIOQ_BUF_SZ             4096
 #define ICE_MAILBOXQ_BUF_SZ          4096
-/* Number of queues per TC should be one of 1, 2, 4, 8, 16, 32, 64 */
-#define ICE_MAX_Q_PER_TC         64
+/* Number of queues per TC should be one of 1, 2, 4, 8, 16, 32, 64, 128, 256 */
+#define ICE_MAX_Q_PER_TC         256
 #define ICE_NUM_DESC_DEFAULT     512
 #define ICE_BUF_SIZE_MIN         1024
 #define ICE_FRAME_SIZE_MAX       9728
@@ -453,6 +456,51 @@ struct ice_acl_info {
 	uint64_t hw_entry_id[MAX_ACL_NORMAL_ENTRIES];
 };
 
+TAILQ_HEAD(ice_shaper_profile_list, ice_tm_shaper_profile);
+TAILQ_HEAD(ice_tm_node_list, ice_tm_node);
+
+struct ice_tm_shaper_profile {
+	TAILQ_ENTRY(ice_tm_shaper_profile) node;
+	uint32_t shaper_profile_id;
+	uint32_t reference_count;
+	struct rte_tm_shaper_params profile;
+};
+
+/* Struct to store Traffic Manager node configuration. */
+struct ice_tm_node {
+	TAILQ_ENTRY(ice_tm_node) node;
+	uint32_t id;
+	uint32_t priority;
+	uint32_t weight;
+	uint32_t level;
+	uint32_t reference_count;
+	struct ice_tm_node *parent;
+	struct ice_tm_node **children;
+	struct ice_tm_shaper_profile *shaper_profile;
+	struct rte_tm_node_params params;
+	struct ice_sched_node *sched_node;
+};
+
+/* node type of Traffic Manager */
+enum ice_tm_node_type {
+	ICE_TM_NODE_TYPE_PORT,
+	ICE_TM_NODE_TYPE_QGROUP,
+	ICE_TM_NODE_TYPE_QUEUE,
+	ICE_TM_NODE_TYPE_MAX,
+};
+
+/* Struct to store all the Traffic Manager configuration. */
+struct ice_tm_conf {
+	struct ice_shaper_profile_list shaper_profile_list;
+	struct ice_tm_node *root; /* root node - port */
+	bool committed;
+	bool clear_on_fail;
+};
+
+struct ice_mbuf_stats {
+	uint64_t tx_pkt_errors;
+};
+
 struct ice_pf {
 	struct ice_adapter *adapter; /* The adapter this PF associate to */
 	struct ice_vsi *main_vsi; /* pointer to main VSI structure */
@@ -482,6 +530,7 @@ struct ice_pf {
 	uint16_t fdir_fltr_cnt[ICE_FLTR_PTYPE_MAX][ICE_FD_HW_SEG_MAX];
 	struct ice_hw_port_stats stats_offset;
 	struct ice_hw_port_stats stats;
+	struct ice_mbuf_stats mbuf_stats;
 	/* internal packet statistics, it should be excluded from the total */
 	struct ice_eth_stats internal_stats_offset;
 	struct ice_eth_stats internal_stats;
@@ -489,14 +538,17 @@ struct ice_pf {
 	bool adapter_stopped;
 	struct ice_flow_list flow_list;
 	rte_spinlock_t flow_ops_lock;
-	struct ice_parser_list rss_parser_list;
-	struct ice_parser_list perm_parser_list;
-	struct ice_parser_list dist_parser_list;
 	bool init_link_up;
 	uint64_t old_rx_bytes;
 	uint64_t old_tx_bytes;
 	uint64_t supported_rxdid; /* bitmap for supported RXDID */
 	uint64_t rss_hf;
+	struct ice_tm_conf tm_conf;
+	uint16_t outer_ethertype;
+	/* lock prevent race condition between lsc interrupt handler
+	 * and link status update during dev_start.
+	 */
+	rte_spinlock_t link_lock;
 };
 
 #define ICE_MAX_QUEUE_NUM  2048
@@ -509,10 +561,15 @@ struct ice_devargs {
 	int rx_low_latency;
 	int safe_mode_support;
 	uint8_t proto_xtr_dflt;
-	int pipe_mode_support;
+	uint8_t default_mac_disable;
 	uint8_t proto_xtr[ICE_MAX_QUEUE_NUM];
 	uint8_t pin_idx;
 	uint8_t pps_out_ena;
+	int xtr_field_offs;
+	uint8_t xtr_flag_offs[PROTO_XTR_MAX];
+	/* Name of the field. */
+	char xtr_field_name[RTE_MBUF_DYN_NAMESIZE];
+	uint64_t mbuf_check;
 };
 
 /**
@@ -531,6 +588,11 @@ struct ice_rss_prof_info {
 	bool symm;
 };
 
+#define ICE_MBUF_CHECK_F_TX_MBUF        (1ULL << 0)
+#define ICE_MBUF_CHECK_F_TX_SIZE        (1ULL << 1)
+#define ICE_MBUF_CHECK_F_TX_SEGMENT     (1ULL << 2)
+#define ICE_MBUF_CHECK_F_TX_OFFLOAD     (1ULL << 3)
+
 /**
  * Structure to store private data for each PF/VF instance.
  */
@@ -548,6 +610,8 @@ struct ice_adapter {
 	struct ice_devargs devargs;
 	enum ice_pkg_type active_pkg_type; /* loaded ddp package type */
 	uint16_t fdir_ref_cnt;
+	/* For vector PMD */
+	eth_rx_burst_t tx_pkt_burst;
 	/* For PTP */
 	struct rte_timecounter systime_tc;
 	struct rte_timecounter rx_tstamp_tc;
@@ -558,6 +622,9 @@ struct ice_adapter {
 	struct ice_rss_prof_info rss_prof_info[ICE_MAX_PTGS];
 	/* True if DCF state of the associated PF is on */
 	bool dcf_state_on;
+	/* Set bit if the engine is disabled */
+	unsigned long disabled_engine_mask;
+	struct ice_parser *psr;
 #ifdef RTE_ARCH_X86
 	bool rx_use_avx2;
 	bool rx_use_avx512;
@@ -607,6 +674,7 @@ struct ice_vsi_vlan_pvid_info {
 #define ICE_PF_TO_ETH_DEV(pf) \
 	(((struct ice_pf *)pf)->adapter->eth_dev)
 
+bool is_ice_supported(struct rte_eth_dev *dev);
 int
 ice_load_pkg(struct ice_adapter *adapter, bool use_dsn, uint64_t dsn);
 struct ice_vsi *
@@ -620,13 +688,19 @@ int ice_add_rss_cfg_wrap(struct ice_pf *pf, uint16_t vsi_id,
 			 struct ice_rss_hash_cfg *cfg);
 int ice_rem_rss_cfg_wrap(struct ice_pf *pf, uint16_t vsi_id,
 			 struct ice_rss_hash_cfg *cfg);
+void ice_tm_conf_init(struct rte_eth_dev *dev);
+void ice_tm_conf_uninit(struct rte_eth_dev *dev);
+int ice_do_hierarchy_commit(struct rte_eth_dev *dev,
+			    int clear_on_fail,
+			    struct rte_tm_error *error);
+extern const struct rte_tm_ops ice_tm_ops;
 
 static inline int
 ice_align_floor(int n)
 {
 	if (n == 0)
 		return 0;
-	return 1 << (sizeof(n) * CHAR_BIT - 1 - __builtin_clz(n));
+	return 1 << (sizeof(n) * CHAR_BIT - 1 - rte_clz32(n));
 }
 
 #define ICE_PHY_TYPE_SUPPORT_50G(phy_type) \
@@ -668,4 +742,12 @@ ice_align_floor(int n)
 	((phy_type) & ICE_PHY_TYPE_HIGH_100G_AUI2_AOC_ACC) || \
 	((phy_type) & ICE_PHY_TYPE_HIGH_100G_AUI2))
 
+__rte_experimental
+int rte_pmd_ice_dump_package(uint16_t port, uint8_t **buff, uint32_t *size);
+
+__rte_experimental
+int rte_pmd_ice_dump_switch(uint16_t port, uint8_t **buff, uint32_t *size);
+
+__rte_experimental
+int rte_pmd_ice_dump_txsched(uint16_t port, bool detail, FILE *stream);
 #endif /* _ICE_ETHDEV_H_ */

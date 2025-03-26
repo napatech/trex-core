@@ -16,14 +16,11 @@
 #define DPI_REG_DUMP	0x3
 #define DPI_GET_REG_CFG 0x4
 
-#define DPI_CMD_QUEUE_SIZE 4096
-#define DPI_CMD_QUEUE_BUFS 1024
-
 typedef union dpi_mbox_msg_t {
 	uint64_t u[2];
 	struct dpi_mbox_message_s {
 		/* VF ID to configure */
-		uint64_t vfid : 4;
+		uint64_t vfid : 8;
 		/* Command code */
 		uint64_t cmd : 4;
 		/* Command buffer size in 8-byte words */
@@ -34,6 +31,10 @@ typedef union dpi_mbox_msg_t {
 		uint64_t sso_pf_func : 16;
 		/* NPA PF function */
 		uint64_t npa_pf_func : 16;
+		/* WQE queue DMA completion status enable */
+		uint64_t wqecs : 1;
+		/* WQE queue DMA completion status offset */
+		uint64_t wqecsoff : 8;
 	} s;
 } dpi_mbox_msg_t;
 

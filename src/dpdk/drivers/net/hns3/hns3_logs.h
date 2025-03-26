@@ -2,8 +2,8 @@
  * Copyright(c) 2018-2021 HiSilicon Limited.
  */
 
-#ifndef _HNS3_LOGS_H_
-#define _HNS3_LOGS_H_
+#ifndef HNS3_LOGS_H
+#define HNS3_LOGS_H
 
 extern int hns3_logtype_init;
 #define PMD_INIT_LOG(level, fmt, args...) \
@@ -31,4 +31,22 @@ extern int hns3_logtype_driver;
 #define hns3_dbg(hw, fmt, args...) \
 	PMD_DRV_LOG_RAW(hw, RTE_LOG_DEBUG, fmt "\n", ## args)
 
-#endif /* _HNS3_LOGS_H_ */
+#ifdef RTE_ETHDEV_DEBUG_RX
+extern int hns3_logtype_rx;
+#define PMD_RX_LOG(hw, level, fmt, args...)			\
+	rte_log(RTE_LOG_ ## level, hns3_logtype_rx,	"%s %s(): " fmt "\n", \
+		(hw)->data->name, __func__, ## args)
+#else
+#define PMD_RX_LOG(hw, level, fmt, args...) do { } while (0)
+#endif
+
+#ifdef RTE_ETHDEV_DEBUG_TX
+extern int hns3_logtype_tx;
+#define PMD_TX_LOG(hw, level, fmt, args...)			\
+	rte_log(RTE_LOG_ ## level, hns3_logtype_tx,	"%s %s(): " fmt "\n", \
+		(hw)->data->name, __func__, ## args)
+#else
+#define PMD_TX_LOG(hw, level, fmt, args...) do { } while (0)
+#endif
+
+#endif /* HNS3_LOGS_H */

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(c) 2014-2021 Broadcom
+ * Copyright(c) 2014-2023 Broadcom
  * All rights reserved.
  */
 
@@ -39,23 +39,9 @@ struct bnxt_db_info;
 #define B_CP_DB_DISARM(cpr)	(*(uint32_t *)((cpr)->cp_db.doorbell) = \
 				 DB_KEY_CP | DB_IRQ_DIS)
 
-#define B_CP_DB_IDX_ARM(cpr, cons)					\
-		(*(uint32_t *)((cpr)->cp_db.doorbell) = (DB_CP_REARM_FLAGS | \
-				(cons)))
-
-#define B_CP_DB_IDX_DISARM(cpr, cons)	do {				\
-		rte_smp_wmb();						\
-		(*(uint32_t *)((cpr)->cp_db.doorbell) = (DB_CP_FLAGS |	\
-				(cons));				\
-} while (0)
 #define B_CP_DIS_DB(cpr, raw_cons)					\
 	rte_write32_relaxed((DB_CP_FLAGS |				\
 		    DB_RING_IDX(&((cpr)->cp_db), raw_cons)),		\
-		    ((cpr)->cp_db.doorbell))
-
-#define B_CP_DB(cpr, raw_cons, ring_mask)				\
-	rte_write32((DB_CP_FLAGS |					\
-		    RING_CMPL((ring_mask), raw_cons)),	\
 		    ((cpr)->cp_db.doorbell))
 
 struct bnxt_db_info {
@@ -67,11 +53,10 @@ struct bnxt_db_info {
 	bool                    db_64;
 	uint32_t		db_ring_mask;
 	uint32_t		db_epoch_mask;
-	uint32_t		db_epoch_shift;
 };
 
-#define DB_EPOCH(db, idx)	(((idx) & (db)->db_epoch_mask) <<	\
-				 ((db)->db_epoch_shift))
+#define DB_EPOCH(db, idx)	(!!((idx) & (db)->db_epoch_mask) <<	\
+				 DBR_EPOCH_SFT)
 #define DB_RING_IDX(db, idx)	(((idx) & (db)->db_ring_mask) |		\
 				 DB_EPOCH(db, idx))
 
@@ -83,7 +68,8 @@ struct bnxt_cp_ring_info {
 	struct bnxt_db_info     cp_db;
 	rte_iova_t		cp_desc_mapping;
 
-	struct ctx_hw_stats	*hw_stats;
+	char			*hw_stats;
+	uint16_t		hw_ring_stats_size;
 	rte_iova_t		hw_stats_map;
 	uint32_t		hw_stats_ctx_id;
 

@@ -6,7 +6,8 @@
 #include "cnxk_eventdev.h"
 #include "cnxk_worker.h"
 
-#define CN9K_DUAL_WS_NB_WS	    2
+#include <rte_dmadev_pmd.h>
+
 #define CN9K_DUAL_WS_PAIR_ID(x, id) (((x)*CN9K_DUAL_WS_NB_WS) + id)
 
 #define CN9K_SET_EVDEV_DEQ_OP(dev, deq_op, deq_ops)                            \
@@ -16,7 +17,7 @@
 	enq_op = enq_ops[dev->tx_offloads & (NIX_TX_OFFLOAD_MAX - 1)]
 
 static int
-cn9k_sso_hws_link(void *arg, void *port, uint16_t *map, uint16_t nb_link)
+cn9k_sso_hws_link(void *arg, void *port, uint16_t *map, uint16_t nb_link, uint8_t profile)
 {
 	struct cnxk_sso_evdev *dev = arg;
 	struct cn9k_sso_hws_dual *dws;
@@ -25,22 +26,20 @@ cn9k_sso_hws_link(void *arg, void *port, uint16_t *map, uint16_t nb_link)
 
 	if (dev->dual_ws) {
 		dws = port;
-		rc = roc_sso_hws_link(&dev->sso,
-				      CN9K_DUAL_WS_PAIR_ID(dws->hws_id, 0), map,
-				      nb_link);
-		rc |= roc_sso_hws_link(&dev->sso,
-				       CN9K_DUAL_WS_PAIR_ID(dws->hws_id, 1),
-				       map, nb_link);
+		rc = roc_sso_hws_link(&dev->sso, CN9K_DUAL_WS_PAIR_ID(dws->hws_id, 0), map, nb_link,
+				      profile, 0);
+		rc |= roc_sso_hws_link(&dev->sso, CN9K_DUAL_WS_PAIR_ID(dws->hws_id, 1), map,
+				       nb_link, profile, 0);
 	} else {
 		ws = port;
-		rc = roc_sso_hws_link(&dev->sso, ws->hws_id, map, nb_link);
+		rc = roc_sso_hws_link(&dev->sso, ws->hws_id, map, nb_link, profile, 0);
 	}
 
 	return rc;
 }
 
 static int
-cn9k_sso_hws_unlink(void *arg, void *port, uint16_t *map, uint16_t nb_link)
+cn9k_sso_hws_unlink(void *arg, void *port, uint16_t *map, uint16_t nb_link, uint8_t profile)
 {
 	struct cnxk_sso_evdev *dev = arg;
 	struct cn9k_sso_hws_dual *dws;
@@ -49,15 +48,13 @@ cn9k_sso_hws_unlink(void *arg, void *port, uint16_t *map, uint16_t nb_link)
 
 	if (dev->dual_ws) {
 		dws = port;
-		rc = roc_sso_hws_unlink(&dev->sso,
-					CN9K_DUAL_WS_PAIR_ID(dws->hws_id, 0),
-					map, nb_link);
-		rc |= roc_sso_hws_unlink(&dev->sso,
-					 CN9K_DUAL_WS_PAIR_ID(dws->hws_id, 1),
-					 map, nb_link);
+		rc = roc_sso_hws_unlink(&dev->sso, CN9K_DUAL_WS_PAIR_ID(dws->hws_id, 0), map,
+					nb_link, profile, 0);
+		rc |= roc_sso_hws_unlink(&dev->sso, CN9K_DUAL_WS_PAIR_ID(dws->hws_id, 1), map,
+					 nb_link, profile, 0);
 	} else {
 		ws = port;
-		rc = roc_sso_hws_unlink(&dev->sso, ws->hws_id, map, nb_link);
+		rc = roc_sso_hws_unlink(&dev->sso, ws->hws_id, map, nb_link, profile, 0);
 	}
 
 	return rc;
@@ -98,30 +95,35 @@ cn9k_sso_hws_release(void *arg, void *hws)
 	struct cnxk_sso_evdev *dev = arg;
 	struct cn9k_sso_hws_dual *dws;
 	struct cn9k_sso_hws *ws;
-	uint16_t i;
+	uint16_t i, k;
 
 	if (dev->dual_ws) {
 		dws = hws;
 		for (i = 0; i < dev->nb_event_queues; i++) {
-			roc_sso_hws_unlink(&dev->sso,
-					   CN9K_DUAL_WS_PAIR_ID(dws->hws_id, 0), &i, 1);
-			roc_sso_hws_unlink(&dev->sso,
-					   CN9K_DUAL_WS_PAIR_ID(dws->hws_id, 1), &i, 1);
+			for (k = 0; k < CNXK_SSO_MAX_PROFILES; k++) {
+				roc_sso_hws_unlink(&dev->sso, CN9K_DUAL_WS_PAIR_ID(dws->hws_id, 0),
+						   &i, 1, k, 0);
+				roc_sso_hws_unlink(&dev->sso, CN9K_DUAL_WS_PAIR_ID(dws->hws_id, 1),
+						   &i, 1, k, 0);
+			}
 		}
 		memset(dws, 0, sizeof(*dws));
 	} else {
 		ws = hws;
 		for (i = 0; i < dev->nb_event_queues; i++)
-			roc_sso_hws_unlink(&dev->sso, ws->hws_id, &i, 1);
+			for (k = 0; k < CNXK_SSO_MAX_PROFILES; k++)
+				roc_sso_hws_unlink(&dev->sso, ws->hws_id, &i, 1, k, 0);
 		memset(ws, 0, sizeof(*ws));
 	}
 }
 
-static void
+static int
 cn9k_sso_hws_flush_events(void *hws, uint8_t queue_id, uintptr_t base,
 			  cnxk_handle_event_t fn, void *arg)
 {
 	struct cnxk_sso_evdev *dev = cnxk_sso_pmd_priv(arg);
+	uint64_t retry = CNXK_SSO_FLUSH_RETRY_MAX;
+	struct cnxk_timesync_info **tstamp;
 	struct cn9k_sso_hws_dual *dws;
 	struct cn9k_sso_hws *ws;
 	uint64_t cq_ds_cnt = 1;
@@ -130,6 +132,7 @@ cn9k_sso_hws_flush_events(void *hws, uint8_t queue_id, uintptr_t base,
 	struct rte_event ev;
 	uintptr_t ws_base;
 	uint64_t val, req;
+	void *lookup_mem;
 
 	plt_write64(0, base + SSO_LF_GGRP_QCTL);
 
@@ -145,20 +148,25 @@ cn9k_sso_hws_flush_events(void *hws, uint8_t queue_id, uintptr_t base,
 	if (dev->dual_ws) {
 		dws = hws;
 		ws_base = dws->base[0];
+		lookup_mem = dws->lookup_mem;
+		tstamp = dws->tstamp;
 	} else {
 		ws = hws;
 		ws_base = ws->base;
+		lookup_mem = ws->lookup_mem;
+		tstamp = ws->tstamp;
 	}
 
 	while (aq_cnt || cq_ds_cnt || ds_cnt) {
 		plt_write64(req, ws_base + SSOW_LF_GWS_OP_GET_WORK0);
-		cn9k_sso_hws_get_work_empty(ws_base, &ev);
+		cn9k_sso_hws_get_work_empty(ws_base, &ev, dev->rx_offloads,
+					    lookup_mem, tstamp);
 		if (fn != NULL && ev.u64 != 0)
 			fn(arg, ev);
 		if (ev.sched_type != SSO_TT_EMPTY)
-			cnxk_sso_hws_swtag_flush(
-				ws_base + SSOW_LF_GWS_TAG,
-				ws_base + SSOW_LF_GWS_OP_SWTAG_FLUSH);
+			cnxk_sso_hws_swtag_flush(ws_base);
+		else if (retry-- == 0)
+			break;
 		do {
 			val = plt_read64(ws_base + SSOW_LF_GWS_PENDSTATE);
 		} while (val & BIT_ULL(56));
@@ -169,7 +177,12 @@ cn9k_sso_hws_flush_events(void *hws, uint8_t queue_id, uintptr_t base,
 		cq_ds_cnt &= 0x3FFF3FFF0000;
 	}
 
+	if (aq_cnt || cq_ds_cnt || ds_cnt)
+		return -EAGAIN;
+
 	plt_write64(0, ws_base + SSOW_LF_GWS_OP_GWC_INVAL);
+
+	return 0;
 }
 
 static void
@@ -181,6 +194,7 @@ cn9k_sso_hws_reset(void *arg, void *hws)
 	uint64_t pend_state;
 	uint8_t pend_tt;
 	uintptr_t base;
+	bool is_pend;
 	uint64_t tag;
 	uint8_t i;
 
@@ -188,6 +202,13 @@ cn9k_sso_hws_reset(void *arg, void *hws)
 	ws = hws;
 	for (i = 0; i < (dev->dual_ws ? CN9K_DUAL_WS_NB_WS : 1); i++) {
 		base = dev->dual_ws ? dws->base[i] : ws->base;
+		is_pend = false;
+		/* Work in WQE0 is always consumed, unless its a SWTAG. */
+		pend_state = plt_read64(base + SSOW_LF_GWS_PENDSTATE);
+		if (pend_state & (BIT_ULL(63) | BIT_ULL(62) | BIT_ULL(54)) ||
+		    (dev->dual_ws ? (dws->swtag_req && i == !dws->vws) :
+					  ws->swtag_req))
+			is_pend = true;
 		/* Wait till getwork/swtp/waitw/desched completes. */
 		do {
 			pend_state = plt_read64(base + SSOW_LF_GWS_PENDSTATE);
@@ -196,45 +217,40 @@ cn9k_sso_hws_reset(void *arg, void *hws)
 
 		tag = plt_read64(base + SSOW_LF_GWS_TAG);
 		pend_tt = (tag >> 32) & 0x3;
-		if (pend_tt != SSO_TT_EMPTY) { /* Work was pending */
+		if (is_pend && pend_tt != SSO_TT_EMPTY) { /* Work was pending */
 			if (pend_tt == SSO_TT_ATOMIC ||
 			    pend_tt == SSO_TT_ORDERED)
 				cnxk_sso_hws_swtag_untag(
 					base + SSOW_LF_GWS_OP_SWTAG_UNTAG);
 			plt_write64(0, base + SSOW_LF_GWS_OP_DESCHED);
+		} else if (pend_tt != SSO_TT_EMPTY) {
+			plt_write64(0, base + SSOW_LF_GWS_OP_SWTAG_FLUSH);
 		}
 
 		/* Wait for desched to complete. */
 		do {
 			pend_state = plt_read64(base + SSOW_LF_GWS_PENDSTATE);
-		} while (pend_state & BIT_ULL(58));
+		} while (pend_state & (BIT_ULL(58) | BIT_ULL(56)));
+		plt_write64(0, base + SSOW_LF_GWS_OP_GWC_INVAL);
 	}
-}
-
-void
-cn9k_sso_set_rsrc(void *arg)
-{
-	struct cnxk_sso_evdev *dev = arg;
-
 	if (dev->dual_ws)
-		dev->max_event_ports = dev->sso.max_hws / CN9K_DUAL_WS_NB_WS;
+		dws->swtag_req = 0;
 	else
-		dev->max_event_ports = dev->sso.max_hws;
-	dev->max_event_queues =
-		dev->sso.max_hwgrp > RTE_EVENT_MAX_QUEUES_PER_DEV ?
-			      RTE_EVENT_MAX_QUEUES_PER_DEV :
-			      dev->sso.max_hwgrp;
+		ws->swtag_req = 0;
 }
 
 static int
 cn9k_sso_rsrc_init(void *arg, uint8_t hws, uint8_t hwgrp)
 {
+	struct cnxk_tim_evdev *tim_dev = cnxk_tim_priv_get();
 	struct cnxk_sso_evdev *dev = arg;
+	uint16_t nb_tim_lfs;
 
 	if (dev->dual_ws)
 		hws = hws * CN9K_DUAL_WS_NB_WS;
 
-	return roc_sso_rsrc_init(&dev->sso, hws, hwgrp);
+	nb_tim_lfs = tim_dev ? tim_dev->nb_rings : 0;
+	return roc_sso_rsrc_init(&dev->sso, hws, hwgrp, nb_tim_lfs);
 }
 
 static int
@@ -294,6 +310,7 @@ cn9k_sso_updt_tx_adptr_data(const struct rte_eventdev *event_dev)
 static void
 cn9k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 {
+#if defined(RTE_ARCH_ARM64)
 	struct cnxk_sso_evdev *dev = cnxk_sso_pmd_priv(event_dev);
 	/* Single WS modes */
 	const event_dequeue_t sso_hws_deq[NIX_RX_OFFLOAD_MAX] = {
@@ -320,30 +337,6 @@ cn9k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 #undef R
 	};
 
-	const event_dequeue_t sso_hws_deq_ca[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_deq_ca_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_burst_t sso_hws_deq_ca_burst[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_deq_ca_burst_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_t sso_hws_deq_tmo_ca[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_deq_tmo_ca_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_burst_t sso_hws_deq_tmo_ca_burst[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_deq_tmo_ca_burst_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
 	const event_dequeue_t sso_hws_deq_seg[NIX_RX_OFFLOAD_MAX] = {
 #define R(name, flags)[flags] = cn9k_sso_hws_deq_seg_##name,
 		NIX_RX_FASTPATH_MODES
@@ -364,30 +357,6 @@ cn9k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 
 	const event_dequeue_burst_t sso_hws_deq_tmo_seg_burst[NIX_RX_OFFLOAD_MAX] = {
 #define R(name, flags)[flags] = cn9k_sso_hws_deq_tmo_seg_burst_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_t sso_hws_deq_ca_seg[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_deq_ca_seg_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_burst_t sso_hws_deq_ca_seg_burst[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_deq_ca_seg_burst_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_t sso_hws_deq_tmo_ca_seg[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_deq_tmo_ca_seg_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_burst_t sso_hws_deq_tmo_ca_seg_burst[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_deq_tmo_ca_seg_burst_##name,
 		NIX_RX_FASTPATH_MODES
 #undef R
 	};
@@ -417,30 +386,6 @@ cn9k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 #undef R
 	};
 
-	const event_dequeue_t sso_hws_dual_deq_ca[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_dual_deq_ca_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_burst_t sso_hws_dual_deq_ca_burst[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_dual_deq_ca_burst_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_t sso_hws_dual_deq_tmo_ca[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_dual_deq_tmo_ca_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_burst_t sso_hws_dual_deq_tmo_ca_burst[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_dual_deq_tmo_ca_burst_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
 	const event_dequeue_t sso_hws_dual_deq_seg[NIX_RX_OFFLOAD_MAX] = {
 #define R(name, flags)[flags] = cn9k_sso_hws_dual_deq_seg_##name,
 		NIX_RX_FASTPATH_MODES
@@ -461,30 +406,6 @@ cn9k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 
 	const event_dequeue_burst_t sso_hws_dual_deq_tmo_seg_burst[NIX_RX_OFFLOAD_MAX] = {
 #define R(name, flags)[flags] = cn9k_sso_hws_dual_deq_tmo_seg_burst_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_t sso_hws_dual_deq_ca_seg[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_dual_deq_ca_seg_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_burst_t sso_hws_dual_deq_ca_seg_burst[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_dual_deq_ca_seg_burst_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_t sso_hws_dual_deq_tmo_ca_seg[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_dual_deq_tmo_ca_seg_##name,
-		NIX_RX_FASTPATH_MODES
-#undef R
-	};
-
-	const event_dequeue_burst_t sso_hws_dual_deq_tmo_ca_seg_burst[NIX_RX_OFFLOAD_MAX] = {
-#define R(name, flags)[flags] = cn9k_sso_hws_dual_deq_tmo_ca_seg_burst_##name,
 		NIX_RX_FASTPATH_MODES
 #undef R
 	};
@@ -518,6 +439,7 @@ cn9k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 	event_dev->enqueue_burst = cn9k_sso_hws_enq_burst;
 	event_dev->enqueue_new_burst = cn9k_sso_hws_enq_new_burst;
 	event_dev->enqueue_forward_burst = cn9k_sso_hws_enq_fwd_burst;
+	event_dev->profile_switch = cn9k_sso_hws_profile_switch;
 	if (dev->rx_offloads & NIX_RX_MULTI_SEG_F) {
 		CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue, sso_hws_deq_seg);
 		CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue_burst,
@@ -527,19 +449,6 @@ cn9k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 					      sso_hws_deq_tmo_seg);
 			CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue_burst,
 					      sso_hws_deq_tmo_seg_burst);
-		}
-		if (dev->is_ca_internal_port) {
-			CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue,
-					      sso_hws_deq_ca_seg);
-			CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue_burst,
-					      sso_hws_deq_ca_seg_burst);
-		}
-
-		if (dev->is_ca_internal_port && dev->is_timeout_deq) {
-			CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue,
-					      sso_hws_deq_tmo_ca_seg);
-			CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue_burst,
-					      sso_hws_deq_tmo_ca_seg_burst);
 		}
 	} else {
 		CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue, sso_hws_deq);
@@ -551,21 +460,9 @@ cn9k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 			CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue_burst,
 					      sso_hws_deq_tmo_burst);
 		}
-		if (dev->is_ca_internal_port) {
-			CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue,
-					      sso_hws_deq_ca);
-			CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue_burst,
-					      sso_hws_deq_ca_burst);
-		}
-
-		if (dev->is_ca_internal_port && dev->is_timeout_deq) {
-			CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue,
-					      sso_hws_deq_tmo_ca);
-			CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue_burst,
-					      sso_hws_deq_tmo_ca_burst);
-		}
 	}
 	event_dev->ca_enqueue = cn9k_sso_hws_ca_enq;
+	event_dev->dma_enqueue = cn9k_dma_adapter_enqueue;
 
 	if (dev->tx_offloads & NIX_TX_MULTI_SEG_F)
 		CN9K_SET_EVDEV_ENQ_OP(dev, event_dev->txa_enqueue,
@@ -581,6 +478,8 @@ cn9k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 		event_dev->enqueue_forward_burst =
 			cn9k_sso_hws_dual_enq_fwd_burst;
 		event_dev->ca_enqueue = cn9k_sso_hws_dual_ca_enq;
+		event_dev->dma_enqueue = cn9k_dma_adapter_dual_enqueue;
+		event_dev->profile_switch = cn9k_sso_hws_dual_profile_switch;
 
 		if (dev->rx_offloads & NIX_RX_MULTI_SEG_F) {
 			CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue,
@@ -594,21 +493,6 @@ cn9k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 					dev, event_dev->dequeue_burst,
 					sso_hws_dual_deq_tmo_seg_burst);
 			}
-			if (dev->is_ca_internal_port) {
-				CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue,
-						      sso_hws_dual_deq_ca_seg);
-				CN9K_SET_EVDEV_DEQ_OP(
-					dev, event_dev->dequeue_burst,
-					sso_hws_dual_deq_ca_seg_burst);
-			}
-			if (dev->is_ca_internal_port && dev->is_timeout_deq) {
-				CN9K_SET_EVDEV_DEQ_OP(
-					dev, event_dev->dequeue,
-					sso_hws_dual_deq_tmo_ca_seg);
-				CN9K_SET_EVDEV_DEQ_OP(
-					dev, event_dev->dequeue_burst,
-					sso_hws_dual_deq_tmo_ca_seg_burst);
-			}
 		} else {
 			CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue,
 					      sso_hws_dual_deq);
@@ -621,20 +505,6 @@ cn9k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 					dev, event_dev->dequeue_burst,
 					sso_hws_dual_deq_tmo_burst);
 			}
-			if (dev->is_ca_internal_port) {
-				CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue,
-						      sso_hws_dual_deq_ca);
-				CN9K_SET_EVDEV_DEQ_OP(
-					dev, event_dev->dequeue_burst,
-					sso_hws_dual_deq_ca_burst);
-			}
-			if (dev->is_ca_internal_port && dev->is_timeout_deq) {
-				CN9K_SET_EVDEV_DEQ_OP(dev, event_dev->dequeue,
-						      sso_hws_dual_deq_tmo_ca);
-				CN9K_SET_EVDEV_DEQ_OP(
-					dev, event_dev->dequeue_burst,
-					sso_hws_dual_deq_tmo_ca_burst);
-			}
 		}
 
 		if (dev->tx_offloads & NIX_TX_MULTI_SEG_F)
@@ -645,8 +515,13 @@ cn9k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 					      sso_hws_dual_tx_adptr_enq);
 	}
 
+	event_dev->dma_enqueue = cn9k_dma_adapter_enqueue;
+
 	event_dev->txa_enqueue_same_dest = event_dev->txa_enqueue;
 	rte_mb();
+#else
+	RTE_SET_USED(event_dev);
+#endif
 }
 
 static void *
@@ -722,7 +597,7 @@ cn9k_sso_dev_configure(const struct rte_eventdev *event_dev)
 	struct cnxk_sso_evdev *dev = cnxk_sso_pmd_priv(event_dev);
 	int rc;
 
-	rc = cnxk_sso_dev_validate(event_dev);
+	rc = cnxk_sso_dev_validate(event_dev, 1, 1);
 	if (rc < 0) {
 		plt_err("Invalid event device configuration");
 		return -EINVAL;
@@ -784,10 +659,64 @@ free:
 	rte_free(gws_cookie);
 }
 
+static void
+cn9k_sso_port_quiesce(struct rte_eventdev *event_dev, void *port,
+		      rte_eventdev_port_flush_t flush_cb, void *args)
+{
+	struct cnxk_sso_evdev *dev = cnxk_sso_pmd_priv(event_dev);
+	struct cn9k_sso_hws_dual *dws;
+	struct cn9k_sso_hws *ws;
+	struct rte_event ev;
+	uintptr_t base;
+	uint64_t ptag;
+	bool is_pend;
+	uint8_t i;
+
+	dws = port;
+	ws = port;
+	for (i = 0; i < (dev->dual_ws ? CN9K_DUAL_WS_NB_WS : 1); i++) {
+		base = dev->dual_ws ? dws->base[i] : ws->base;
+		is_pend = false;
+		/* Work in WQE0 is always consumed, unless its a SWTAG. */
+		ptag = plt_read64(base + SSOW_LF_GWS_PENDSTATE);
+		if (ptag & (BIT_ULL(63) | BIT_ULL(62) | BIT_ULL(54)) ||
+		    (dev->dual_ws ? (dws->swtag_req && i == !dws->vws) :
+					  ws->swtag_req))
+			is_pend = true;
+		/* Wait till getwork/swtp/waitw/desched completes. */
+		do {
+			ptag = plt_read64(base + SSOW_LF_GWS_PENDSTATE);
+		} while (ptag & (BIT_ULL(63) | BIT_ULL(62) | BIT_ULL(58) |
+				 BIT_ULL(56)));
+
+		cn9k_sso_hws_get_work_empty(
+			base, &ev, dev->rx_offloads,
+			dev->dual_ws ? dws->lookup_mem : ws->lookup_mem,
+			dev->dual_ws ? dws->tstamp : ws->tstamp);
+		if (is_pend && ev.u64)
+			if (flush_cb)
+				flush_cb(event_dev->data->dev_id, ev, args);
+
+		ptag = (plt_read64(base + SSOW_LF_GWS_TAG) >> 32) & SSO_TT_EMPTY;
+		if (ptag != SSO_TT_EMPTY)
+			cnxk_sso_hws_swtag_flush(base);
+
+		do {
+			ptag = plt_read64(base + SSOW_LF_GWS_PENDSTATE);
+		} while (ptag & BIT_ULL(56));
+
+		plt_write64(0, base + SSOW_LF_GWS_OP_GWC_INVAL);
+	}
+
+	if (dev->dual_ws)
+		dws->swtag_req = 0;
+	else
+		ws->swtag_req = 0;
+}
+
 static int
-cn9k_sso_port_link(struct rte_eventdev *event_dev, void *port,
-		   const uint8_t queues[], const uint8_t priorities[],
-		   uint16_t nb_links)
+cn9k_sso_port_link_profile(struct rte_eventdev *event_dev, void *port, const uint8_t queues[],
+			   const uint8_t priorities[], uint16_t nb_links, uint8_t profile)
 {
 	struct cnxk_sso_evdev *dev = cnxk_sso_pmd_priv(event_dev);
 	uint16_t hwgrp_ids[nb_links];
@@ -796,14 +725,14 @@ cn9k_sso_port_link(struct rte_eventdev *event_dev, void *port,
 	RTE_SET_USED(priorities);
 	for (link = 0; link < nb_links; link++)
 		hwgrp_ids[link] = queues[link];
-	nb_links = cn9k_sso_hws_link(dev, port, hwgrp_ids, nb_links);
+	nb_links = cn9k_sso_hws_link(dev, port, hwgrp_ids, nb_links, profile);
 
 	return (int)nb_links;
 }
 
 static int
-cn9k_sso_port_unlink(struct rte_eventdev *event_dev, void *port,
-		     uint8_t queues[], uint16_t nb_unlinks)
+cn9k_sso_port_unlink_profile(struct rte_eventdev *event_dev, void *port, uint8_t queues[],
+			     uint16_t nb_unlinks, uint8_t profile)
 {
 	struct cnxk_sso_evdev *dev = cnxk_sso_pmd_priv(event_dev);
 	uint16_t hwgrp_ids[nb_unlinks];
@@ -811,9 +740,23 @@ cn9k_sso_port_unlink(struct rte_eventdev *event_dev, void *port,
 
 	for (unlink = 0; unlink < nb_unlinks; unlink++)
 		hwgrp_ids[unlink] = queues[unlink];
-	nb_unlinks = cn9k_sso_hws_unlink(dev, port, hwgrp_ids, nb_unlinks);
+	nb_unlinks = cn9k_sso_hws_unlink(dev, port, hwgrp_ids, nb_unlinks, profile);
 
 	return (int)nb_unlinks;
+}
+
+static int
+cn9k_sso_port_link(struct rte_eventdev *event_dev, void *port, const uint8_t queues[],
+		   const uint8_t priorities[], uint16_t nb_links)
+{
+	return cn9k_sso_port_link_profile(event_dev, port, queues, priorities, nb_links, 0);
+}
+
+static int
+cn9k_sso_port_unlink(struct rte_eventdev *event_dev, void *port, uint8_t queues[],
+		     uint16_t nb_unlinks)
+{
+	return cn9k_sso_port_unlink_profile(event_dev, port, queues, nb_unlinks, 0);
 }
 
 static int
@@ -872,8 +815,7 @@ cn9k_sso_rx_adapter_caps_get(const struct rte_eventdev *event_dev,
 }
 
 static void
-cn9k_sso_set_priv_mem(const struct rte_eventdev *event_dev, void *lookup_mem,
-		      void *tstmp_info)
+cn9k_sso_set_priv_mem(const struct rte_eventdev *event_dev, void *lookup_mem)
 {
 	struct cnxk_sso_evdev *dev = cnxk_sso_pmd_priv(event_dev);
 	int i;
@@ -882,12 +824,18 @@ cn9k_sso_set_priv_mem(const struct rte_eventdev *event_dev, void *lookup_mem,
 		if (dev->dual_ws) {
 			struct cn9k_sso_hws_dual *dws =
 				event_dev->data->ports[i];
-			dws->lookup_mem = lookup_mem;
-			dws->tstamp = tstmp_info;
+			dws->xaq_lmt = dev->xaq_lmt;
+			dws->fc_mem = (uint64_t *)dev->fc_iova;
+			dws->tstamp = dev->tstamp;
+			if (lookup_mem)
+				dws->lookup_mem = lookup_mem;
 		} else {
 			struct cn9k_sso_hws *ws = event_dev->data->ports[i];
-			ws->lookup_mem = lookup_mem;
-			ws->tstamp = tstmp_info;
+			ws->xaq_lmt = dev->xaq_lmt;
+			ws->fc_mem = (uint64_t *)dev->fc_iova;
+			ws->tstamp = dev->tstamp;
+			if (lookup_mem)
+				ws->lookup_mem = lookup_mem;
 		}
 	}
 }
@@ -900,7 +848,6 @@ cn9k_sso_rx_adapter_queue_add(
 {
 	struct cn9k_eth_rxq *rxq;
 	void *lookup_mem;
-	void *tstmp_info;
 	int rc;
 
 	rc = strncmp(eth_dev->device->driver->name, "net_cn9k", 8);
@@ -914,8 +861,7 @@ cn9k_sso_rx_adapter_queue_add(
 
 	rxq = eth_dev->data->rx_queues[0];
 	lookup_mem = rxq->lookup_mem;
-	tstmp_info = rxq->tstamp;
-	cn9k_sso_set_priv_mem(event_dev, lookup_mem, tstmp_info);
+	cn9k_sso_set_priv_mem(event_dev, lookup_mem);
 	cn9k_sso_fp_fns_set((struct rte_eventdev *)(uintptr_t)event_dev);
 
 	return 0;
@@ -968,15 +914,9 @@ cn9k_sso_txq_fc_update(const struct rte_eth_dev *eth_dev, int32_t tx_queue_id)
 		sq = &cnxk_eth_dev->sqs[tx_queue_id];
 		txq = eth_dev->data->tx_queues[tx_queue_id];
 		sqes_per_sqb = 1U << txq->sqes_per_sqb_log2;
-		sq->nb_sqb_bufs_adj =
-			sq->nb_sqb_bufs -
-			RTE_ALIGN_MUL_CEIL(sq->nb_sqb_bufs, sqes_per_sqb) /
-				sqes_per_sqb;
 		if (cnxk_eth_dev->tx_offloads & RTE_ETH_TX_OFFLOAD_SECURITY)
-			sq->nb_sqb_bufs_adj -= (cnxk_eth_dev->outb.nb_desc /
-						(sqes_per_sqb - 1));
+			sq->nb_sqb_bufs_adj -= (cnxk_eth_dev->outb.nb_desc / sqes_per_sqb);
 		txq->nb_sqb_bufs_adj = sq->nb_sqb_bufs_adj;
-		txq->nb_sqb_bufs_adj = (70 * txq->nb_sqb_bufs_adj) / 100;
 	}
 }
 
@@ -1035,11 +975,11 @@ cn9k_sso_tx_adapter_queue_del(uint8_t id, const struct rte_eventdev *event_dev,
 }
 
 static int
-cn9k_crypto_adapter_caps_get(const struct rte_eventdev *event_dev,
-			     const struct rte_cryptodev *cdev, uint32_t *caps)
+cn9k_crypto_adapter_caps_get(const struct rte_eventdev *event_dev, const struct rte_cryptodev *cdev,
+			     uint32_t *caps)
 {
-	CNXK_VALID_DEV_OR_ERR_RET(event_dev->dev, "event_cn9k");
-	CNXK_VALID_DEV_OR_ERR_RET(cdev->device, "crypto_cn9k");
+	CNXK_VALID_DEV_OR_ERR_RET(event_dev->dev, "event_cn9k", ENOTSUP);
+	CNXK_VALID_DEV_OR_ERR_RET(cdev->device, "crypto_cn9k", ENOTSUP);
 
 	*caps = RTE_EVENT_CRYPTO_ADAPTER_CAP_INTERNAL_PORT_OP_FWD |
 		RTE_EVENT_CRYPTO_ADAPTER_CAP_SESSION_PRIVATE_DATA;
@@ -1050,43 +990,116 @@ cn9k_crypto_adapter_caps_get(const struct rte_eventdev *event_dev,
 static int
 cn9k_crypto_adapter_qp_add(const struct rte_eventdev *event_dev,
 			   const struct rte_cryptodev *cdev,
-			   int32_t queue_pair_id, const struct rte_event *event)
+			   int32_t queue_pair_id,
+			   const struct rte_event_crypto_adapter_queue_conf *conf)
 {
-	struct cnxk_sso_evdev *dev = cnxk_sso_pmd_priv(event_dev);
+	int ret;
 
-	RTE_SET_USED(event);
+	CNXK_VALID_DEV_OR_ERR_RET(event_dev->dev, "event_cn9k", EINVAL);
+	CNXK_VALID_DEV_OR_ERR_RET(cdev->device, "crypto_cn9k", EINVAL);
 
-	CNXK_VALID_DEV_OR_ERR_RET(event_dev->dev, "event_cn9k");
-	CNXK_VALID_DEV_OR_ERR_RET(cdev->device, "crypto_cn9k");
-
-	dev->is_ca_internal_port = 1;
 	cn9k_sso_fp_fns_set((struct rte_eventdev *)(uintptr_t)event_dev);
 
-	return cnxk_crypto_adapter_qp_add(event_dev, cdev, queue_pair_id);
+	ret = cnxk_crypto_adapter_qp_add(event_dev, cdev, queue_pair_id, conf);
+	cn9k_sso_set_priv_mem(event_dev, NULL);
+
+	return ret;
 }
 
 static int
-cn9k_crypto_adapter_qp_del(const struct rte_eventdev *event_dev,
-			   const struct rte_cryptodev *cdev,
+cn9k_crypto_adapter_qp_del(const struct rte_eventdev *event_dev, const struct rte_cryptodev *cdev,
 			   int32_t queue_pair_id)
 {
-	CNXK_VALID_DEV_OR_ERR_RET(event_dev->dev, "event_cn9k");
-	CNXK_VALID_DEV_OR_ERR_RET(cdev->device, "crypto_cn9k");
+	CNXK_VALID_DEV_OR_ERR_RET(event_dev->dev, "event_cn9k", EINVAL);
+	CNXK_VALID_DEV_OR_ERR_RET(cdev->device, "crypto_cn9k", EINVAL);
 
 	return cnxk_crypto_adapter_qp_del(cdev, queue_pair_id);
+}
+
+static int
+cn9k_tim_caps_get(const struct rte_eventdev *evdev, uint64_t flags,
+		  uint32_t *caps, const struct event_timer_adapter_ops **ops)
+{
+	return cnxk_tim_caps_get(evdev, flags, caps, ops,
+				 cn9k_sso_set_priv_mem);
+}
+
+static int
+cn9k_dma_adapter_caps_get(const struct rte_eventdev *event_dev,
+			  const int16_t dma_dev_id, uint32_t *caps)
+{
+	struct rte_dma_dev *dma_dev;
+	RTE_SET_USED(event_dev);
+
+	dma_dev = rte_dma_pmd_get_dev_by_id(dma_dev_id);
+	if (dma_dev == NULL)
+		return -EINVAL;
+
+	CNXK_VALID_DEV_OR_ERR_RET(dma_dev->device, "cnxk_dmadev_pci_driver", EINVAL);
+
+	*caps = RTE_EVENT_DMA_ADAPTER_CAP_INTERNAL_PORT_OP_FWD;
+
+	return 0;
+}
+
+static int
+cn9k_dma_adapter_vchan_add(const struct rte_eventdev *event_dev,
+			    const int16_t dma_dev_id, uint16_t vchan_id,
+			    const struct rte_event *event)
+{
+	struct rte_dma_dev *dma_dev;
+	int ret;
+
+	RTE_SET_USED(event);
+
+	dma_dev = rte_dma_pmd_get_dev_by_id(dma_dev_id);
+	if (dma_dev == NULL)
+		return -EINVAL;
+
+	CNXK_VALID_DEV_OR_ERR_RET(dma_dev->device, "cnxk_dmadev_pci_driver", EINVAL);
+
+	cn9k_sso_fp_fns_set((struct rte_eventdev *)(uintptr_t)event_dev);
+
+	ret = cnxk_dma_adapter_vchan_add(event_dev, dma_dev_id, vchan_id);
+	cn9k_sso_set_priv_mem(event_dev, NULL);
+
+	return ret;
+}
+
+static int
+cn9k_dma_adapter_vchan_del(const struct rte_eventdev *event_dev,
+			    const int16_t dma_dev_id, uint16_t vchan_id)
+{
+	struct rte_dma_dev *dma_dev;
+
+	RTE_SET_USED(event_dev);
+
+	dma_dev = rte_dma_pmd_get_dev_by_id(dma_dev_id);
+	if (dma_dev == NULL)
+		return -EINVAL;
+
+	CNXK_VALID_DEV_OR_ERR_RET(dma_dev->device, "cnxk_dmadev_pci_driver", EINVAL);
+
+	return cnxk_dma_adapter_vchan_del(dma_dev_id, vchan_id);
 }
 
 static struct eventdev_ops cn9k_sso_dev_ops = {
 	.dev_infos_get = cn9k_sso_info_get,
 	.dev_configure = cn9k_sso_dev_configure,
+
 	.queue_def_conf = cnxk_sso_queue_def_conf,
 	.queue_setup = cnxk_sso_queue_setup,
 	.queue_release = cnxk_sso_queue_release,
+	.queue_attr_set = cnxk_sso_queue_attribute_set,
+
 	.port_def_conf = cnxk_sso_port_def_conf,
 	.port_setup = cn9k_sso_port_setup,
 	.port_release = cn9k_sso_port_release,
+	.port_quiesce = cn9k_sso_port_quiesce,
 	.port_link = cn9k_sso_port_link,
 	.port_unlink = cn9k_sso_port_unlink,
+	.port_link_profile = cn9k_sso_port_link_profile,
+	.port_unlink_profile = cn9k_sso_port_unlink_profile,
 	.timeout_ticks = cnxk_sso_timeout_ticks,
 
 	.eth_rx_adapter_caps_get = cn9k_sso_rx_adapter_caps_get,
@@ -1098,12 +1111,23 @@ static struct eventdev_ops cn9k_sso_dev_ops = {
 	.eth_tx_adapter_caps_get = cn9k_sso_tx_adapter_caps_get,
 	.eth_tx_adapter_queue_add = cn9k_sso_tx_adapter_queue_add,
 	.eth_tx_adapter_queue_del = cn9k_sso_tx_adapter_queue_del,
+	.eth_tx_adapter_start = cnxk_sso_tx_adapter_start,
+	.eth_tx_adapter_stop = cnxk_sso_tx_adapter_stop,
+	.eth_tx_adapter_free = cnxk_sso_tx_adapter_free,
 
-	.timer_adapter_caps_get = cnxk_tim_caps_get,
+	.timer_adapter_caps_get = cn9k_tim_caps_get,
 
 	.crypto_adapter_caps_get = cn9k_crypto_adapter_caps_get,
 	.crypto_adapter_queue_pair_add = cn9k_crypto_adapter_qp_add,
 	.crypto_adapter_queue_pair_del = cn9k_crypto_adapter_qp_del,
+
+	.dma_adapter_caps_get = cn9k_dma_adapter_caps_get,
+	.dma_adapter_vchan_add = cn9k_dma_adapter_vchan_add,
+	.dma_adapter_vchan_del = cn9k_dma_adapter_vchan_del,
+
+	.xstats_get = cnxk_sso_xstats_get,
+	.xstats_reset = cnxk_sso_xstats_reset,
+	.xstats_get_names = cnxk_sso_xstats_get_names,
 
 	.dump = cnxk_sso_dump,
 	.dev_start = cn9k_sso_start,
@@ -1117,11 +1141,6 @@ cn9k_sso_init(struct rte_eventdev *event_dev)
 {
 	struct cnxk_sso_evdev *dev = cnxk_sso_pmd_priv(event_dev);
 	int rc;
-
-	if (RTE_CACHE_LINE_SIZE != 128) {
-		plt_err("Driver not compiled for CN9K");
-		return -EFAULT;
-	}
 
 	rc = roc_plt_init();
 	if (rc < 0) {
@@ -1168,11 +1187,13 @@ static const struct rte_pci_id cn9k_pci_sso_map[] = {
 	CNXK_PCI_ID(PCI_SUBSYSTEM_DEVID_CN9KC, PCI_DEVID_CNXK_RVU_SSO_TIM_PF),
 	CNXK_PCI_ID(PCI_SUBSYSTEM_DEVID_CN9KD, PCI_DEVID_CNXK_RVU_SSO_TIM_PF),
 	CNXK_PCI_ID(PCI_SUBSYSTEM_DEVID_CN9KE, PCI_DEVID_CNXK_RVU_SSO_TIM_PF),
+	CNXK_PCI_ID(PCI_SUBSYSTEM_DEVID_CNF9KA, PCI_DEVID_CNXK_RVU_SSO_TIM_PF),
 	CNXK_PCI_ID(PCI_SUBSYSTEM_DEVID_CN9KA, PCI_DEVID_CNXK_RVU_SSO_TIM_VF),
 	CNXK_PCI_ID(PCI_SUBSYSTEM_DEVID_CN9KB, PCI_DEVID_CNXK_RVU_SSO_TIM_VF),
 	CNXK_PCI_ID(PCI_SUBSYSTEM_DEVID_CN9KC, PCI_DEVID_CNXK_RVU_SSO_TIM_VF),
 	CNXK_PCI_ID(PCI_SUBSYSTEM_DEVID_CN9KD, PCI_DEVID_CNXK_RVU_SSO_TIM_VF),
 	CNXK_PCI_ID(PCI_SUBSYSTEM_DEVID_CN9KE, PCI_DEVID_CNXK_RVU_SSO_TIM_VF),
+	CNXK_PCI_ID(PCI_SUBSYSTEM_DEVID_CNF9KA, PCI_DEVID_CNXK_RVU_SSO_TIM_VF),
 	{
 		.vendor_id = 0,
 	},

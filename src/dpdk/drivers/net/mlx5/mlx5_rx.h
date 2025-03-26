@@ -41,11 +41,11 @@ struct mlx5_rxq_stats {
 
 /* Compressed CQE context. */
 struct rxq_zip {
+	uint16_t cqe_cnt; /* Number of CQEs. */
 	uint16_t ai; /* Array index. */
-	uint16_t ca; /* Current array index. */
-	uint16_t na; /* Next array index. */
-	uint16_t cq_ci; /* The next CQE. */
-	uint32_t cqe_cnt; /* Number of CQEs. */
+	uint32_t ca; /* Current array index. */
+	uint32_t na; /* Next array index. */
+	uint32_t cq_ci; /* The next CQE. */
 };
 
 /* Get pointer to the first stride. */
@@ -62,6 +62,7 @@ enum mlx5_rxq_err_state {
 	MLX5_RXQ_ERR_STATE_NO_ERROR = 0,
 	MLX5_RXQ_ERR_STATE_NEED_RESET,
 	MLX5_RXQ_ERR_STATE_NEED_READY,
+	MLX5_RXQ_ERR_STATE_IGNORE,
 };
 
 enum mlx5_rqx_code {
@@ -99,6 +100,8 @@ struct mlx5_rxq_data {
 	unsigned int mcqe_format:3; /* CQE compression format. */
 	unsigned int shared:1; /* Shared RXQ. */
 	unsigned int delay_drop:1; /* Enable delay drop. */
+	unsigned int cqe_comp_layout:1; /* CQE Compression Layout*/
+	unsigned int cq_ci:24;
 	volatile uint32_t *rq_db;
 	volatile uint32_t *cq_db;
 	uint16_t port_id;
@@ -106,7 +109,6 @@ struct mlx5_rxq_data {
 	uint32_t rq_ci;
 	uint16_t consumed_strd; /* Number of consumed strides in WQE. */
 	uint32_t rq_pi;
-	uint32_t cq_ci;
 	uint16_t rq_repl_thresh; /* Threshold for buffer replenishment. */
 	uint32_t byte_mask;
 	union {
@@ -118,7 +120,9 @@ struct mlx5_rxq_data {
 	uint16_t mprq_max_memcpy_len; /* Maximum size of packet to memcpy. */
 	volatile void *wqes;
 	volatile struct mlx5_cqe(*cqes)[];
+	struct mlx5_cqe title_cqe; /* Title CQE for CQE compression. */
 	struct rte_mbuf *(*elts)[];
+	struct rte_mbuf title_pkt; /* Title packet for CQE compression. */
 	struct mlx5_mprq_buf *(*mprq_bufs)[];
 	struct rte_mempool *mp;
 	struct rte_mempool *mprq_mp; /* Mempool for Multi-Packet RQ. */
@@ -126,11 +130,13 @@ struct mlx5_rxq_data {
 	struct mlx5_dev_ctx_shared *sh; /* Shared context. */
 	uint16_t idx; /* Queue index. */
 	struct mlx5_rxq_stats stats;
+	struct mlx5_rxq_stats stats_reset; /* stats on last reset. */
 	rte_xmm_t mbuf_initializer; /* Default rearm/flags for vectorized Rx. */
 	struct rte_mbuf fake_mbuf; /* elts padding for vectorized Rx. */
 	struct mlx5_uar_data uar_data; /* CQ doorbell. */
 	uint32_t cqn; /* CQ number. */
 	uint8_t cq_arm_sn; /* CQ arm seq number. */
+	uint64_t mark_flag; /* ol_flags to set with marks. */
 	uint32_t tunnel; /* Tunnel information. */
 	int timestamp_offset; /* Dynamic mbuf field for timestamp. */
 	uint64_t timestamp_rx_flag; /* Dynamic mbuf flag for timestamp. */
@@ -174,6 +180,9 @@ struct mlx5_rxq_priv {
 	struct mlx5_devx_rq devx_rq;
 	struct rte_eth_hairpin_conf hairpin_conf; /* Hairpin configuration. */
 	uint32_t hairpin_status; /* Hairpin binding status. */
+	uint32_t lwm:16;
+	uint32_t lwm_event_pending:1;
+	uint32_t lwm_devx_subscribed:1;
 };
 
 /* External RX queue descriptor. */
@@ -209,7 +218,7 @@ struct mlx5_rxq_ctrl *mlx5_rxq_new(struct rte_eth_dev *dev, uint16_t idx,
 				   uint16_t desc, unsigned int socket,
 				   const struct rte_eth_rxconf *conf,
 				   const struct rte_eth_rxseg_split *rx_seg,
-				   uint16_t n_seg);
+				   uint16_t n_seg, bool is_extmem);
 struct mlx5_rxq_ctrl *mlx5_rxq_hairpin_new
 	(struct rte_eth_dev *dev, struct mlx5_rxq_priv *rxq, uint16_t desc,
 	 const struct rte_eth_hairpin_conf *hairpin_conf);
@@ -275,14 +284,15 @@ uint64_t mlx5_get_rx_queue_offloads(struct rte_eth_dev *dev);
 void mlx5_rxq_timestamp_set(struct rte_eth_dev *dev);
 int mlx5_hrxq_modify(struct rte_eth_dev *dev, uint32_t hxrq_idx,
 		     const uint8_t *rss_key, uint32_t rss_key_len,
-		     uint64_t hash_fields,
+		     uint64_t hash_fields, bool symmetric_hash_function,
 		     const uint16_t *queues, uint32_t queues_n);
 
 /* mlx5_rx.c */
 
 uint16_t mlx5_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n);
 void mlx5_rxq_initialize(struct mlx5_rxq_data *rxq);
-__rte_noinline int mlx5_rx_err_handle(struct mlx5_rxq_data *rxq, uint8_t vec);
+__rte_noinline int mlx5_rx_err_handle(struct mlx5_rxq_data *rxq, uint8_t vec,
+				      uint16_t err_n, uint16_t *skip_cnt);
 void mlx5_mprq_buf_free(struct mlx5_mprq_buf *buf);
 uint16_t mlx5_rx_burst_mprq(void *dpdk_rxq, struct rte_mbuf **pkts,
 			    uint16_t pkts_n);
@@ -293,6 +303,11 @@ void mlx5_rxq_info_get(struct rte_eth_dev *dev, uint16_t queue_id,
 int mlx5_rx_burst_mode_get(struct rte_eth_dev *dev, uint16_t rx_queue_id,
 			   struct rte_eth_burst_mode *mode);
 int mlx5_get_monitor_addr(void *rx_queue, struct rte_power_monitor_cond *pmc);
+void mlx5_dev_interrupt_handler_lwm(void *args);
+int mlx5_rx_queue_lwm_set(struct rte_eth_dev *dev, uint16_t rx_queue_id,
+			  uint8_t lwm);
+int mlx5_rx_queue_lwm_query(struct rte_eth_dev *dev, uint16_t *rx_queue_id,
+			    uint8_t *lwm);
 
 /* Vectorized version of mlx5_rx.c */
 int mlx5_rxq_check_vec_support(struct mlx5_rxq_data *rxq_data);
@@ -360,25 +375,6 @@ mlx5_rx_mb2mr(struct mlx5_rxq_data *rxq, struct rte_mbuf *mb)
 		return lkey;
 	/* Slower search in the mempool database on miss. */
 	return mlx5_mr_mempool2mr_bh(mr_ctrl, mb->pool, addr);
-}
-
-/**
- * Convert timestamp from HW format to linear counter
- * from Packet Pacing Clock Queue CQE timestamp format.
- *
- * @param sh
- *   Pointer to the device shared context. Might be needed
- *   to convert according current device configuration.
- * @param ts
- *   Timestamp from CQE to convert.
- * @return
- *   UTC in nanoseconds
- */
-static __rte_always_inline uint64_t
-mlx5_txpp_convert_rx_ts(struct mlx5_dev_ctx_shared *sh, uint64_t ts)
-{
-	RTE_SET_USED(sh);
-	return (ts & UINT32_MAX) + (ts >> 32) * NS_PER_S;
 }
 
 /**
@@ -528,7 +524,7 @@ mprq_buf_to_pkt(struct mlx5_rxq_data *rxq, struct rte_mbuf *pkt, uint32_t len,
 		void *buf_addr;
 
 		/* Increment the refcnt of the whole chunk. */
-		__atomic_add_fetch(&buf->refcnt, 1, __ATOMIC_RELAXED);
+		__atomic_fetch_add(&buf->refcnt, 1, __ATOMIC_RELAXED);
 		MLX5_ASSERT(__atomic_load_n(&buf->refcnt,
 			    __ATOMIC_RELAXED) <= strd_n + 1);
 		buf_addr = RTE_PTR_SUB(addr, RTE_PKTMBUF_HEADROOM);
@@ -667,10 +663,15 @@ mlx5_is_external_rxq(struct rte_eth_dev *dev, uint16_t queue_idx)
 	struct mlx5_priv *priv = dev->data->dev_private;
 	struct mlx5_external_rxq *rxq;
 
-	if (!priv->ext_rxqs || queue_idx < MLX5_EXTERNAL_RX_QUEUE_ID_MIN)
+	if (!priv->ext_rxqs || queue_idx < RTE_PMD_MLX5_EXTERNAL_RX_QUEUE_ID_MIN)
 		return false;
-	rxq = &priv->ext_rxqs[queue_idx - MLX5_EXTERNAL_RX_QUEUE_ID_MIN];
+	rxq = &priv->ext_rxqs[queue_idx - RTE_PMD_MLX5_EXTERNAL_RX_QUEUE_ID_MIN];
 	return !!__atomic_load_n(&rxq->refcnt, __ATOMIC_RELAXED);
 }
+
+#define LWM_COOKIE_RXQID_OFFSET 0
+#define LWM_COOKIE_RXQID_MASK 0xffff
+#define LWM_COOKIE_PORTID_OFFSET 16
+#define LWM_COOKIE_PORTID_MASK 0xffff
 
 #endif /* RTE_PMD_MLX5_RX_H_ */

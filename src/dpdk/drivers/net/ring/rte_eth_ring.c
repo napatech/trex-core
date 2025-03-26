@@ -2,19 +2,23 @@
  * Copyright(c) 2010-2015 Intel Corporation
  */
 
+#include <stdlib.h>
+
 #include "rte_eth_ring.h"
 #include <rte_mbuf.h>
 #include <ethdev_driver.h>
 #include <rte_malloc.h>
 #include <rte_memcpy.h>
+#include <rte_os_shim.h>
 #include <rte_string_fns.h>
-#include <rte_bus_vdev.h>
+#include <bus_vdev_driver.h>
 #include <rte_kvargs.h>
 #include <rte_errno.h>
 
 #define ETH_RING_NUMA_NODE_ACTION_ARG	"nodeaction"
 #define ETH_RING_ACTION_CREATE		"CREATE"
 #define ETH_RING_ACTION_ATTACH		"ATTACH"
+#define ETH_RING_ACTION_MAX_LEN		8 /* CREATE | ACTION */
 #define ETH_RING_INTERNAL_ARG		"internal"
 #define ETH_RING_INTERNAL_ARG_MAX_LEN	19 /* "0x..16chars..\0" */
 
@@ -40,8 +44,8 @@ enum dev_action {
 
 struct ring_queue {
 	struct rte_ring *rng;
-	rte_atomic64_t rx_pkts;
-	rte_atomic64_t tx_pkts;
+	uint64_t rx_pkts;
+	uint64_t tx_pkts;
 };
 
 struct pmd_internals {
@@ -76,9 +80,9 @@ eth_ring_rx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 	const uint16_t nb_rx = (uint16_t)rte_ring_dequeue_burst(r->rng,
 			ptrs, nb_bufs, NULL);
 	if (r->rng->flags & RING_F_SC_DEQ)
-		r->rx_pkts.cnt += nb_rx;
+		r->rx_pkts += nb_rx;
 	else
-		rte_atomic64_add(&(r->rx_pkts), nb_rx);
+		__atomic_fetch_add(&r->rx_pkts, nb_rx, __ATOMIC_RELAXED);
 	return nb_rx;
 }
 
@@ -90,9 +94,9 @@ eth_ring_tx(void *q, struct rte_mbuf **bufs, uint16_t nb_bufs)
 	const uint16_t nb_tx = (uint16_t)rte_ring_enqueue_burst(r->rng,
 			ptrs, nb_bufs, NULL);
 	if (r->rng->flags & RING_F_SP_ENQ)
-		r->tx_pkts.cnt += nb_tx;
+		r->tx_pkts += nb_tx;
 	else
-		rte_atomic64_add(&(r->tx_pkts), nb_tx);
+		__atomic_fetch_add(&r->tx_pkts, nb_tx, __ATOMIC_RELAXED);
 	return nb_tx;
 }
 
@@ -109,15 +113,30 @@ eth_dev_start(struct rte_eth_dev *dev)
 static int
 eth_dev_stop(struct rte_eth_dev *dev)
 {
+	uint16_t i;
+
 	dev->data->dev_started = 0;
 	dev->data->dev_link.link_status = RTE_ETH_LINK_DOWN;
+
+	for (i = 0; i < dev->data->nb_rx_queues; i++)
+		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
+	for (i = 0; i < dev->data->nb_tx_queues; i++)
+		dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
 	return 0;
 }
 
 static int
 eth_dev_set_link_down(struct rte_eth_dev *dev)
 {
+	uint16_t i;
+
 	dev->data->dev_link.link_status = RTE_ETH_LINK_DOWN;
+
+	for (i = 0; i < dev->data->nb_rx_queues; i++)
+		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
+	for (i = 0; i < dev->data->nb_tx_queues; i++)
+		dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
+
 	return 0;
 }
 
@@ -180,13 +199,13 @@ eth_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *stats)
 
 	for (i = 0; i < RTE_ETHDEV_QUEUE_STAT_CNTRS &&
 			i < dev->data->nb_rx_queues; i++) {
-		stats->q_ipackets[i] = internal->rx_ring_queues[i].rx_pkts.cnt;
+		stats->q_ipackets[i] = internal->rx_ring_queues[i].rx_pkts;
 		rx_total += stats->q_ipackets[i];
 	}
 
 	for (i = 0; i < RTE_ETHDEV_QUEUE_STAT_CNTRS &&
 			i < dev->data->nb_tx_queues; i++) {
-		stats->q_opackets[i] = internal->tx_ring_queues[i].tx_pkts.cnt;
+		stats->q_opackets[i] = internal->tx_ring_queues[i].tx_pkts;
 		tx_total += stats->q_opackets[i];
 	}
 
@@ -203,9 +222,9 @@ eth_stats_reset(struct rte_eth_dev *dev)
 	struct pmd_internals *internal = dev->data->dev_private;
 
 	for (i = 0; i < dev->data->nb_rx_queues; i++)
-		internal->rx_ring_queues[i].rx_pkts.cnt = 0;
+		internal->rx_ring_queues[i].rx_pkts = 0;
 	for (i = 0; i < dev->data->nb_tx_queues; i++)
-		internal->tx_ring_queues[i].tx_pkts.cnt = 0;
+		internal->tx_ring_queues[i].tx_pkts = 0;
 
 	return 0;
 }
@@ -284,6 +303,29 @@ eth_dev_close(struct rte_eth_dev *dev)
 	return ret;
 }
 
+static int ring_monitor_callback(const uint64_t value,
+		const uint64_t arg[RTE_POWER_MONITOR_OPAQUE_SZ])
+{
+	/* Check if the head pointer has changed */
+	return value != arg[0];
+}
+
+static int
+eth_get_monitor_addr(void *rx_queue, struct rte_power_monitor_cond *pmc)
+{
+	struct rte_ring *rng = ((struct ring_queue *)rx_queue)->rng;
+
+	/*
+	 * Monitor ring head since if head moves
+	 * there are packets to transmit
+	 */
+	pmc->addr = &rng->prod.head;
+	pmc->size = sizeof(rng->prod.head);
+	pmc->opaque[0] = rng->prod.head;
+	pmc->fn = ring_monitor_callback;
+	return 0;
+}
+
 static const struct eth_dev_ops ops = {
 	.dev_close = eth_dev_close,
 	.dev_start = eth_dev_start,
@@ -303,6 +345,7 @@ static const struct eth_dev_ops ops = {
 	.promiscuous_disable = eth_promiscuous_disable,
 	.allmulticast_enable = eth_allmulticast_enable,
 	.allmulticast_disable = eth_allmulticast_disable,
+	.get_monitor_addr = eth_get_monitor_addr,
 };
 
 static int
@@ -513,7 +556,7 @@ eth_dev_ring_create(const char *name,
 }
 
 struct node_action_pair {
-	char name[PATH_MAX];
+	char name[ETH_RING_ACTION_MAX_LEN];
 	unsigned int node;
 	enum dev_action action;
 };

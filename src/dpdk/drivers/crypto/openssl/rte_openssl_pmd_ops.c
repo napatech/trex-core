@@ -10,7 +10,11 @@
 
 #include "openssl_pmd_private.h"
 #include "compat.h"
-
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+#include <openssl/provider.h>
+#include <openssl/core_names.h>
+#include <openssl/param_build.h>
+#endif
 
 static const struct rte_cryptodev_capabilities openssl_pmd_capabilities[] = {
 	{	/* MD5 HMAC */
@@ -390,6 +394,26 @@ static const struct rte_cryptodev_capabilities openssl_pmd_capabilities[] = {
 			}, }
 		}, }
 	},
+	{	/* AES CMAC (AUTH) */
+		.op = RTE_CRYPTO_OP_TYPE_SYMMETRIC,
+		{.sym = {
+			.xform_type = RTE_CRYPTO_SYM_XFORM_AUTH,
+			{.auth = {
+				.algo = RTE_CRYPTO_AUTH_AES_CMAC,
+				.block_size = 16,
+				.key_size = {
+					.min = 16,
+					.max = 32,
+					.increment = 8
+				},
+				.digest_size = {
+					.min = 4,
+					.max = 16,
+					.increment = 4
+				},
+			}, }
+		}, }
+	},
 	{	/* 3DES CBC */
 		.op = RTE_CRYPTO_OP_TYPE_SYMMETRIC,
 		{.sym = {
@@ -533,10 +557,10 @@ static const struct rte_cryptodev_capabilities openssl_pmd_capabilities[] = {
 			.xform_capa = {
 				.xform_type = RTE_CRYPTO_ASYM_XFORM_DH,
 				.op_types =
-				((1<<RTE_CRYPTO_ASYM_OP_PRIVATE_KEY_GENERATE) |
-				(1 << RTE_CRYPTO_ASYM_OP_PUBLIC_KEY_GENERATE |
+				((1<<RTE_CRYPTO_ASYM_KE_PRIV_KEY_GENERATE) |
+				(1 << RTE_CRYPTO_ASYM_KE_PUB_KEY_GENERATE |
 				(1 <<
-				RTE_CRYPTO_ASYM_OP_SHARED_SECRET_COMPUTE))),
+				RTE_CRYPTO_ASYM_KE_SHARED_SECRET_COMPUTE))),
 				{
 				.modlen = {
 				/* value 0 symbolizes no limit on min length */
@@ -567,6 +591,23 @@ static const struct rte_cryptodev_capabilities openssl_pmd_capabilities[] = {
 				}, }
 			}
 		},
+		}
+	},
+	{	/* SM2 */
+		.op = RTE_CRYPTO_OP_TYPE_ASYMMETRIC,
+		{.asym = {
+			.xform_capa = {
+				.xform_type = RTE_CRYPTO_ASYM_XFORM_SM2,
+				.hash_algos = (1 << RTE_CRYPTO_AUTH_SM3),
+				.op_types =
+				((1<<RTE_CRYPTO_ASYM_OP_SIGN) |
+				 (1 << RTE_CRYPTO_ASYM_OP_VERIFY) |
+				 (1 << RTE_CRYPTO_ASYM_OP_ENCRYPT) |
+				 (1 << RTE_CRYPTO_ASYM_OP_DECRYPT)),
+				{.internal_rng = 1
+				}
+			}
+		}
 		}
 	},
 
@@ -740,7 +781,6 @@ openssl_pmd_qp_setup(struct rte_cryptodev *dev, uint16_t qp_id,
 		goto qp_setup_cleanup;
 
 	qp->sess_mp = qp_conf->mp_session;
-	qp->sess_mp_priv = qp_conf->mp_session_private;
 
 	memset(&qp->stats, 0, sizeof(qp->stats));
 
@@ -770,10 +810,9 @@ openssl_pmd_asym_session_get_size(struct rte_cryptodev *dev __rte_unused)
 static int
 openssl_pmd_sym_session_configure(struct rte_cryptodev *dev __rte_unused,
 		struct rte_crypto_sym_xform *xform,
-		struct rte_cryptodev_sym_session *sess,
-		struct rte_mempool *mempool)
+		struct rte_cryptodev_sym_session *sess)
 {
-	void *sess_private_data;
+	void *sess_private_data = CRYPTODEV_GET_SYM_SESS_PRIV(sess);
 	int ret;
 
 	if (unlikely(sess == NULL)) {
@@ -781,23 +820,13 @@ openssl_pmd_sym_session_configure(struct rte_cryptodev *dev __rte_unused,
 		return -EINVAL;
 	}
 
-	if (rte_mempool_get(mempool, &sess_private_data)) {
-		OPENSSL_LOG(ERR,
-			"Couldn't get object from session mempool");
-		return -ENOMEM;
-	}
-
 	ret = openssl_set_session_parameters(sess_private_data, xform);
 	if (ret != 0) {
 		OPENSSL_LOG(ERR, "failed configure session parameters");
 
 		/* Return session to mempool */
-		rte_mempool_put(mempool, sess_private_data);
 		return ret;
 	}
-
-	set_sym_session_private_data(sess, dev->driver_id,
-			sess_private_data);
 
 	return 0;
 }
@@ -806,13 +835,13 @@ static int openssl_set_asym_session_parameters(
 		struct openssl_asym_session *asym_session,
 		struct rte_crypto_asym_xform *xform)
 {
-	int ret = 0;
+	int ret = -1;
 
 	if ((xform->xform_type != RTE_CRYPTO_ASYM_XFORM_DH) &&
 		(xform->next != NULL)) {
 		OPENSSL_LOG(ERR, "chained xfrms are not supported on %s",
-			rte_crypto_asym_xform_strings[xform->xform_type]);
-		return -1;
+			rte_cryptodev_asym_get_xform_string(xform->xform_type));
+		return ret;
 	}
 
 	switch (xform->xform_type) {
@@ -833,6 +862,108 @@ static int openssl_set_asym_session_parameters(
 		if (!n || !e)
 			goto err_rsa;
 
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+		OSSL_PARAM_BLD * param_bld = OSSL_PARAM_BLD_new();
+		if (!param_bld) {
+			OPENSSL_LOG(ERR, "failed to allocate resources\n");
+			goto err_rsa;
+		}
+
+		if (!OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_N, n)
+			|| !OSSL_PARAM_BLD_push_BN(param_bld,
+					OSSL_PKEY_PARAM_RSA_E, e)) {
+			OSSL_PARAM_BLD_free(param_bld);
+			OPENSSL_LOG(ERR, "failed to allocate resources\n");
+			goto err_rsa;
+		}
+
+		if (xform->rsa.key_type == RTE_RSA_KEY_TYPE_EXP) {
+			d = BN_bin2bn(
+			(const unsigned char *)xform->rsa.d.data,
+			xform->rsa.d.length,
+			d);
+			if (!d) {
+				OSSL_PARAM_BLD_free(param_bld);
+				goto err_rsa;
+			}
+		} else {
+			p = BN_bin2bn((const unsigned char *)
+					xform->rsa.qt.p.data,
+					xform->rsa.qt.p.length,
+					p);
+			q = BN_bin2bn((const unsigned char *)
+					xform->rsa.qt.q.data,
+					xform->rsa.qt.q.length,
+					q);
+			dmp1 = BN_bin2bn((const unsigned char *)
+					xform->rsa.qt.dP.data,
+					xform->rsa.qt.dP.length,
+					dmp1);
+			dmq1 = BN_bin2bn((const unsigned char *)
+					xform->rsa.qt.dQ.data,
+					xform->rsa.qt.dQ.length,
+					dmq1);
+			iqmp = BN_bin2bn((const unsigned char *)
+					xform->rsa.qt.qInv.data,
+					xform->rsa.qt.qInv.length,
+					iqmp);
+
+			if (!p || !q || !dmp1 || !dmq1 || !iqmp) {
+				OSSL_PARAM_BLD_free(param_bld);
+				goto err_rsa;
+			}
+
+			if (!OSSL_PARAM_BLD_push_BN(param_bld,
+							OSSL_PKEY_PARAM_RSA_FACTOR1, p)
+				|| !OSSL_PARAM_BLD_push_BN(param_bld,
+							OSSL_PKEY_PARAM_RSA_FACTOR2, q)
+				|| !OSSL_PARAM_BLD_push_BN(param_bld,
+							OSSL_PKEY_PARAM_RSA_EXPONENT1, dmp1)
+				|| !OSSL_PARAM_BLD_push_BN(param_bld,
+							OSSL_PKEY_PARAM_RSA_EXPONENT2, dmq1)
+				|| !OSSL_PARAM_BLD_push_BN(param_bld,
+							OSSL_PKEY_PARAM_RSA_COEFFICIENT1, iqmp)) {
+				OSSL_PARAM_BLD_free(param_bld);
+				goto err_rsa;
+			}
+		}
+
+		if (!OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_N, n)
+			|| !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_RSA_E, e)
+			|| !OSSL_PARAM_BLD_push_BN(param_bld,
+						OSSL_PKEY_PARAM_RSA_D, d)) {
+			OSSL_PARAM_BLD_free(param_bld);
+			goto err_rsa;
+		}
+
+		EVP_PKEY_CTX *key_ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+		EVP_PKEY *pkey = NULL;
+		EVP_PKEY_CTX *rsa_ctx = NULL;
+		OSSL_PARAM *params = NULL;
+
+		params = OSSL_PARAM_BLD_to_param(param_bld);
+		if (!params) {
+			OSSL_PARAM_BLD_free(param_bld);
+			goto err_rsa;
+		}
+
+		if (key_ctx == NULL
+			|| EVP_PKEY_fromdata_init(key_ctx) <= 0
+			|| EVP_PKEY_fromdata(key_ctx, &pkey,
+				EVP_PKEY_KEYPAIR, params) <= 0) {
+			OSSL_PARAM_free(params);
+			goto err_rsa;
+		}
+
+		rsa_ctx = EVP_PKEY_CTX_new(pkey, NULL);
+		asym_session->xfrm_type = RTE_CRYPTO_ASYM_XFORM_RSA;
+		asym_session->u.r.ctx = rsa_ctx;
+		EVP_PKEY_free(pkey);
+		EVP_PKEY_CTX_free(key_ctx);
+		OSSL_PARAM_BLD_free(param_bld);
+		OSSL_PARAM_free(params);
+		ret = 0;
+#else
 		RSA *rsa = RSA_new();
 		if (rsa == NULL)
 			goto err_rsa;
@@ -897,11 +1028,12 @@ static int openssl_set_asym_session_parameters(
 		if (ret) {
 			OPENSSL_LOG(ERR, "Failed to load rsa keys\n");
 			RSA_free(rsa);
-			return -1;
+			return ret;
 		}
 		asym_session->u.r.rsa = rsa;
 		asym_session->xfrm_type = RTE_CRYPTO_ASYM_XFORM_RSA;
 		break;
+#endif
 err_rsa:
 		BN_clear_free(n);
 		BN_clear_free(e);
@@ -912,7 +1044,7 @@ err_rsa:
 		BN_clear_free(dmq1);
 		BN_clear_free(iqmp);
 
-		return -1;
+		return ret;
 	}
 	case RTE_CRYPTO_ASYM_XFORM_MODEX:
 	{
@@ -922,7 +1054,7 @@ err_rsa:
 		if (ctx == NULL) {
 			OPENSSL_LOG(ERR,
 				" failed to allocate resources\n");
-			return -1;
+			return ret;
 		}
 		BN_CTX_start(ctx);
 		BIGNUM *mod = BN_CTX_get(ctx);
@@ -930,7 +1062,7 @@ err_rsa:
 		if (mod == NULL || exp == NULL) {
 			BN_CTX_end(ctx);
 			BN_CTX_free(ctx);
-			return -1;
+			return ret;
 		}
 
 		mod = BN_bin2bn((const unsigned char *)
@@ -953,14 +1085,14 @@ err_rsa:
 		if (ctx == NULL) {
 			OPENSSL_LOG(ERR,
 				" failed to allocate resources\n");
-			return -1;
+			return ret;
 		}
 		BN_CTX_start(ctx);
 		BIGNUM *mod = BN_CTX_get(ctx);
 		if (mod == NULL) {
 			BN_CTX_end(ctx);
 			BN_CTX_free(ctx);
-			return -1;
+			return ret;
 		}
 
 		mod = BN_bin2bn((const unsigned char *)
@@ -974,6 +1106,59 @@ err_rsa:
 	}
 	case RTE_CRYPTO_ASYM_XFORM_DH:
 	{
+		DH *dh = NULL;
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+		BIGNUM **p = &asym_session->u.dh.p;
+		BIGNUM **g = &asym_session->u.dh.g;
+
+		*p = BN_bin2bn((const unsigned char *)
+				xform->dh.p.data,
+				xform->dh.p.length,
+				*p);
+		*g = BN_bin2bn((const unsigned char *)
+				xform->dh.g.data,
+				xform->dh.g.length,
+				*g);
+		if (!*p || !*g)
+			goto err_dh;
+
+		OSSL_PARAM_BLD *param_bld = NULL;
+		param_bld = OSSL_PARAM_BLD_new();
+		if (!param_bld) {
+			OPENSSL_LOG(ERR, "failed to allocate resources\n");
+			goto err_dh;
+		}
+		if ((!OSSL_PARAM_BLD_push_utf8_string(param_bld,
+					"group", "ffdhe2048", 0))
+			|| (!OSSL_PARAM_BLD_push_BN(param_bld,
+					OSSL_PKEY_PARAM_FFC_P, *p))
+			|| (!OSSL_PARAM_BLD_push_BN(param_bld,
+					OSSL_PKEY_PARAM_FFC_G, *g))) {
+			OSSL_PARAM_BLD_free(param_bld);
+			goto err_dh;
+		}
+
+		OSSL_PARAM_BLD *param_bld_peer = NULL;
+		param_bld_peer = OSSL_PARAM_BLD_new();
+		if (!param_bld_peer) {
+			OPENSSL_LOG(ERR, "failed to allocate resources\n");
+			OSSL_PARAM_BLD_free(param_bld);
+			goto err_dh;
+		}
+		if ((!OSSL_PARAM_BLD_push_utf8_string(param_bld_peer,
+					"group", "ffdhe2048", 0))
+			|| (!OSSL_PARAM_BLD_push_BN(param_bld_peer,
+					OSSL_PKEY_PARAM_FFC_P, *p))
+			|| (!OSSL_PARAM_BLD_push_BN(param_bld_peer,
+					OSSL_PKEY_PARAM_FFC_G, *g))) {
+			OSSL_PARAM_BLD_free(param_bld);
+			OSSL_PARAM_BLD_free(param_bld_peer);
+			goto err_dh;
+		}
+
+		asym_session->u.dh.param_bld = param_bld;
+		asym_session->u.dh.param_bld_peer = param_bld_peer;
+#else
 		BIGNUM *p = NULL;
 		BIGNUM *g = NULL;
 
@@ -988,7 +1173,7 @@ err_rsa:
 		if (!p || !g)
 			goto err_dh;
 
-		DH *dh = DH_new();
+		dh = DH_new();
 		if (dh == NULL) {
 			OPENSSL_LOG(ERR,
 				"failed to allocate resources\n");
@@ -999,45 +1184,76 @@ err_rsa:
 			DH_free(dh);
 			goto err_dh;
 		}
-
-		/*
-		 * setup xfrom for
-		 * public key generate, or
-		 * DH Priv key generate, or both
-		 * public and private key generate
-		 */
-		asym_session->u.dh.key_op = (1 << xform->dh.type);
-
-		if (xform->dh.type ==
-			RTE_CRYPTO_ASYM_OP_PRIVATE_KEY_GENERATE) {
-			/* check if next is pubkey */
-			if ((xform->next != NULL) &&
-				(xform->next->xform_type ==
-				RTE_CRYPTO_ASYM_XFORM_DH) &&
-				(xform->next->dh.type ==
-				RTE_CRYPTO_ASYM_OP_PUBLIC_KEY_GENERATE)
-				) {
-				/*
-				 * setup op as pub/priv key
-				 * pair generationi
-				 */
-				asym_session->u.dh.key_op |=
-				(1 <<
-				RTE_CRYPTO_ASYM_OP_PUBLIC_KEY_GENERATE);
-			}
-		}
+#endif
 		asym_session->u.dh.dh_key = dh;
 		asym_session->xfrm_type = RTE_CRYPTO_ASYM_XFORM_DH;
 		break;
 
 err_dh:
 		OPENSSL_LOG(ERR, " failed to set dh params\n");
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+		BN_free(*p);
+		BN_free(*g);
+#else
 		BN_free(p);
 		BN_free(g);
+#endif
 		return -1;
 	}
 	case RTE_CRYPTO_ASYM_XFORM_DSA:
 	{
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+		BIGNUM **p = &asym_session->u.s.p;
+		BIGNUM **g = &asym_session->u.s.g;
+		BIGNUM **q = &asym_session->u.s.q;
+		BIGNUM **priv_key = &asym_session->u.s.priv_key;
+		BIGNUM *pub_key = NULL;
+		OSSL_PARAM_BLD *param_bld = NULL;
+
+		*p = BN_bin2bn((const unsigned char *)
+				xform->dsa.p.data,
+				xform->dsa.p.length,
+				*p);
+
+		*g = BN_bin2bn((const unsigned char *)
+				xform->dsa.g.data,
+				xform->dsa.g.length,
+				*g);
+
+		*q = BN_bin2bn((const unsigned char *)
+				xform->dsa.q.data,
+				xform->dsa.q.length,
+				*q);
+		if (!*p || !*q || !*g)
+			goto err_dsa;
+
+		*priv_key = BN_bin2bn((const unsigned char *)
+				xform->dsa.x.data,
+				xform->dsa.x.length,
+				*priv_key);
+		if (*priv_key == NULL)
+			goto err_dsa;
+
+		param_bld = OSSL_PARAM_BLD_new();
+		if (!param_bld) {
+			OPENSSL_LOG(ERR, "failed to allocate resources\n");
+			goto err_dsa;
+		}
+
+		if (!OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_FFC_P, *p)
+			|| !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_FFC_G, *g)
+			|| !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_FFC_Q, *q)
+			|| !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_PRIV_KEY,
+			*priv_key)) {
+			OSSL_PARAM_BLD_free(param_bld);
+			OPENSSL_LOG(ERR, "failed to allocate resources\n");
+			goto err_dsa;
+		}
+		asym_session->xfrm_type = RTE_CRYPTO_ASYM_XFORM_DSA;
+		asym_session->u.s.param_bld = param_bld;
+
+		break;
+#else
 		BIGNUM *p = NULL, *g = NULL;
 		BIGNUM *q = NULL, *priv_key = NULL;
 		BIGNUM *pub_key = BN_new();
@@ -1092,22 +1308,115 @@ err_dh:
 		if (ret) {
 			DSA_free(dsa);
 			OPENSSL_LOG(ERR, "Failed to set keys\n");
-			return -1;
+			goto err_dsa;
 		}
 		asym_session->u.s.dsa = dsa;
 		asym_session->xfrm_type = RTE_CRYPTO_ASYM_XFORM_DSA;
 		break;
-
+#endif
 err_dsa:
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+		BN_free(*p);
+		BN_free(*q);
+		BN_free(*g);
+		BN_free(*priv_key);
+#else
 		BN_free(p);
 		BN_free(q);
 		BN_free(g);
 		BN_free(priv_key);
+#endif
 		BN_free(pub_key);
 		return -1;
 	}
-	default:
+	case RTE_CRYPTO_ASYM_XFORM_SM2:
+	{
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+#ifndef OPENSSL_NO_SM2
+		OSSL_PARAM_BLD *param_bld = NULL;
+		OSSL_PARAM *params = NULL;
+		BIGNUM *pkey_bn = NULL;
+		uint8_t pubkey[65];
+		size_t len = 0;
+		int ret = -1;
+
+		param_bld = OSSL_PARAM_BLD_new();
+		if (!param_bld) {
+			OPENSSL_LOG(ERR, "failed to allocate params\n");
+			goto err_sm2;
+		}
+
+		ret = OSSL_PARAM_BLD_push_utf8_string(param_bld,
+				OSSL_ASYM_CIPHER_PARAM_DIGEST, "SM3", 0);
+		if (!ret) {
+			OPENSSL_LOG(ERR, "failed to push params\n");
+			goto err_sm2;
+		}
+
+		ret = OSSL_PARAM_BLD_push_utf8_string(param_bld,
+				OSSL_PKEY_PARAM_GROUP_NAME, "SM2", 0);
+		if (!ret) {
+			OPENSSL_LOG(ERR, "failed to push params\n");
+			goto err_sm2;
+		}
+
+		pkey_bn = BN_bin2bn((const unsigned char *)xform->ec.pkey.data,
+							xform->ec.pkey.length, pkey_bn);
+
+		ret = OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_PRIV_KEY,
+									 pkey_bn);
+		if (!ret) {
+			OPENSSL_LOG(ERR, "failed to push params\n");
+			goto err_sm2;
+		}
+
+		memset(pubkey, 0, sizeof(pubkey));
+		pubkey[0] = 0x04;
+		len += 1;
+		memcpy(&pubkey[len], xform->ec.q.x.data, xform->ec.q.x.length);
+		len += xform->ec.q.x.length;
+		memcpy(&pubkey[len], xform->ec.q.y.data, xform->ec.q.y.length);
+		len += xform->ec.q.y.length;
+
+		ret = OSSL_PARAM_BLD_push_octet_string(param_bld,
+				OSSL_PKEY_PARAM_PUB_KEY, pubkey, len);
+		if (!ret) {
+			OPENSSL_LOG(ERR, "failed to push params\n");
+			goto err_sm2;
+		}
+
+		params = OSSL_PARAM_BLD_to_param(param_bld);
+		if (!params) {
+			OPENSSL_LOG(ERR, "failed to push params\n");
+			goto err_sm2;
+		}
+
+		asym_session->u.sm2.params = params;
+		OSSL_PARAM_BLD_free(param_bld);
+		BN_free(pkey_bn);
+
+		asym_session->xfrm_type = RTE_CRYPTO_ASYM_XFORM_SM2;
+		break;
+err_sm2:
+		if (param_bld)
+			OSSL_PARAM_BLD_free(param_bld);
+
+		if (asym_session->u.sm2.params)
+			OSSL_PARAM_free(asym_session->u.sm2.params);
+
+		BN_free(pkey_bn);
 		return -1;
+#else
+		OPENSSL_LOG(WARNING, "SM2 unsupported in current OpenSSL Version");
+		return -ENOTSUP;
+#endif
+#else
+		OPENSSL_LOG(WARNING, "SM2 unsupported for OpenSSL Version < 3.0");
+		return -ENOTSUP;
+#endif
+	}
+	default:
+		return ret;
 	}
 
 	return 0;
@@ -1140,28 +1449,25 @@ openssl_pmd_asym_session_configure(struct rte_cryptodev *dev __rte_unused,
 
 /** Clear the memory of session so it doesn't leave key material behind */
 static void
-openssl_pmd_sym_session_clear(struct rte_cryptodev *dev,
+openssl_pmd_sym_session_clear(struct rte_cryptodev *dev __rte_unused,
 		struct rte_cryptodev_sym_session *sess)
 {
-	uint8_t index = dev->driver_id;
-	void *sess_priv = get_sym_session_private_data(sess, index);
+	void *sess_priv = CRYPTODEV_GET_SYM_SESS_PRIV(sess);
 
 	/* Zero out the whole structure */
-	if (sess_priv) {
-		openssl_reset_session(sess_priv);
-		memset(sess_priv, 0, sizeof(struct openssl_session));
-		struct rte_mempool *sess_mp = rte_mempool_from_obj(sess_priv);
-		set_sym_session_private_data(sess, index, NULL);
-		rte_mempool_put(sess_mp, sess_priv);
-	}
+	openssl_reset_session(sess_priv);
 }
 
 static void openssl_reset_asym_session(struct openssl_asym_session *sess)
 {
 	switch (sess->xfrm_type) {
 	case RTE_CRYPTO_ASYM_XFORM_RSA:
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+		EVP_PKEY_CTX_free(sess->u.r.ctx);
+#else
 		if (sess->u.r.rsa)
 			RSA_free(sess->u.r.rsa);
+#endif
 		break;
 	case RTE_CRYPTO_ASYM_XFORM_MODEX:
 		if (sess->u.e.ctx) {
@@ -1176,13 +1482,35 @@ static void openssl_reset_asym_session(struct openssl_asym_session *sess)
 		}
 		break;
 	case RTE_CRYPTO_ASYM_XFORM_DH:
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+		OSSL_PARAM_BLD_free(sess->u.dh.param_bld);
+		OSSL_PARAM_BLD_free(sess->u.dh.param_bld_peer);
+		sess->u.dh.param_bld = NULL;
+		sess->u.dh.param_bld_peer = NULL;
+#else
 		if (sess->u.dh.dh_key)
 			DH_free(sess->u.dh.dh_key);
+#endif
+		BN_clear_free(sess->u.dh.p);
+		BN_clear_free(sess->u.dh.g);
 		break;
 	case RTE_CRYPTO_ASYM_XFORM_DSA:
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+		OSSL_PARAM_BLD_free(sess->u.s.param_bld);
+		sess->u.s.param_bld = NULL;
+		BN_clear_free(sess->u.s.p);
+		BN_clear_free(sess->u.s.q);
+		BN_clear_free(sess->u.s.g);
+		BN_clear_free(sess->u.s.priv_key);
+#else
 		if (sess->u.s.dsa)
 			DSA_free(sess->u.s.dsa);
+#endif
 		break;
+	case RTE_CRYPTO_ASYM_XFORM_SM2:
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+		OSSL_PARAM_free(sess->u.sm2.params);
+#endif
 	default:
 		break;
 	}

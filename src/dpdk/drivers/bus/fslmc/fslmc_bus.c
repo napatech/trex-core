@@ -6,17 +6,18 @@
 
 #include <string.h>
 #include <dirent.h>
+#include <stdalign.h>
 #include <stdbool.h>
 
 #include <rte_log.h>
-#include <rte_bus.h>
+#include <bus_driver.h>
 #include <rte_malloc.h>
 #include <rte_devargs.h>
 #include <rte_memcpy.h>
 #include <ethdev_driver.h>
 #include <rte_mbuf_dyn.h>
 
-#include <rte_fslmc.h>
+#include "private.h"
 #include <fslmc_vfio.h>
 #include "fslmc_logs.h"
 
@@ -156,6 +157,7 @@ scan_one_fslmc_device(char *dev_name)
 	}
 
 	dev->device.bus = &rte_fslmc_bus.bus;
+	dev->device.numa_node = SOCKET_ID_ANY;
 
 	/* Allocate interrupt instance */
 	dev->intr_handle =
@@ -394,7 +396,7 @@ rte_fslmc_probe(void)
 	static const struct rte_mbuf_dynfield dpaa2_seqn_dynfield_desc = {
 		.name = DPAA2_SEQN_DYNFIELD_NAME,
 		.size = sizeof(dpaa2_seqn_t),
-		.align = __alignof__(dpaa2_seqn_t),
+		.align = alignof(dpaa2_seqn_t),
 	};
 
 	if (TAILQ_EMPTY(&rte_fslmc_bus.device_list))
@@ -530,27 +532,19 @@ rte_fslmc_driver_register(struct rte_dpaa2_driver *driver)
 	RTE_VERIFY(driver);
 
 	TAILQ_INSERT_TAIL(&rte_fslmc_bus.driver_list, driver, next);
-	/* Update Bus references */
-	driver->fslmc_bus = &rte_fslmc_bus;
 }
 
 /*un-register a fslmc bus based dpaa2 driver */
 void
 rte_fslmc_driver_unregister(struct rte_dpaa2_driver *driver)
 {
-	struct rte_fslmc_bus *fslmc_bus;
-
-	fslmc_bus = driver->fslmc_bus;
-
 	/* Cleanup the PA->VA Translation table; From wherever this function
 	 * is called from.
 	 */
 	if (rte_eal_iova_mode() == RTE_IOVA_PA)
 		dpaax_iova_table_depopulate();
 
-	TAILQ_REMOVE(&fslmc_bus->driver_list, driver, next);
-	/* Update Bus references */
-	driver->fslmc_bus = NULL;
+	TAILQ_REMOVE(&rte_fslmc_bus.driver_list, driver, next);
 }
 
 /*
@@ -641,6 +635,10 @@ fslmc_bus_dev_iterate(const void *start, const char *str,
 
 	/* Now that name=device_name format is available, split */
 	dup = strdup(str);
+	if (dup == NULL) {
+		DPAA2_BUS_DEBUG("Dup string (%s) failed!\n", str);
+		return NULL;
+	}
 	dev_name = dup + strlen("name=");
 
 	if (start != NULL) {

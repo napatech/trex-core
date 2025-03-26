@@ -3,14 +3,20 @@
  */
 
 #include <rte_acl.h>
+#include <rte_log.h>
+
 #include "tb_mem.h"
 #include "acl.h"
+#include "acl_log.h"
 
 #define	ACL_POOL_ALIGN		8
 #define	ACL_POOL_ALLOC_MIN	0x800000
 
 /* number of pointers per alloc */
 #define ACL_PTR_ALLOC	32
+
+/* account for situation when all fields are 8B long */
+#define ACL_MAX_INDEXES	(2 * RTE_ACL_MAX_FIELDS)
 
 /* macros for dividing rule sets heuristics */
 #define NODE_MAX	0x4000
@@ -80,7 +86,7 @@ struct acl_build_context {
 	struct tb_mem_pool        pool;
 	struct rte_acl_trie       tries[RTE_ACL_MAX_TRIES];
 	struct rte_acl_bld_trie   bld_tries[RTE_ACL_MAX_TRIES];
-	uint32_t            data_indexes[RTE_ACL_MAX_TRIES][RTE_ACL_MAX_FIELDS];
+	uint32_t            data_indexes[RTE_ACL_MAX_TRIES][ACL_MAX_INDEXES];
 
 	/* memory free lists for nodes and blocks used for node ptrs */
 	struct acl_mem_block      blocks[MEM_BLOCK_NUM];
@@ -988,7 +994,7 @@ build_trie(struct acl_build_context *context, struct rte_acl_build_rule *head,
 				 */
 				uint64_t mask;
 				mask = RTE_ACL_MASKLEN_TO_BITMASK(
-					fld->mask_range.u32,
+					fld->mask_range.u64,
 					rule->config->defs[n].size);
 
 				/* gen a mini-trie for this field */
@@ -1011,8 +1017,8 @@ build_trie(struct acl_build_context *context, struct rte_acl_build_rule *head,
 				break;
 
 			default:
-				RTE_LOG(ERR, ACL,
-					"Error in rule[%u] type - %hhu\n",
+				ACL_LOG(ERR,
+					"Error in rule[%u] type - %hhu",
 					rule->f->data.userdata,
 					rule->config->defs[n].type);
 				return NULL;
@@ -1088,7 +1094,7 @@ acl_calc_wildness(struct rte_acl_build_rule *head,
 
 			switch (rule->config->defs[n].type) {
 			case RTE_ACL_FIELD_TYPE_BITMASK:
-				wild = (size - __builtin_popcountll(
+				wild = (size - rte_popcount64(
 					fld->mask_range.u64 & msk_val)) /
 					size;
 				break;
@@ -1301,6 +1307,9 @@ acl_build_index(const struct rte_acl_config *config, uint32_t *data_index)
 		if (last_header != config->defs[n].input_index) {
 			last_header = config->defs[n].input_index;
 			data_index[m++] = config->defs[n].offset;
+			if (config->defs[n].size > sizeof(uint32_t))
+				data_index[m++] = config->defs[n].offset +
+					sizeof(uint32_t);
 		}
 	}
 
@@ -1365,7 +1374,7 @@ acl_build_tries(struct acl_build_context *context,
 
 		last = build_one_trie(context, rule_sets, n, context->node_max);
 		if (context->bld_tries[n].trie == NULL) {
-			RTE_LOG(ERR, ACL, "Build of %u-th trie failed\n", n);
+			ACL_LOG(ERR, "Build of %u-th trie failed", n);
 			return -ENOMEM;
 		}
 
@@ -1374,8 +1383,8 @@ acl_build_tries(struct acl_build_context *context,
 			break;
 
 		if (num_tries == RTE_DIM(context->tries)) {
-			RTE_LOG(ERR, ACL,
-				"Exceeded max number of tries: %u\n",
+			ACL_LOG(ERR,
+				"Exceeded max number of tries: %u",
 				num_tries);
 			return -ENOMEM;
 		}
@@ -1400,7 +1409,7 @@ acl_build_tries(struct acl_build_context *context,
 		 */
 		last = build_one_trie(context, rule_sets, n, INT32_MAX);
 		if (context->bld_tries[n].trie == NULL || last != NULL) {
-			RTE_LOG(ERR, ACL, "Build of %u-th trie failed\n", n);
+			ACL_LOG(ERR, "Build of %u-th trie failed", n);
 			return -ENOMEM;
 		}
 
@@ -1426,8 +1435,8 @@ acl_build_log(const struct acl_build_context *ctx)
 
 	for (n = 0; n < RTE_DIM(ctx->tries); n++) {
 		if (ctx->tries[n].count != 0)
-			RTE_LOG(DEBUG, ACL,
-				"trie %u: number of rules: %u, indexes: %u\n",
+			ACL_LOG(DEBUG,
+				"trie %u: number of rules: %u, indexes: %u",
 				n, ctx->tries[n].count,
 				ctx->tries[n].num_data_indexes);
 	}
@@ -1487,7 +1496,7 @@ acl_set_data_indexes(struct rte_acl_ctx *ctx)
 		memcpy(ctx->data_indexes + ofs, ctx->trie[i].data_index,
 			n * sizeof(ctx->data_indexes[0]));
 		ctx->trie[i].data_index = ctx->data_indexes + ofs;
-		ofs += RTE_ACL_MAX_FIELDS;
+		ofs += ACL_MAX_INDEXES;
 	}
 }
 
@@ -1517,8 +1526,8 @@ acl_bld(struct acl_build_context *bcx, struct rte_acl_ctx *ctx,
 
 	/* build phase runs out of memory. */
 	if (rc != 0) {
-		RTE_LOG(ERR, ACL,
-			"ACL context: %s, %s() failed with error code: %d\n",
+		ACL_LOG(ERR,
+			"ACL context: %s, %s() failed with error code: %d",
 			bcx->acx->name, __func__, rc);
 		return rc;
 	}
@@ -1559,8 +1568,8 @@ acl_check_bld_param(struct rte_acl_ctx *ctx, const struct rte_acl_config *cfg)
 
 	for (i = 0; i != cfg->num_fields; i++) {
 		if (cfg->defs[i].type > RTE_ACL_FIELD_TYPE_BITMASK) {
-			RTE_LOG(ERR, ACL,
-			"ACL context: %s, invalid type: %hhu for %u-th field\n",
+			ACL_LOG(ERR,
+			"ACL context: %s, invalid type: %hhu for %u-th field",
 			ctx->name, cfg->defs[i].type, i);
 			return -EINVAL;
 		}
@@ -1571,8 +1580,8 @@ acl_check_bld_param(struct rte_acl_ctx *ctx, const struct rte_acl_config *cfg)
 			;
 
 		if (j == RTE_DIM(field_sizes)) {
-			RTE_LOG(ERR, ACL,
-			"ACL context: %s, invalid size: %hhu for %u-th field\n",
+			ACL_LOG(ERR,
+			"ACL context: %s, invalid size: %hhu for %u-th field",
 			ctx->name, cfg->defs[i].size, i);
 			return -EINVAL;
 		}
@@ -1643,7 +1652,7 @@ rte_acl_build(struct rte_acl_ctx *ctx, const struct rte_acl_config *cfg)
 			/* allocate and fill run-time  structures. */
 			rc = rte_acl_gen(ctx, bcx.tries, bcx.bld_tries,
 				bcx.num_tries, bcx.cfg.num_categories,
-				RTE_ACL_MAX_FIELDS * RTE_DIM(bcx.tries) *
+				ACL_MAX_INDEXES * RTE_DIM(bcx.tries) *
 				sizeof(ctx->data_indexes[0]), max_size);
 			if (rc == 0) {
 				/* set data indexes. */

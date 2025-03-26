@@ -23,13 +23,16 @@
 
 #define DEV_NAME "BBDEV"
 
+/* Number of supported operation types in *rte_bbdev_op_type*. */
+#define BBDEV_OP_TYPE_COUNT 7
 
 /* BBDev library logging ID */
 RTE_LOG_REGISTER_DEFAULT(bbdev_logtype, NOTICE);
+#define RTE_LOGTYPE_BBDEV bbdev_logtype
 
 /* Helper macro for logging */
-#define rte_bbdev_log(level, fmt, ...) \
-	rte_log(RTE_LOG_ ## level, bbdev_logtype, fmt "\n", ##__VA_ARGS__)
+#define rte_bbdev_log(level, ...) \
+	RTE_LOG_LINE(level, BBDEV, "" __VA_ARGS__)
 
 #define rte_bbdev_log_debug(fmt, ...) \
 	rte_bbdev_log(DEBUG, RTE_STR(__LINE__) ":%s() " fmt, __func__, \
@@ -206,7 +209,7 @@ rte_bbdev_allocate(const char *name)
 		return NULL;
 	}
 
-	__atomic_add_fetch(&bbdev->data->process_cnt, 1, __ATOMIC_RELAXED);
+	rte_atomic_fetch_add_explicit(&bbdev->data->process_cnt, 1, rte_memory_order_relaxed);
 	bbdev->data->dev_id = dev_id;
 	bbdev->state = RTE_BBDEV_INITIALIZED;
 
@@ -248,8 +251,8 @@ rte_bbdev_release(struct rte_bbdev *bbdev)
 	}
 
 	/* clear shared BBDev Data if no process is using the device anymore */
-	if (__atomic_sub_fetch(&bbdev->data->process_cnt, 1,
-			      __ATOMIC_RELAXED) == 0)
+	if (rte_atomic_fetch_sub_explicit(&bbdev->data->process_cnt, 1,
+			      rte_memory_order_relaxed) - 1 == 0)
 		memset(bbdev->data, 0, sizeof(*bbdev->data));
 
 	memset(bbdev, 0, sizeof(*bbdev));
@@ -439,6 +442,7 @@ rte_bbdev_queue_configure(uint16_t dev_id, uint16_t queue_id,
 	const struct rte_bbdev_op_cap *p;
 	struct rte_bbdev_queue_conf *stored_conf;
 	const char *op_type_str;
+	unsigned int max_priority;
 	VALID_DEV_OR_RET_ERR(dev, dev_id);
 
 	VALID_DEV_OPS_OR_RET_ERR(dev, dev_id);
@@ -492,20 +496,16 @@ rte_bbdev_queue_configure(uint16_t dev_id, uint16_t queue_id,
 					conf->queue_size, queue_id, dev_id);
 			return -EINVAL;
 		}
-		if (conf->op_type == RTE_BBDEV_OP_TURBO_DEC &&
-			conf->priority > dev_info.max_ul_queue_priority) {
+		if ((uint8_t)conf->op_type >= RTE_BBDEV_OP_TYPE_SIZE_MAX) {
 			rte_bbdev_log(ERR,
-					"Priority (%u) of queue %u of bbdev %u must be <= %u",
-					conf->priority, queue_id, dev_id,
-					dev_info.max_ul_queue_priority);
+					"Invalid operation type (%u) ", conf->op_type);
 			return -EINVAL;
 		}
-		if (conf->op_type == RTE_BBDEV_OP_TURBO_ENC &&
-			conf->priority > dev_info.max_dl_queue_priority) {
+		max_priority = dev_info.queue_priority[conf->op_type];
+		if (conf->priority > max_priority) {
 			rte_bbdev_log(ERR,
 					"Priority (%u) of queue %u of bbdev %u must be <= %u",
-					conf->priority, queue_id, dev_id,
-					dev_info.max_dl_queue_priority);
+					conf->priority, queue_id, dev_id, max_priority);
 			return -EINVAL;
 		}
 	}
@@ -719,6 +719,8 @@ get_stats_from_queues(struct rte_bbdev *dev, struct rte_bbdev_stats *stats)
 		stats->dequeued_count += q_stats->dequeued_count;
 		stats->enqueue_err_count += q_stats->enqueue_err_count;
 		stats->dequeue_err_count += q_stats->dequeue_err_count;
+		stats->enqueue_warn_count += q_stats->enqueue_warn_count;
+		stats->dequeue_warn_count += q_stats->dequeue_warn_count;
 	}
 	rte_bbdev_log_debug("Got stats on %u", dev->data->dev_id);
 }
@@ -850,6 +852,12 @@ get_bbdev_op_size(enum rte_bbdev_op_type type)
 	case RTE_BBDEV_OP_LDPC_ENC:
 		result = sizeof(struct rte_bbdev_enc_op);
 		break;
+	case RTE_BBDEV_OP_FFT:
+		result = sizeof(struct rte_bbdev_fft_op);
+		break;
+	case RTE_BBDEV_OP_MLDTS:
+		result = sizeof(struct rte_bbdev_mldts_op);
+		break;
 	default:
 		break;
 	}
@@ -873,6 +881,14 @@ bbdev_op_init(struct rte_mempool *mempool, void *arg, void *element,
 		struct rte_bbdev_enc_op *op = element;
 		memset(op, 0, mempool->elt_size);
 		op->mempool = mempool;
+	} else if (type == RTE_BBDEV_OP_FFT) {
+		struct rte_bbdev_fft_op *op = element;
+		memset(op, 0, mempool->elt_size);
+		op->mempool = mempool;
+	} else if (type == RTE_BBDEV_OP_MLDTS) {
+		struct rte_bbdev_mldts_op *op = element;
+		memset(op, 0, mempool->elt_size);
+		op->mempool = mempool;
 	}
 }
 
@@ -890,10 +906,10 @@ rte_bbdev_op_pool_create(const char *name, enum rte_bbdev_op_type type,
 		return NULL;
 	}
 
-	if (type >= RTE_BBDEV_OP_TYPE_COUNT) {
+	if (type >= BBDEV_OP_TYPE_COUNT) {
 		rte_bbdev_log(ERR,
 				"Invalid op type (%u), should be less than %u",
-				type, RTE_BBDEV_OP_TYPE_COUNT);
+				type, BBDEV_OP_TYPE_COUNT);
 		return NULL;
 	}
 
@@ -1091,12 +1107,12 @@ rte_bbdev_queue_intr_ctl(uint16_t dev_id, uint16_t queue_id, int epfd, int op,
 
 	intr_handle = dev->intr_handle;
 	if (intr_handle == NULL) {
-		rte_bbdev_log(ERR, "Device %u intr handle unset\n", dev_id);
+		rte_bbdev_log(ERR, "Device %u intr handle unset", dev_id);
 		return -ENOTSUP;
 	}
 
 	if (queue_id >= RTE_MAX_RXTX_INTR_VEC_ID) {
-		rte_bbdev_log(ERR, "Device %u queue_id %u is too big\n",
+		rte_bbdev_log(ERR, "Device %u queue_id %u is too big",
 				dev_id, queue_id);
 		return -ENOTSUP;
 	}
@@ -1105,7 +1121,7 @@ rte_bbdev_queue_intr_ctl(uint16_t dev_id, uint16_t queue_id, int epfd, int op,
 	ret = rte_intr_rx_ctl(intr_handle, epfd, op, vec, data);
 	if (ret && (ret != -EEXIST)) {
 		rte_bbdev_log(ERR,
-				"dev %u q %u int ctl error op %d epfd %d vec %u\n",
+				"dev %u q %u int ctl error op %d epfd %d vec %u",
 				dev_id, queue_id, op, epfd, vec);
 		return ret;
 	}
@@ -1123,11 +1139,54 @@ rte_bbdev_op_type_str(enum rte_bbdev_op_type op_type)
 		"RTE_BBDEV_OP_TURBO_ENC",
 		"RTE_BBDEV_OP_LDPC_DEC",
 		"RTE_BBDEV_OP_LDPC_ENC",
+		"RTE_BBDEV_OP_FFT",
+		"RTE_BBDEV_OP_MLDTS",
 	};
 
-	if (op_type < RTE_BBDEV_OP_TYPE_COUNT)
+	if (op_type < BBDEV_OP_TYPE_COUNT)
 		return op_types[op_type];
 
 	rte_bbdev_log(ERR, "Invalid operation type");
+	return NULL;
+}
+
+const char *
+rte_bbdev_device_status_str(enum rte_bbdev_device_status status)
+{
+	static const char * const dev_sta_string[] = {
+		"RTE_BBDEV_DEV_NOSTATUS",
+		"RTE_BBDEV_DEV_NOT_SUPPORTED",
+		"RTE_BBDEV_DEV_RESET",
+		"RTE_BBDEV_DEV_CONFIGURED",
+		"RTE_BBDEV_DEV_ACTIVE",
+		"RTE_BBDEV_DEV_FATAL_ERR",
+		"RTE_BBDEV_DEV_RESTART_REQ",
+		"RTE_BBDEV_DEV_RECONFIG_REQ",
+		"RTE_BBDEV_DEV_CORRECT_ERR",
+	};
+
+	/* Cast from enum required for clang. */
+	if ((uint8_t)status < sizeof(dev_sta_string) / sizeof(char *))
+		return dev_sta_string[status];
+
+	rte_bbdev_log(ERR, "Invalid device status");
+	return NULL;
+}
+
+const char *
+rte_bbdev_enqueue_status_str(enum rte_bbdev_enqueue_status status)
+{
+	static const char * const enq_sta_string[] = {
+		"RTE_BBDEV_ENQ_STATUS_NONE",
+		"RTE_BBDEV_ENQ_STATUS_QUEUE_FULL",
+		"RTE_BBDEV_ENQ_STATUS_RING_FULL",
+		"RTE_BBDEV_ENQ_STATUS_INVALID_OP",
+	};
+
+	/* Cast from enum required for clang. */
+	if ((uint8_t)status < sizeof(enq_sta_string) / sizeof(char *))
+		return enq_sta_string[status];
+
+	rte_bbdev_log(ERR, "Invalid enqueue status");
 	return NULL;
 }

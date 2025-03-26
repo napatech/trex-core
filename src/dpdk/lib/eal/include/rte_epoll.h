@@ -13,7 +13,7 @@
 
 #include <stdint.h>
 
-#include <rte_compat.h>
+#include <rte_stdatomic.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,7 +39,7 @@ enum {
 
 /** interrupt epoll event obj, taken by epoll_event.ptr */
 struct rte_epoll_event {
-	uint32_t status;           /**< OUT: event status */
+	RTE_ATOMIC(uint32_t) status;           /**< OUT: event status */
 	int fd;                    /**< OUT: event fd */
 	int epfd;       /**< OUT: epoll instance the ev associated with */
 	struct rte_epoll_data epdata;
@@ -85,7 +85,6 @@ rte_epoll_wait(int epfd, struct rte_epoll_event *events,
  *   - On success, returns the number of available event.
  *   - On failure, a negative value.
  */
-__rte_experimental
 int
 rte_epoll_wait_interruptible(int epfd, struct rte_epoll_event *events,
 	       int maxevents, int timeout);

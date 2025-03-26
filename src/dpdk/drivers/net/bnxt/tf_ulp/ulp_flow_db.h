@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(c) 2014-2021 Broadcom
+ * Copyright(c) 2014-2023 Broadcom
  * All rights reserved.
  */
 
@@ -15,6 +15,7 @@
 
 /* Defines for the fdb flag */
 #define ULP_FDB_FLAG_SHARED_SESSION	0x1
+#define ULP_FDB_FLAG_SHARED_WC_SESSION	0x2
 
 /*
  * Structure for the flow database resource information
@@ -203,13 +204,13 @@ ulp_flow_db_resource_get(struct bnxt_ulp_context *ulp_ctxt,
  * Flush all flows in the flow database.
  *
  * ulp_ctxt [in] Ptr to ulp context
- * tbl_idx [in] The index to table
+ * flow_type [in] - specify default or regular
  *
  * returns 0 on success or negative number on failure
  */
 int32_t
 ulp_flow_db_flush_flows(struct bnxt_ulp_context *ulp_ctx,
-			uint32_t idx);
+			enum bnxt_ulp_fdb_type flow_type);
 
 /*
  * Flush all flows in the flow database that belong to a device function.
@@ -404,11 +405,18 @@ ulp_flow_db_parent_flow_count_reset(struct bnxt_ulp_context *ulp_ctxt);
  * Set the shared bit for the flow db entry
  *
  * res [in] Ptr to fdb entry
- * shared [in] shared flag
+ * s_type [in] session flag
  *
  * returns none
  */
 void ulp_flow_db_shared_session_set(struct ulp_flow_db_res_params *res,
-				    enum bnxt_ulp_shared_session shared);
+				    enum bnxt_ulp_session_type s_type);
 
+/*
+ * Get the shared bit for the flow db entry
+ *
+ * res [out] Shared session type
+ */
+enum bnxt_ulp_session_type
+ulp_flow_db_shared_session_get(struct ulp_flow_db_res_params *res);
 #endif /* _ULP_FLOW_DB_H_ */

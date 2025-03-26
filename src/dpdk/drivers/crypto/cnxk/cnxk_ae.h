@@ -9,10 +9,14 @@
 #include <rte_crypto_asym.h>
 #include <rte_malloc.h>
 
-#include "roc_api.h"
+#include "roc_ae.h"
+
 #include "cnxk_cryptodev_ops.h"
 
+#define ASYM_SESS_SIZE sizeof(struct rte_cryptodev_asym_session)
+
 struct cnxk_ae_sess {
+	uint8_t rte_sess[ASYM_SESS_SIZE];
 	enum rte_crypto_asym_xform_type xfrm_type;
 	union {
 		struct rte_crypto_rsa_xform rsa_ctx;
@@ -22,6 +26,26 @@ struct cnxk_ae_sess {
 	uint64_t *cnxk_fpm_iova;
 	struct roc_ae_ec_group **ec_grp;
 	uint64_t cpt_inst_w7;
+	uint64_t cpt_inst_w2;
+	struct cnxk_cpt_qp *qp;
+	struct roc_cpt_lf *lf;
+	struct hw_ctx_s {
+		union {
+			struct {
+				uint64_t rsvd : 48;
+
+				uint64_t ctx_push_size : 7;
+				uint64_t rsvd1 : 1;
+
+				uint64_t ctx_hdr_size : 2;
+				uint64_t aop_valid : 1;
+				uint64_t rsvd2 : 1;
+				uint64_t ctx_size : 4;
+			} s;
+			uint64_t u64;
+		} w0;
+		uint8_t rsvd[256];
+	} hw_ctx __plt_aligned(ROC_ALIGN);
 };
 
 static __rte_always_inline void
@@ -80,20 +104,31 @@ cnxk_ae_fill_rsa_params(struct cnxk_ae_sess *sess,
 	struct rte_crypto_rsa_priv_key_qt qt = xform->rsa.qt;
 	struct rte_crypto_rsa_xform *xfrm_rsa = &xform->rsa;
 	struct rte_crypto_rsa_xform *rsa = &sess->rsa_ctx;
+	struct rte_crypto_param_t d = xform->rsa.d;
 	size_t mod_len = xfrm_rsa->n.length;
 	size_t exp_len = xfrm_rsa->e.length;
 	uint64_t total_size;
 	size_t len = 0;
 
-	if (qt.p.length != 0 && qt.p.data == NULL)
-		return -EINVAL;
+	/* Set private key type */
+	rsa->key_type = xfrm_rsa->key_type;
 
-	/* Make sure key length used is not more than mod_len/2 */
-	if (qt.p.data != NULL)
-		len = (((mod_len / 2) < qt.p.length) ? 0 : qt.p.length);
+	if (rsa->key_type == RTE_RSA_KEY_TYPE_QT) {
+		if (qt.p.length != 0 && qt.p.data == NULL)
+			return -EINVAL;
+
+		/* Make sure key length used is not more than mod_len/2 */
+		if (qt.p.data != NULL)
+			len = (((mod_len / 2) < qt.p.length) ? 0 : qt.p.length * 5);
+	} else if (rsa->key_type == RTE_RSA_KEY_TYPE_EXP) {
+		if (d.length != 0 && d.data == NULL)
+			return -EINVAL;
+
+		len = d.length;
+	}
 
 	/* Total size required for RSA key params(n,e,(q,dQ,p,dP,qInv)) */
-	total_size = mod_len + exp_len + 5 * len;
+	total_size = mod_len + exp_len + len;
 
 	/* Allocate buffer to hold all RSA keys */
 	rsa->n.data = rte_malloc(NULL, total_size, 0);
@@ -105,8 +140,8 @@ cnxk_ae_fill_rsa_params(struct cnxk_ae_sess *sess,
 	rsa->e.data = rsa->n.data + mod_len;
 	memcpy(rsa->e.data, xfrm_rsa->e.data, exp_len);
 
-	/* Private key in quintuple format */
-	if (len != 0) {
+	if (rsa->key_type == RTE_RSA_KEY_TYPE_QT) {
+		/* Private key in quintuple format */
 		rsa->qt.q.data = rsa->e.data + exp_len;
 		memcpy(rsa->qt.q.data, qt.q.data, qt.q.length);
 		rsa->qt.dQ.data = rsa->qt.q.data + qt.q.length;
@@ -124,6 +159,11 @@ cnxk_ae_fill_rsa_params(struct cnxk_ae_sess *sess,
 		rsa->qt.p.length = qt.p.length;
 		rsa->qt.dP.length = qt.dP.length;
 		rsa->qt.qInv.length = qt.qInv.length;
+	} else if (rsa->key_type == RTE_RSA_KEY_TYPE_EXP) {
+		/* Private key in exponent format */
+		rsa->d.data = rsa->e.data + exp_len;
+		memcpy(rsa->d.data, d.data, d.length);
+		rsa->d.length = d.length;
 	}
 	rsa->n.length = mod_len;
 	rsa->e.length = exp_len;
@@ -153,10 +193,28 @@ cnxk_ae_fill_ec_params(struct cnxk_ae_sess *sess,
 	case RTE_CRYPTO_EC_GROUP_SECP521R1:
 		ec->curveid = ROC_AE_EC_ID_P521;
 		break;
+	case RTE_CRYPTO_EC_GROUP_SM2:
+		ec->curveid = ROC_AE_EC_ID_SM2;
+		break;
 	default:
-		/* Only NIST curves (FIPS 186-4) are supported */
+		/* Only NIST curves (FIPS 186-4) and SM2 are supported */
 		return -EINVAL;
 	}
+
+	if (xform->xform_type == RTE_CRYPTO_ASYM_XFORM_ECPM)
+		return 0;
+
+	ec->pkey.length = xform->ec.pkey.length;
+	if (xform->ec.pkey.length)
+		rte_memcpy(ec->pkey.data, xform->ec.pkey.data, xform->ec.pkey.length);
+
+	ec->q.x.length = xform->ec.q.x.length;
+	if (xform->ec.q.x.length)
+		rte_memcpy(ec->q.x.data, xform->ec.q.x.data, xform->ec.q.x.length);
+
+	ec->q.y.length = xform->ec.q.y.length;
+	if (xform->ec.q.y.length)
+		rte_memcpy(ec->q.y.data, xform->ec.q.y.data, xform->ec.q.y.length);
 
 	return 0;
 }
@@ -178,7 +236,10 @@ cnxk_ae_fill_session_parameters(struct cnxk_ae_sess *sess,
 		break;
 	case RTE_CRYPTO_ASYM_XFORM_ECDSA:
 		/* Fall through */
+	case RTE_CRYPTO_ASYM_XFORM_ECDH:
 	case RTE_CRYPTO_ASYM_XFORM_ECPM:
+	case RTE_CRYPTO_ASYM_XFORM_ECFPM:
+	case RTE_CRYPTO_ASYM_XFORM_SM2:
 		ret = cnxk_ae_fill_ec_params(sess, xform);
 		break;
 	default:
@@ -205,6 +266,7 @@ cnxk_ae_free_session_parameters(struct cnxk_ae_sess *sess)
 	case RTE_CRYPTO_ASYM_XFORM_ECDSA:
 		/* Fall through */
 	case RTE_CRYPTO_ASYM_XFORM_ECPM:
+	case RTE_CRYPTO_ASYM_XFORM_ECFPM:
 		break;
 	default:
 		break;
@@ -286,7 +348,7 @@ cnxk_ae_rsa_prep(struct rte_crypto_op *op, struct roc_ae_buf_ptr *meta_buf,
 	dptr += in_size;
 	dlen = total_key_len + in_size;
 
-	if (rsa_op.pad == RTE_CRYPTO_RSA_PADDING_NONE) {
+	if (rsa_op.padding.type == RTE_CRYPTO_RSA_PADDING_NONE) {
 		/* Use mod_exp operation for no_padding type */
 		w4.s.opcode_minor = ROC_AE_MINOR_OP_MODEX;
 		w4.s.param2 = exp_len;
@@ -313,9 +375,63 @@ cnxk_ae_rsa_prep(struct rte_crypto_op *op, struct roc_ae_buf_ptr *meta_buf,
 }
 
 static __rte_always_inline void
+cnxk_ae_rsa_exp_prep(struct rte_crypto_op *op, struct roc_ae_buf_ptr *meta_buf,
+		     struct rte_crypto_rsa_xform *rsa, rte_crypto_param *crypto_param,
+		     struct cpt_inst_s *inst)
+{
+	struct rte_crypto_rsa_op_param rsa_op;
+	uint32_t privkey_len = rsa->d.length;
+	uint32_t mod_len = rsa->n.length;
+	union cpt_inst_w4 w4;
+	uint32_t in_size;
+	uint32_t dlen;
+	uint8_t *dptr;
+
+	rsa_op = op->asym->rsa;
+
+	/* Input buffer */
+	dptr = meta_buf->vaddr;
+	inst->dptr = (uintptr_t)dptr;
+	memcpy(dptr, rsa->n.data, mod_len);
+	dptr += mod_len;
+	memcpy(dptr, rsa->d.data, privkey_len);
+	dptr += privkey_len;
+
+	in_size = crypto_param->length;
+	memcpy(dptr, crypto_param->data, in_size);
+
+	dptr += in_size;
+	dlen = mod_len + privkey_len + in_size;
+
+	if (rsa_op.padding.type == RTE_CRYPTO_RSA_PADDING_NONE) {
+		/* Use mod_exp operation for no_padding type */
+		w4.s.opcode_minor = ROC_AE_MINOR_OP_MODEX;
+		w4.s.param2 = privkey_len;
+	} else {
+		if (rsa_op.op_type == RTE_CRYPTO_ASYM_OP_SIGN) {
+			w4.s.opcode_minor = ROC_AE_MINOR_OP_PKCS_ENC;
+			/* Private key encrypt (exponent), use BT1*/
+			w4.s.param2 = ROC_AE_CPT_BLOCK_TYPE1 | ((uint16_t)(privkey_len) << 1);
+		} else if (rsa_op.op_type == RTE_CRYPTO_ASYM_OP_DECRYPT) {
+			w4.s.opcode_minor = ROC_AE_MINOR_OP_PKCS_DEC;
+			/* Private key decrypt (exponent), use BT2 */
+			w4.s.param2 = ROC_AE_CPT_BLOCK_TYPE2;
+		}
+	}
+
+	w4.s.opcode_major = ROC_AE_MAJOR_OP_MODEX;
+
+	w4.s.param1 = mod_len;
+	w4.s.dlen = dlen;
+
+	inst->w4.u64 = w4.u64;
+	inst->rptr = (uintptr_t)dptr;
+}
+
+static __rte_always_inline void
 cnxk_ae_rsa_crt_prep(struct rte_crypto_op *op, struct roc_ae_buf_ptr *meta_buf,
-		     struct rte_crypto_rsa_xform *rsa,
-		     rte_crypto_param *crypto_param, struct cpt_inst_s *inst)
+		     struct rte_crypto_rsa_xform *rsa, rte_crypto_param *crypto_param,
+		     struct cpt_inst_s *inst)
 {
 	uint32_t qInv_len = rsa->qt.qInv.length;
 	struct rte_crypto_rsa_op_param rsa_op;
@@ -345,7 +461,7 @@ cnxk_ae_rsa_crt_prep(struct rte_crypto_op *op, struct roc_ae_buf_ptr *meta_buf,
 	dptr += in_size;
 	dlen = total_key_len + in_size;
 
-	if (rsa_op.pad == RTE_CRYPTO_RSA_PADDING_NONE) {
+	if (rsa_op.padding.type == RTE_CRYPTO_RSA_PADDING_NONE) {
 		/*Use mod_exp operation for no_padding type */
 		w4.s.opcode_minor = ROC_AE_MINOR_OP_MODEX_CRT;
 	} else {
@@ -370,28 +486,30 @@ cnxk_ae_rsa_crt_prep(struct rte_crypto_op *op, struct roc_ae_buf_ptr *meta_buf,
 }
 
 static __rte_always_inline int __rte_hot
-cnxk_ae_enqueue_rsa_op(struct rte_crypto_op *op,
-		       struct roc_ae_buf_ptr *meta_buf,
+cnxk_ae_enqueue_rsa_op(struct rte_crypto_op *op, struct roc_ae_buf_ptr *meta_buf,
 		       struct cnxk_ae_sess *sess, struct cpt_inst_s *inst)
 {
 	struct rte_crypto_rsa_op_param *rsa = &op->asym->rsa;
+	struct rte_crypto_rsa_xform *ctx = &sess->rsa_ctx;
 
 	switch (rsa->op_type) {
 	case RTE_CRYPTO_ASYM_OP_VERIFY:
-		cnxk_ae_rsa_prep(op, meta_buf, &sess->rsa_ctx, &rsa->sign,
-				 inst);
+		cnxk_ae_rsa_prep(op, meta_buf, ctx, &rsa->sign, inst);
 		break;
 	case RTE_CRYPTO_ASYM_OP_ENCRYPT:
-		cnxk_ae_rsa_prep(op, meta_buf, &sess->rsa_ctx, &rsa->message,
-				 inst);
+		cnxk_ae_rsa_prep(op, meta_buf, ctx, &rsa->message, inst);
 		break;
 	case RTE_CRYPTO_ASYM_OP_SIGN:
-		cnxk_ae_rsa_crt_prep(op, meta_buf, &sess->rsa_ctx,
-				     &rsa->message, inst);
+		if (ctx->key_type == RTE_RSA_KEY_TYPE_QT)
+			cnxk_ae_rsa_crt_prep(op, meta_buf, ctx, &rsa->message, inst);
+		else
+			cnxk_ae_rsa_exp_prep(op, meta_buf, ctx, &rsa->message, inst);
 		break;
 	case RTE_CRYPTO_ASYM_OP_DECRYPT:
-		cnxk_ae_rsa_crt_prep(op, meta_buf, &sess->rsa_ctx, &rsa->cipher,
-				     inst);
+		if (ctx->key_type == RTE_RSA_KEY_TYPE_QT)
+			cnxk_ae_rsa_crt_prep(op, meta_buf, ctx, &rsa->cipher, inst);
+		else
+			cnxk_ae_rsa_exp_prep(op, meta_buf, ctx, &rsa->cipher, inst);
 		break;
 	default:
 		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
@@ -404,10 +522,11 @@ static __rte_always_inline void
 cnxk_ae_ecdsa_sign_prep(struct rte_crypto_ecdsa_op_param *ecdsa,
 			struct roc_ae_buf_ptr *meta_buf,
 			uint64_t fpm_table_iova, struct roc_ae_ec_group *ec_grp,
-			uint8_t curveid, struct cpt_inst_s *inst)
+			struct cnxk_ae_sess *sess, struct cpt_inst_s *inst)
 {
 	uint16_t message_len = ecdsa->message.length;
-	uint16_t pkey_len = ecdsa->pkey.length;
+	uint16_t pkey_len = sess->ec_ctx.pkey.length;
+	uint8_t curveid = sess->ec_ctx.curveid;
 	uint16_t p_align, k_align, m_align;
 	uint16_t k_len = ecdsa->k.length;
 	uint16_t order_len, prime_len;
@@ -429,7 +548,7 @@ cnxk_ae_ecdsa_sign_prep(struct rte_crypto_ecdsa_op_param *ecdsa,
 
 	/* Set write offset for order and private key */
 	o_offset = prime_len - order_len;
-	pk_offset = prime_len - pkey_len;
+	pk_offset = p_align - pkey_len;
 
 	/* Input buffer */
 	dptr = meta_buf->vaddr;
@@ -457,7 +576,7 @@ cnxk_ae_ecdsa_sign_prep(struct rte_crypto_ecdsa_op_param *ecdsa,
 	memcpy(dptr + o_offset, ec_grp->order.data, order_len);
 	dptr += p_align;
 
-	memcpy(dptr + pk_offset, ecdsa->pkey.data, pkey_len);
+	memcpy(dptr + pk_offset, sess->ec_ctx.pkey.data, pkey_len);
 	dptr += p_align;
 
 	memcpy(dptr, ecdsa->message.data, message_len);
@@ -470,11 +589,11 @@ cnxk_ae_ecdsa_sign_prep(struct rte_crypto_ecdsa_op_param *ecdsa,
 	dptr += p_align;
 
 	/* Setup opcodes */
-	w4.s.opcode_major = ROC_AE_MAJOR_OP_ECDSA;
-	w4.s.opcode_minor = ROC_AE_MINOR_OP_ECDSA_SIGN;
+	w4.s.opcode_major = ROC_AE_MAJOR_OP_EC;
+	w4.s.opcode_minor = ROC_AE_MINOR_OP_EC_SIGN;
 
 	w4.s.param1 = curveid | (message_len << 8);
-	w4.s.param2 = (pkey_len << 8) | k_len;
+	w4.s.param2 = (p_align << 8) | k_len;
 	w4.s.dlen = dlen;
 
 	inst->w4.u64 = w4.u64;
@@ -485,13 +604,14 @@ static __rte_always_inline void
 cnxk_ae_ecdsa_verify_prep(struct rte_crypto_ecdsa_op_param *ecdsa,
 			  struct roc_ae_buf_ptr *meta_buf,
 			  uint64_t fpm_table_iova,
-			  struct roc_ae_ec_group *ec_grp, uint8_t curveid,
+			  struct roc_ae_ec_group *ec_grp, struct cnxk_ae_sess *sess,
 			  struct cpt_inst_s *inst)
 {
 	uint32_t message_len = ecdsa->message.length;
+	uint16_t qx_len = sess->ec_ctx.q.x.length;
+	uint16_t qy_len = sess->ec_ctx.q.y.length;
+	uint8_t curveid = sess->ec_ctx.curveid;
 	uint16_t o_offset, r_offset, s_offset;
-	uint16_t qx_len = ecdsa->q.x.length;
-	uint16_t qy_len = ecdsa->q.y.length;
 	uint16_t r_len = ecdsa->r.length;
 	uint16_t s_len = ecdsa->s.length;
 	uint16_t order_len, prime_len;
@@ -551,10 +671,10 @@ cnxk_ae_ecdsa_verify_prep(struct rte_crypto_ecdsa_op_param *ecdsa,
 	memcpy(dptr, ec_grp->prime.data, prime_len);
 	dptr += p_align;
 
-	memcpy(dptr + qx_offset, ecdsa->q.x.data, qx_len);
+	memcpy(dptr + qx_offset, sess->ec_ctx.q.x.data, qx_len);
 	dptr += p_align;
 
-	memcpy(dptr + qy_offset, ecdsa->q.y.data, qy_len);
+	memcpy(dptr + qy_offset, sess->ec_ctx.q.y.data, qy_len);
 	dptr += p_align;
 
 	memcpy(dptr, ec_grp->consta.data, prime_len);
@@ -564,8 +684,8 @@ cnxk_ae_ecdsa_verify_prep(struct rte_crypto_ecdsa_op_param *ecdsa,
 	dptr += p_align;
 
 	/* Setup opcodes */
-	w4.s.opcode_major = ROC_AE_MAJOR_OP_ECDSA;
-	w4.s.opcode_minor = ROC_AE_MINOR_OP_ECDSA_VERIFY;
+	w4.s.opcode_major = ROC_AE_MAJOR_OP_EC;
+	w4.s.opcode_minor = ROC_AE_MINOR_OP_EC_VERIFY;
 
 	w4.s.param1 = curveid | (message_len << 8);
 	w4.s.param2 = 0;
@@ -587,10 +707,212 @@ cnxk_ae_enqueue_ecdsa_op(struct rte_crypto_op *op,
 
 	if (ecdsa->op_type == RTE_CRYPTO_ASYM_OP_SIGN)
 		cnxk_ae_ecdsa_sign_prep(ecdsa, meta_buf, fpm_iova[curveid],
-					ec_grp[curveid], curveid, inst);
+					ec_grp[curveid], sess, inst);
 	else if (ecdsa->op_type == RTE_CRYPTO_ASYM_OP_VERIFY)
 		cnxk_ae_ecdsa_verify_prep(ecdsa, meta_buf, fpm_iova[curveid],
-					  ec_grp[curveid], curveid, inst);
+					  ec_grp[curveid], sess, inst);
+	else {
+		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static __rte_always_inline void
+cnxk_ae_sm2_sign_prep(struct rte_crypto_sm2_op_param *sm2,
+			struct roc_ae_buf_ptr *meta_buf,
+			uint64_t fpm_table_iova, struct roc_ae_ec_group *ec_grp,
+			struct cnxk_ae_sess *sess, struct cpt_inst_s *inst)
+{
+	uint16_t message_len = sm2->message.length;
+	uint16_t pkey_len = sess->ec_ctx.pkey.length;
+	uint16_t p_align, k_align, m_align;
+	uint16_t k_len = sm2->k.length;
+	uint16_t order_len, prime_len;
+	uint16_t o_offset, pk_offset;
+	union cpt_inst_w4 w4;
+	uint16_t dlen;
+	uint8_t *dptr;
+
+	prime_len = ec_grp->prime.length;
+	order_len = ec_grp->order.length;
+
+	/* Truncate input length to curve prime length */
+	if (message_len > prime_len)
+		message_len = prime_len;
+	m_align = RTE_ALIGN_CEIL(message_len, 8);
+
+	p_align = RTE_ALIGN_CEIL(prime_len, 8);
+	k_align = RTE_ALIGN_CEIL(k_len, 8);
+
+	/* Set write offset for order and private key */
+	o_offset = prime_len - order_len;
+	pk_offset = p_align - pkey_len;
+
+	/* Input buffer */
+	dptr = meta_buf->vaddr;
+	inst->dptr = (uintptr_t)dptr;
+
+	/*
+	 * Set dlen = sum(sizeof(fpm address), ROUNDUP8(scalar len, input len),
+	 * ROUNDUP8(priv key len, prime len, order len)).
+	 * Please note, private key, order cannot exceed prime
+	 * length i.e 3 * p_align.
+	 */
+	dlen = sizeof(fpm_table_iova) + k_align + m_align + p_align * 5;
+
+	memset(dptr, 0, dlen);
+
+	*(uint64_t *)dptr = fpm_table_iova;
+	dptr += sizeof(fpm_table_iova);
+
+	rte_memcpy(dptr, sm2->k.data, k_len);
+	dptr += k_align;
+
+	rte_memcpy(dptr, ec_grp->prime.data, prime_len);
+	dptr += p_align;
+
+	rte_memcpy(dptr + o_offset, ec_grp->order.data, order_len);
+	dptr += p_align;
+
+	rte_memcpy(dptr + pk_offset, sess->ec_ctx.pkey.data, pkey_len);
+	dptr += p_align;
+
+	rte_memcpy(dptr, sm2->message.data, message_len);
+	dptr += m_align;
+
+	rte_memcpy(dptr, ec_grp->consta.data, prime_len);
+	dptr += p_align;
+
+	rte_memcpy(dptr, ec_grp->constb.data, prime_len);
+	dptr += p_align;
+
+	/* Setup opcodes */
+	w4.s.opcode_major = ROC_AE_MAJOR_OP_EC;
+	w4.s.opcode_minor = ROC_AE_MINOR_OP_EC_SIGN;
+
+	/* prime length of SM2 curve is same as that of P256. */
+	w4.s.param1 = ROC_AE_EC_ID_P256 |
+		ROC_AE_EC_PARAM1_SM2 | ROC_AE_EC_PARAM1_NONNIST | (message_len << 8);
+	w4.s.param2 = (p_align << 8) | k_len;
+	w4.s.dlen = dlen;
+
+	inst->w4.u64 = w4.u64;
+	inst->rptr = (uintptr_t)dptr;
+}
+
+static __rte_always_inline void
+cnxk_ae_sm2_verify_prep(struct rte_crypto_sm2_op_param *sm2,
+			  struct roc_ae_buf_ptr *meta_buf,
+			  uint64_t fpm_table_iova,
+			  struct roc_ae_ec_group *ec_grp, struct cnxk_ae_sess *sess,
+			  struct cpt_inst_s *inst)
+{
+	uint32_t message_len = sm2->message.length;
+	uint16_t o_offset, r_offset, s_offset;
+	uint16_t qx_len = sess->ec_ctx.q.x.length;
+	uint16_t qy_len = sess->ec_ctx.q.y.length;
+	uint16_t r_len = sm2->r.length;
+	uint16_t s_len = sm2->s.length;
+	uint16_t order_len, prime_len;
+	uint16_t qx_offset, qy_offset;
+	uint16_t p_align, m_align;
+	union cpt_inst_w4 w4;
+	uint16_t dlen;
+	uint8_t *dptr;
+
+	prime_len = ec_grp->prime.length;
+	order_len = ec_grp->order.length;
+
+	/* Truncate input length to curve prime length */
+	if (message_len > prime_len)
+		message_len = prime_len;
+
+	m_align = RTE_ALIGN_CEIL(message_len, 8);
+	p_align = RTE_ALIGN_CEIL(prime_len, 8);
+
+	/* Set write offset for sign, order and public key coordinates */
+	o_offset = prime_len - order_len;
+	qx_offset = prime_len - qx_len;
+	qy_offset = prime_len - qy_len;
+	r_offset = prime_len - r_len;
+	s_offset = prime_len - s_len;
+
+	/* Input buffer */
+	dptr = meta_buf->vaddr;
+	inst->dptr = (uintptr_t)dptr;
+
+	/*
+	 * Set dlen = sum(sizeof(fpm address), ROUNDUP8(message len),
+	 * ROUNDUP8(sign len(r and s), public key len(x and y coordinates),
+	 * prime len, order len)).
+	 * Please note sign, public key and order can not exceed prime length
+	 * i.e. 6 * p_align
+	 */
+	dlen = sizeof(fpm_table_iova) + m_align + (8 * p_align);
+
+	memset(dptr, 0, dlen);
+
+	*(uint64_t *)dptr = fpm_table_iova;
+	dptr += sizeof(fpm_table_iova);
+
+	rte_memcpy(dptr + r_offset, sm2->r.data, r_len);
+	dptr += p_align;
+
+	rte_memcpy(dptr + s_offset, sm2->s.data, s_len);
+	dptr += p_align;
+
+	rte_memcpy(dptr, sm2->message.data, message_len);
+	dptr += m_align;
+
+	rte_memcpy(dptr + o_offset, ec_grp->order.data, order_len);
+	dptr += p_align;
+
+	rte_memcpy(dptr, ec_grp->prime.data, prime_len);
+	dptr += p_align;
+
+	rte_memcpy(dptr + qx_offset, sess->ec_ctx.q.x.data, qx_len);
+	dptr += p_align;
+
+	rte_memcpy(dptr + qy_offset, sess->ec_ctx.q.y.data, qy_len);
+	dptr += p_align;
+
+	rte_memcpy(dptr, ec_grp->consta.data, prime_len);
+	dptr += p_align;
+
+	rte_memcpy(dptr, ec_grp->constb.data, prime_len);
+	dptr += p_align;
+
+	/* Setup opcodes */
+	w4.s.opcode_major = ROC_AE_MAJOR_OP_EC;
+	w4.s.opcode_minor = ROC_AE_MINOR_OP_EC_VERIFY;
+
+	/* prime length of SM2 curve is same as that of P256. */
+	w4.s.param1 = ROC_AE_EC_ID_P256 |
+		ROC_AE_EC_PARAM1_SM2 | ROC_AE_EC_PARAM1_NONNIST | (message_len << 8);
+	w4.s.param2 = 0;
+	w4.s.dlen = dlen;
+
+	inst->w4.u64 = w4.u64;
+	inst->rptr = (uintptr_t)dptr;
+}
+
+static __rte_always_inline int __rte_hot
+cnxk_ae_enqueue_sm2_op(struct rte_crypto_op *op,
+			 struct roc_ae_buf_ptr *meta_buf,
+			 struct cnxk_ae_sess *sess, uint64_t *fpm_iova,
+			 struct roc_ae_ec_group **ec_grp,
+			 struct cpt_inst_s *inst)
+{
+	struct rte_crypto_sm2_op_param *sm2 = &op->asym->sm2;
+	uint8_t curveid = sess->ec_ctx.curveid;
+
+	if (sm2->op_type == RTE_CRYPTO_ASYM_OP_SIGN)
+		cnxk_ae_sm2_sign_prep(sm2, meta_buf, fpm_iova[curveid],
+					ec_grp[curveid], sess, inst);
+	else if (sm2->op_type == RTE_CRYPTO_ASYM_OP_VERIFY)
+		cnxk_ae_sm2_verify_prep(sm2, meta_buf, fpm_iova[curveid],
+					  ec_grp[curveid], sess, inst);
 	else {
 		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
 		return -EINVAL;
@@ -599,13 +921,71 @@ cnxk_ae_enqueue_ecdsa_op(struct rte_crypto_op *op,
 }
 
 static __rte_always_inline int
-cnxk_ae_ecpm_prep(struct rte_crypto_ecpm_op_param *ecpm,
+cnxk_ae_ecfpm_prep(rte_crypto_param *scalar,
+		   struct roc_ae_buf_ptr *meta_buf, uint64_t *fpm_iova,
+		   struct roc_ae_ec_group *ec_grp, uint8_t curveid,
+		   struct cpt_inst_s *inst)
+{
+	uint16_t scalar_align, p_align;
+	uint16_t dlen, prime_len;
+	uint64_t fpm_table_iova;
+	union cpt_inst_w4 w4;
+	uint8_t *dptr;
+
+	prime_len = ec_grp->prime.length;
+	fpm_table_iova = (uint64_t)fpm_iova[curveid];
+
+	/* Input buffer */
+	dptr = meta_buf->vaddr;
+	inst->dptr = (uintptr_t)dptr;
+
+	p_align = RTE_ALIGN_CEIL(prime_len, 8);
+	scalar_align = RTE_ALIGN_CEIL(scalar->length, 8);
+
+	/*
+	 * Set dlen = sum(ROUNDUP8(input point(x and y coordinates), prime,
+	 * scalar length),
+	 * Please note point length is equivalent to prime of the curve
+	 */
+	dlen = sizeof(fpm_table_iova) + 3 * p_align + scalar_align;
+
+	memset(dptr, 0, dlen);
+
+	*(uint64_t *)dptr = fpm_table_iova;
+	dptr += sizeof(fpm_table_iova);
+
+	/* Copy scalar, prime */
+	memcpy(dptr, scalar->data, scalar->length);
+	dptr += scalar_align;
+	memcpy(dptr, ec_grp->prime.data, ec_grp->prime.length);
+	dptr += p_align;
+	memcpy(dptr, ec_grp->consta.data, ec_grp->consta.length);
+	dptr += p_align;
+	memcpy(dptr, ec_grp->constb.data, ec_grp->constb.length);
+	dptr += p_align;
+
+	/* Setup opcodes */
+	w4.s.opcode_major = ROC_AE_MAJOR_OP_ECC;
+	w4.s.opcode_minor = ROC_AE_MINOR_OP_ECC_FPM;
+
+	w4.s.param1 = curveid | (1 << 8);
+	w4.s.param2 = scalar->length;
+	w4.s.dlen = dlen;
+
+	inst->w4.u64 = w4.u64;
+	inst->rptr = (uintptr_t)dptr;
+
+	return 0;
+}
+
+static __rte_always_inline int
+cnxk_ae_ecpm_prep(rte_crypto_param *scalar, struct rte_crypto_ec_point *p,
 		  struct roc_ae_buf_ptr *meta_buf,
 		  struct roc_ae_ec_group *ec_grp, uint8_t curveid,
 		  struct cpt_inst_s *inst)
 {
-	uint16_t x1_len = ecpm->p.x.length;
-	uint16_t y1_len = ecpm->p.y.length;
+	uint16_t x1_len = p->x.length;
+	uint16_t y1_len = p->y.length;
 	uint16_t scalar_align, p_align;
 	uint16_t x1_offset, y1_offset;
 	uint16_t dlen, prime_len;
@@ -619,7 +999,7 @@ cnxk_ae_ecpm_prep(struct rte_crypto_ecpm_op_param *ecpm,
 	inst->dptr = (uintptr_t)dptr;
 
 	p_align = RTE_ALIGN_CEIL(prime_len, 8);
-	scalar_align = RTE_ALIGN_CEIL(ecpm->scalar.length, 8);
+	scalar_align = RTE_ALIGN_CEIL(scalar->length, 8);
 
 	/*
 	 * Set dlen = sum(ROUNDUP8(input point(x and y coordinates), prime,
@@ -634,11 +1014,11 @@ cnxk_ae_ecpm_prep(struct rte_crypto_ecpm_op_param *ecpm,
 	memset(dptr, 0, dlen);
 
 	/* Copy input point, scalar, prime */
-	memcpy(dptr + x1_offset, ecpm->p.x.data, x1_len);
+	memcpy(dptr + x1_offset, p->x.data, x1_len);
 	dptr += p_align;
-	memcpy(dptr + y1_offset, ecpm->p.y.data, y1_len);
+	memcpy(dptr + y1_offset, p->y.data, y1_len);
 	dptr += p_align;
-	memcpy(dptr, ecpm->scalar.data, ecpm->scalar.length);
+	memcpy(dptr, scalar->data, scalar->length);
 	dptr += scalar_align;
 	memcpy(dptr, ec_grp->prime.data, ec_grp->prime.length);
 	dptr += p_align;
@@ -652,13 +1032,85 @@ cnxk_ae_ecpm_prep(struct rte_crypto_ecpm_op_param *ecpm,
 	w4.s.opcode_minor = ROC_AE_MINOR_OP_ECC_UMP;
 
 	w4.s.param1 = curveid;
-	w4.s.param2 = ecpm->scalar.length;
+	w4.s.param2 = scalar->length;
 	w4.s.dlen = dlen;
 
 	inst->w4.u64 = w4.u64;
 	inst->rptr = (uintptr_t)dptr;
 
 	return 0;
+}
+
+static __rte_always_inline int
+cnxk_ae_random_prep(uint16_t len, struct roc_ae_buf_ptr *meta_buf,
+		   struct cpt_inst_s *inst)
+{
+	union cpt_inst_w4 w4;
+	uint8_t *dptr;
+
+	/* Input buffer */
+	dptr = meta_buf->vaddr;
+	inst->dptr = (uintptr_t)dptr;
+
+	/* Setup opcodes */
+	w4.s.opcode_major = ROC_AE_MAJOR_OP_RANDOM;
+	w4.s.opcode_minor = ROC_AE_MINOR_OP_RANDOM;
+
+	w4.s.param1 = len;
+	w4.s.param2 = 0;
+	w4.s.dlen = 0;
+
+	inst->w4.u64 = w4.u64;
+	inst->rptr = (uintptr_t)dptr;
+
+	return 0;
+}
+
+static __rte_always_inline int __rte_hot
+cnxk_ae_enqueue_ecdh_op(struct rte_crypto_op *op,
+			 struct roc_ae_buf_ptr *meta_buf,
+			 struct cnxk_ae_sess *sess, uint64_t *fpm_iova,
+			 struct roc_ae_ec_group **ec_grp,
+			 struct cpt_inst_s *inst)
+{
+	struct rte_crypto_ecdh_op_param *ecdh = &op->asym->ecdh;
+	uint8_t curveid = sess->ec_ctx.curveid;
+	struct rte_crypto_ec_point point;
+	rte_crypto_uint scalar;
+	int ret = 0;
+
+	switch (ecdh->ke_type) {
+	case RTE_CRYPTO_ASYM_KE_PRIV_KEY_GENERATE:
+		cnxk_ae_random_prep(ecdh->priv_key.length, meta_buf, inst);
+		break;
+	case RTE_CRYPTO_ASYM_KE_PUB_KEY_GENERATE:
+		scalar.data = sess->ec_ctx.pkey.data;
+		scalar.length = sess->ec_ctx.pkey.length;
+		cnxk_ae_ecfpm_prep(&scalar, meta_buf, fpm_iova, ec_grp[curveid],
+			curveid, inst);
+		break;
+	case RTE_CRYPTO_ASYM_KE_PUB_KEY_VERIFY:
+		scalar.data = ec_grp[curveid]->order.data;
+		scalar.length = ec_grp[curveid]->order.length;
+		cnxk_ae_ecpm_prep(&scalar, &ecdh->pub_key, meta_buf,
+			ec_grp[curveid], curveid, inst);
+		break;
+	case RTE_CRYPTO_ASYM_KE_SHARED_SECRET_COMPUTE:
+		scalar.data = sess->ec_ctx.pkey.data;
+		scalar.length = sess->ec_ctx.pkey.length;
+		point.x.data = sess->ec_ctx.q.x.data;
+		point.x.length = sess->ec_ctx.q.x.length;
+		point.y.data = sess->ec_ctx.q.y.data;
+		point.y.length = sess->ec_ctx.q.y.length;
+		cnxk_ae_ecpm_prep(&scalar, &point, meta_buf,
+			ec_grp[curveid], curveid, inst);
+		break;
+	default:
+		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+		ret = -EINVAL;
+	}
+
+	return ret;
 }
 
 static __rte_always_inline void
@@ -673,7 +1125,7 @@ cnxk_ae_dequeue_rsa_op(struct rte_crypto_op *cop, uint8_t *rptr,
 		memcpy(rsa->cipher.data, rptr, rsa->cipher.length);
 		break;
 	case RTE_CRYPTO_ASYM_OP_DECRYPT:
-		if (rsa->pad == RTE_CRYPTO_RSA_PADDING_NONE) {
+		if (rsa->padding.type == RTE_CRYPTO_RSA_PADDING_NONE) {
 			rsa->message.length = rsa_ctx->n.length;
 			memcpy(rsa->message.data, rptr, rsa->message.length);
 		} else {
@@ -693,7 +1145,7 @@ cnxk_ae_dequeue_rsa_op(struct rte_crypto_op *cop, uint8_t *rptr,
 		memcpy(rsa->sign.data, rptr, rsa->sign.length);
 		break;
 	case RTE_CRYPTO_ASYM_OP_VERIFY:
-		if (rsa->pad == RTE_CRYPTO_RSA_PADDING_NONE) {
+		if (rsa->padding.type == RTE_CRYPTO_RSA_PADDING_NONE) {
 			rsa->sign.length = rsa_ctx->n.length;
 			memcpy(rsa->sign.data, rptr, rsa->sign.length);
 		} else {
@@ -735,6 +1187,23 @@ cnxk_ae_dequeue_ecdsa_op(struct rte_crypto_ecdsa_op_param *ecdsa, uint8_t *rptr,
 }
 
 static __rte_always_inline void
+cnxk_ae_dequeue_sm2_op(struct rte_crypto_sm2_op_param *sm2, uint8_t *rptr,
+			 struct roc_ae_ec_ctx *ec,
+			 struct roc_ae_ec_group **ec_grp)
+{
+	int prime_len = ec_grp[ec->curveid]->prime.length;
+
+	if (sm2->op_type == RTE_CRYPTO_ASYM_OP_VERIFY)
+		return;
+
+	/* Separate out sign r and s components */
+	rte_memcpy(sm2->r.data, rptr, prime_len);
+	rte_memcpy(sm2->s.data, rptr + RTE_ALIGN_CEIL(prime_len, 8), prime_len);
+	sm2->r.length = prime_len;
+	sm2->s.length = prime_len;
+}
+
+static __rte_always_inline void
 cnxk_ae_dequeue_ecpm_op(struct rte_crypto_ecpm_op_param *ecpm, uint8_t *rptr,
 			struct roc_ae_ec_ctx *ec,
 			struct roc_ae_ec_group **ec_grp)
@@ -745,6 +1214,37 @@ cnxk_ae_dequeue_ecpm_op(struct rte_crypto_ecpm_op_param *ecpm, uint8_t *rptr,
 	memcpy(ecpm->r.y.data, rptr + RTE_ALIGN_CEIL(prime_len, 8), prime_len);
 	ecpm->r.x.length = prime_len;
 	ecpm->r.y.length = prime_len;
+}
+
+static __rte_always_inline void
+cnxk_ae_dequeue_ecdh_op(struct rte_crypto_ecdh_op_param *ecdh, uint8_t *rptr,
+			struct roc_ae_ec_ctx *ec,
+			struct roc_ae_ec_group **ec_grp)
+{
+	int prime_len = ec_grp[ec->curveid]->prime.length;
+
+	switch (ecdh->ke_type) {
+	case RTE_CRYPTO_ASYM_KE_PRIV_KEY_GENERATE:
+		memcpy(ecdh->priv_key.data, rptr, prime_len);
+		ecdh->priv_key.length = prime_len;
+		break;
+	case RTE_CRYPTO_ASYM_KE_PUB_KEY_GENERATE:
+		memcpy(ecdh->pub_key.x.data, rptr, prime_len);
+		memcpy(ecdh->pub_key.y.data, rptr + RTE_ALIGN_CEIL(prime_len, 8), prime_len);
+		ecdh->pub_key.x.length = prime_len;
+		ecdh->pub_key.y.length = prime_len;
+		break;
+	case RTE_CRYPTO_ASYM_KE_PUB_KEY_VERIFY:
+		break;
+	case RTE_CRYPTO_ASYM_KE_SHARED_SECRET_COMPUTE:
+		memcpy(ecdh->shared_secret.x.data, rptr, prime_len);
+		memcpy(ecdh->shared_secret.y.data, rptr + RTE_ALIGN_CEIL(prime_len, 8), prime_len);
+		ecdh->shared_secret.x.length = prime_len;
+		ecdh->shared_secret.y.length = prime_len;
+		break;
+	default:
+		break;
+	}
 }
 
 static __rte_always_inline void *
@@ -802,10 +1302,32 @@ cnxk_ae_enqueue(struct cnxk_cpt_qp *qp, struct rte_crypto_op *op,
 		if (unlikely(ret))
 			goto req_fail;
 		break;
+	case RTE_CRYPTO_ASYM_XFORM_SM2:
+		ret = cnxk_ae_enqueue_sm2_op(op, &meta_buf, sess,
+					       sess->cnxk_fpm_iova,
+					       sess->ec_grp, inst);
+		if (unlikely(ret))
+			goto req_fail;
+		break;
 	case RTE_CRYPTO_ASYM_XFORM_ECPM:
-		ret = cnxk_ae_ecpm_prep(&asym_op->ecpm, &meta_buf,
+		ret = cnxk_ae_ecpm_prep(&asym_op->ecpm.scalar, &asym_op->ecpm.p, &meta_buf,
 					sess->ec_grp[sess->ec_ctx.curveid],
 					sess->ec_ctx.curveid, inst);
+		if (unlikely(ret))
+			goto req_fail;
+		break;
+	case RTE_CRYPTO_ASYM_XFORM_ECFPM:
+		ret = cnxk_ae_ecfpm_prep(&asym_op->ecpm.scalar, &meta_buf,
+					 sess->cnxk_fpm_iova,
+					 sess->ec_grp[sess->ec_ctx.curveid],
+					 sess->ec_ctx.curveid, inst);
+		if (unlikely(ret))
+			goto req_fail;
+		break;
+	case RTE_CRYPTO_ASYM_XFORM_ECDH:
+		ret = cnxk_ae_enqueue_ecdh_op(op, &meta_buf, sess,
+					       sess->cnxk_fpm_iova,
+					       sess->ec_grp, inst);
 		if (unlikely(ret))
 			goto req_fail;
 		break;
@@ -842,8 +1364,17 @@ cnxk_ae_post_process(struct rte_crypto_op *cop, struct cnxk_ae_sess *sess,
 		cnxk_ae_dequeue_ecdsa_op(&op->ecdsa, rptr, &sess->ec_ctx,
 					 sess->ec_grp);
 		break;
+	case RTE_CRYPTO_ASYM_XFORM_SM2:
+		cnxk_ae_dequeue_sm2_op(&op->sm2, rptr, &sess->ec_ctx,
+					 sess->ec_grp);
+		break;
 	case RTE_CRYPTO_ASYM_XFORM_ECPM:
+	case RTE_CRYPTO_ASYM_XFORM_ECFPM:
 		cnxk_ae_dequeue_ecpm_op(&op->ecpm, rptr, &sess->ec_ctx,
+					sess->ec_grp);
+		break;
+	case RTE_CRYPTO_ASYM_XFORM_ECDH:
+		cnxk_ae_dequeue_ecdh_op(&op->ecdh, rptr, &sess->ec_ctx,
 					sess->ec_grp);
 		break;
 	default:

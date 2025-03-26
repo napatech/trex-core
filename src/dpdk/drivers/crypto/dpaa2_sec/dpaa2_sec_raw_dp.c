@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright 2021 NXP
+ * Copyright 2021-2022 NXP
  */
 
 #include <cryptodev_pmd.h>
-#include <rte_fslmc.h>
+#include <bus_fslmc_driver.h>
 #include <fslmc_vfio.h>
 #include <dpaa2_hw_pvt.h>
 #include <dpaa2_hw_dpio.h>
@@ -44,8 +44,8 @@ build_raw_dp_chain_fd(uint8_t *drv_ctx,
 	uint16_t auth_hdr_len = ofs.ofs.cipher.head -
 				ofs.ofs.auth.head;
 
-	uint16_t auth_tail_len = ofs.ofs.auth.tail;
-	uint32_t auth_only_len = (auth_tail_len << 16) | auth_hdr_len;
+	uint16_t auth_tail_len;
+	uint32_t auth_only_len;
 	int icv_len = sess->digest_length;
 	uint8_t *old_icv;
 	uint8_t *iv_ptr = iv->va;
@@ -55,6 +55,8 @@ build_raw_dp_chain_fd(uint8_t *drv_ctx,
 
 	cipher_len = data_len - ofs.ofs.cipher.head - ofs.ofs.cipher.tail;
 	auth_len = data_len - ofs.ofs.auth.head - ofs.ofs.auth.tail;
+	auth_tail_len = auth_len - cipher_len - auth_hdr_len;
+	auth_only_len = (auth_tail_len << 16) | auth_hdr_len;
 	/* first FLE entry used to store session ctxt */
 	fle = (struct qbman_fle *)rte_malloc(NULL,
 			FLE_SG_MEM_SIZE(2 * sgl->num),
@@ -93,30 +95,28 @@ build_raw_dp_chain_fd(uint8_t *drv_ctx,
 	/* OOP */
 	if (dest_sgl) {
 		/* Configure Output SGE for Encap/Decap */
-		DPAA2_SET_FLE_ADDR(sge, dest_sgl->vec[0].iova);
-		DPAA2_SET_FLE_OFFSET(sge, ofs.ofs.cipher.head);
+		DPAA2_SET_FLE_ADDR(sge, dest_sgl->vec[0].iova + ofs.ofs.cipher.head);
 		sge->length = dest_sgl->vec[0].len - ofs.ofs.cipher.head;
 
 		/* o/p segs */
 		for (i = 1; i < dest_sgl->num; i++) {
 			sge++;
 			DPAA2_SET_FLE_ADDR(sge, dest_sgl->vec[i].iova);
-			DPAA2_SET_FLE_OFFSET(sge, 0);
 			sge->length = dest_sgl->vec[i].len;
 		}
+		sge->length -= ofs.ofs.cipher.tail;
 	} else {
 		/* Configure Output SGE for Encap/Decap */
-		DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova);
-		DPAA2_SET_FLE_OFFSET(sge, ofs.ofs.cipher.head);
+		DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova + ofs.ofs.cipher.head);
 		sge->length = sgl->vec[0].len - ofs.ofs.cipher.head;
 
 		/* o/p segs */
 		for (i = 1; i < sgl->num; i++) {
 			sge++;
 			DPAA2_SET_FLE_ADDR(sge, sgl->vec[i].iova);
-			DPAA2_SET_FLE_OFFSET(sge, 0);
 			sge->length = sgl->vec[i].len;
 		}
+		sge->length -= ofs.ofs.cipher.tail;
 	}
 
 	if (sess->dir == DIR_ENC) {
@@ -144,14 +144,12 @@ build_raw_dp_chain_fd(uint8_t *drv_ctx,
 	sge->length = sess->iv.length;
 
 	sge++;
-	DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova);
-	DPAA2_SET_FLE_OFFSET(sge, ofs.ofs.auth.head);
+	DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova + ofs.ofs.auth.head);
 	sge->length = sgl->vec[0].len - ofs.ofs.auth.head;
 
 	for (i = 1; i < sgl->num; i++) {
 		sge++;
 		DPAA2_SET_FLE_ADDR(sge, sgl->vec[i].iova);
-		DPAA2_SET_FLE_OFFSET(sge, 0);
 		sge->length = sgl->vec[i].len;
 	}
 
@@ -240,28 +238,24 @@ build_raw_dp_aead_fd(uint8_t *drv_ctx,
 	/* OOP */
 	if (dest_sgl) {
 		/* Configure Output SGE for Encap/Decap */
-		DPAA2_SET_FLE_ADDR(sge, dest_sgl->vec[0].iova);
-		DPAA2_SET_FLE_OFFSET(sge, ofs.ofs.cipher.head);
+		DPAA2_SET_FLE_ADDR(sge, dest_sgl->vec[0].iova +  ofs.ofs.cipher.head);
 		sge->length = dest_sgl->vec[0].len - ofs.ofs.cipher.head;
 
 		/* o/p segs */
 		for (i = 1; i < dest_sgl->num; i++) {
 			sge++;
 			DPAA2_SET_FLE_ADDR(sge, dest_sgl->vec[i].iova);
-			DPAA2_SET_FLE_OFFSET(sge, 0);
 			sge->length = dest_sgl->vec[i].len;
 		}
 	} else {
 		/* Configure Output SGE for Encap/Decap */
-		DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova);
-		DPAA2_SET_FLE_OFFSET(sge, ofs.ofs.cipher.head);
+		DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova + ofs.ofs.cipher.head);
 		sge->length = sgl->vec[0].len - ofs.ofs.cipher.head;
 
 		/* o/p segs */
 		for (i = 1; i < sgl->num; i++) {
 			sge++;
 			DPAA2_SET_FLE_ADDR(sge, sgl->vec[i].iova);
-			DPAA2_SET_FLE_OFFSET(sge, 0);
 			sge->length = sgl->vec[i].len;
 		}
 	}
@@ -295,15 +289,13 @@ build_raw_dp_aead_fd(uint8_t *drv_ctx,
 		sge++;
 	}
 
-	DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova);
-	DPAA2_SET_FLE_OFFSET(sge, ofs.ofs.cipher.head);
+	DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova + ofs.ofs.cipher.head);
 	sge->length = sgl->vec[0].len - ofs.ofs.cipher.head;
 
 	/* i/p segs */
 	for (i = 1; i < sgl->num; i++) {
 		sge++;
 		DPAA2_SET_FLE_ADDR(sge, sgl->vec[i].iova);
-		DPAA2_SET_FLE_OFFSET(sge, 0);
 		sge->length = sgl->vec[i].len;
 	}
 
@@ -408,8 +400,7 @@ build_raw_dp_auth_fd(uint8_t *drv_ctx,
 		sge++;
 	}
 	/* i/p 1st seg */
-	DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova);
-	DPAA2_SET_FLE_OFFSET(sge, data_offset);
+	DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova + data_offset);
 
 	if (data_len <= (int)(sgl->vec[0].len - data_offset)) {
 		sge->length = data_len;
@@ -419,7 +410,6 @@ build_raw_dp_auth_fd(uint8_t *drv_ctx,
 		for (i = 1; i < sgl->num; i++) {
 			sge++;
 			DPAA2_SET_FLE_ADDR(sge, sgl->vec[i].iova);
-			DPAA2_SET_FLE_OFFSET(sge, 0);
 			sge->length = sgl->vec[i].len;
 		}
 	}
@@ -498,14 +488,12 @@ build_raw_dp_proto_fd(uint8_t *drv_ctx,
 	if (dest_sgl) {
 		/* Configure Output SGE for Encap/Decap */
 		DPAA2_SET_FLE_ADDR(sge, dest_sgl->vec[0].iova);
-		DPAA2_SET_FLE_OFFSET(sge, 0);
 		sge->length = dest_sgl->vec[0].len;
 		out_len += sge->length;
 		/* o/p segs */
 		for (i = 1; i < dest_sgl->num; i++) {
 			sge++;
 			DPAA2_SET_FLE_ADDR(sge, dest_sgl->vec[i].iova);
-			DPAA2_SET_FLE_OFFSET(sge, 0);
 			sge->length = dest_sgl->vec[i].len;
 			out_len += sge->length;
 		}
@@ -514,14 +502,12 @@ build_raw_dp_proto_fd(uint8_t *drv_ctx,
 	} else {
 		/* Configure Output SGE for Encap/Decap */
 		DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova);
-		DPAA2_SET_FLE_OFFSET(sge, 0);
 		sge->length = sgl->vec[0].len;
 		out_len += sge->length;
 		/* o/p segs */
 		for (i = 1; i < sgl->num; i++) {
 			sge++;
 			DPAA2_SET_FLE_ADDR(sge, sgl->vec[i].iova);
-			DPAA2_SET_FLE_OFFSET(sge, 0);
 			sge->length = sgl->vec[i].len;
 			out_len += sge->length;
 		}
@@ -541,14 +527,12 @@ build_raw_dp_proto_fd(uint8_t *drv_ctx,
 
 	/* Configure input SGE for Encap/Decap */
 	DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova);
-	DPAA2_SET_FLE_OFFSET(sge, 0);
 	sge->length = sgl->vec[0].len;
 	in_len += sge->length;
 	/* i/p segs */
 	for (i = 1; i < sgl->num; i++) {
 		sge++;
 		DPAA2_SET_FLE_ADDR(sge, sgl->vec[i].iova);
-		DPAA2_SET_FLE_OFFSET(sge, 0);
 		sge->length = sgl->vec[i].len;
 		in_len += sge->length;
 	}
@@ -634,28 +618,24 @@ build_raw_dp_cipher_fd(uint8_t *drv_ctx,
 	/* OOP */
 	if (dest_sgl) {
 		/* o/p 1st seg */
-		DPAA2_SET_FLE_ADDR(sge, dest_sgl->vec[0].iova);
-		DPAA2_SET_FLE_OFFSET(sge, data_offset);
+		DPAA2_SET_FLE_ADDR(sge, dest_sgl->vec[0].iova + data_offset);
 		sge->length = dest_sgl->vec[0].len - data_offset;
 
 		/* o/p segs */
 		for (i = 1; i < dest_sgl->num; i++) {
 			sge++;
 			DPAA2_SET_FLE_ADDR(sge, dest_sgl->vec[i].iova);
-			DPAA2_SET_FLE_OFFSET(sge, 0);
 			sge->length = dest_sgl->vec[i].len;
 		}
 	} else {
 		/* o/p 1st seg */
-		DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova);
-		DPAA2_SET_FLE_OFFSET(sge, data_offset);
+		DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova + data_offset);
 		sge->length = sgl->vec[0].len - data_offset;
 
 		/* o/p segs */
 		for (i = 1; i < sgl->num; i++) {
 			sge++;
 			DPAA2_SET_FLE_ADDR(sge, sgl->vec[i].iova);
-			DPAA2_SET_FLE_OFFSET(sge, 0);
 			sge->length = sgl->vec[i].len;
 		}
 	}
@@ -674,21 +654,18 @@ build_raw_dp_cipher_fd(uint8_t *drv_ctx,
 
 	/* i/p IV */
 	DPAA2_SET_FLE_ADDR(sge, iv->iova);
-	DPAA2_SET_FLE_OFFSET(sge, 0);
 	sge->length = sess->iv.length;
 
 	sge++;
 
 	/* i/p 1st seg */
-	DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova);
-	DPAA2_SET_FLE_OFFSET(sge, data_offset);
+	DPAA2_SET_FLE_ADDR(sge, sgl->vec[0].iova + data_offset);
 	sge->length = sgl->vec[0].len - data_offset;
 
 	/* i/p segs */
 	for (i = 1; i < sgl->num; i++) {
 		sge++;
 		DPAA2_SET_FLE_ADDR(sge, sgl->vec[i].iova);
-		DPAA2_SET_FLE_OFFSET(sge, 0);
 		sge->length = sgl->vec[i].len;
 	}
 	DPAA2_SET_FLE_FIN(sge);
@@ -1005,11 +982,9 @@ dpaa2_sec_configure_raw_dp_ctx(struct rte_cryptodev *dev, uint16_t qp_id,
 	}
 
 	if (sess_type == RTE_CRYPTO_OP_SECURITY_SESSION)
-		sess = (dpaa2_sec_session *)get_sec_session_private_data(
-				session_ctx.sec_sess);
+		sess = SECURITY_GET_SESS_PRIV(session_ctx.sec_sess);
 	else if (sess_type == RTE_CRYPTO_OP_WITH_SESSION)
-		sess = (dpaa2_sec_session *)get_sym_session_private_data(
-			session_ctx.crypto_sess, cryptodev_driver_id);
+		sess = CRYPTODEV_GET_SYM_SESS_PRIV(session_ctx.crypto_sess);
 	else
 		return -ENOTSUP;
 	raw_dp_ctx->dequeue_burst = dpaa2_sec_raw_dequeue_burst;

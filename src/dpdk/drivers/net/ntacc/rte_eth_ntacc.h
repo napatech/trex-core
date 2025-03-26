@@ -34,8 +34,7 @@
 #ifndef __RTE_ETH_NTACC_H__
 #define __RTE_ETH_NTACC_H__
 
-#include "nt_compat.h"
-
+#include <ethdev_pci.h>
 
 #define SEGMENT_LENGTH  (1024*1024)
 
@@ -255,7 +254,8 @@ int DoNtpl(const char *ntplStr, uint32_t *pNtplID, struct pmd_internals *interna
 
 extern int ntacc_logtype;
 
-#define PMD_NTACC_LOG(level, fmt, args...) rte_log(RTE_LOG_ ## level, ntacc_logtype, "%s: " fmt , __func__, ##args)
+#define PMD_NTACC_LOG(level, fmt, args...) rte_log(RTE_LOG_ ## level, ntacc_logtype, \
+		                                               "%s: " fmt , __func__, ##args)
 
 #endif
 

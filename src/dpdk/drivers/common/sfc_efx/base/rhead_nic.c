@@ -40,6 +40,10 @@ rhead_board_cfg(
 
 	encp->enc_clk_mult = 1; /* not used for Riverhead */
 
+	EFX_STATIC_ASSERT(MC_CMD_INIT_RXQ_V4_IN_BUFFER_SIZE_BYTES_LEN == 4);
+	/* Agrees with MC_CMD_INIT_RXQ_V4_IN_BUFFER_SIZE_BYTES_LEN */
+	encp->enc_rx_dma_desc_size_max = UINT32_MAX;
+
 	/*
 	 * FIXME There are TxSend and TxSeg descriptors on Riverhead.
 	 * TxSeg is bigger than TxSend.
@@ -171,6 +175,15 @@ rhead_board_cfg(
 		goto fail3;
 	encp->enc_required_pcie_bandwidth_mbps = bandwidth;
 	encp->enc_max_pcie_link_gen = EFX_PCIE_LINK_SPEED_GEN3;
+
+	/*
+	 * FIXME: MCDI table API support depends on an EF100 firmware build
+	 * and an EF100 platform. It should be discovered by using a capability
+	 * flag from MCDI that is not implemented yet.
+	 * Right now we can safely rely on the return code from the libefx
+	 * MCDI Table API.
+	 */
+	encp->enc_table_api_supported = B_TRUE;
 
 	return (0);
 

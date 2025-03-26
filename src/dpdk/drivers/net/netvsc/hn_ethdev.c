@@ -30,8 +30,9 @@
 #include <rte_errno.h>
 #include <rte_memory.h>
 #include <rte_eal.h>
-#include <rte_dev.h>
-#include <rte_bus_vmbus.h>
+#include <dev_driver.h>
+#include <bus_driver.h>
+#include <bus_vmbus_driver.h>
 #include <rte_alarm.h>
 
 #include "hn_logs.h"
@@ -554,9 +555,10 @@ static int hn_subchan_configure(struct hn_data *hv,
 static void netvsc_hotplug_retry(void *args)
 {
 	int ret;
-	struct hn_data *hv = args;
+	struct hv_hotadd_context *hot_ctx = args;
+	struct hn_data *hv = hot_ctx->hv;
 	struct rte_eth_dev *dev = &rte_eth_devices[hv->port_id];
-	struct rte_devargs *d = &hv->devargs;
+	struct rte_devargs *d = &hot_ctx->da;
 	char buf[256];
 
 	DIR *di;
@@ -566,10 +568,13 @@ static void netvsc_hotplug_retry(void *args)
 	int s;
 
 	PMD_DRV_LOG(DEBUG, "%s: retry count %d",
-		    __func__, hv->eal_hot_plug_retry);
+		    __func__, hot_ctx->eal_hot_plug_retry);
 
-	if (hv->eal_hot_plug_retry++ > NETVSC_MAX_HOTADD_RETRY)
-		return;
+	if (hot_ctx->eal_hot_plug_retry++ > NETVSC_MAX_HOTADD_RETRY) {
+		PMD_DRV_LOG(NOTICE, "Failed to parse PCI device retry=%d",
+			    hot_ctx->eal_hot_plug_retry);
+		goto free_hotadd_ctx;
+	}
 
 	snprintf(buf, sizeof(buf), "/sys/bus/pci/devices/%s/net", d->name);
 	di = opendir(buf);
@@ -602,7 +607,7 @@ static void netvsc_hotplug_retry(void *args)
 		}
 		if (req.ifr_hwaddr.sa_family != ARPHRD_ETHER) {
 			closedir(di);
-			return;
+			goto free_hotadd_ctx;
 		}
 		memcpy(eth_addr.addr_bytes, req.ifr_hwaddr.sa_data,
 		       RTE_DIM(eth_addr.addr_bytes));
@@ -611,8 +616,13 @@ static void netvsc_hotplug_retry(void *args)
 			PMD_DRV_LOG(NOTICE,
 				    "Found matching MAC address, adding device %s network name %s",
 				    d->name, dir->d_name);
+
+			/* If this device has been hot removed from this
+			 * parent device, restore its args.
+			 */
 			ret = rte_eal_hotplug_add(d->bus->name, d->name,
-						  d->args);
+						  hv->vf_devargs ?
+						  hv->vf_devargs : "");
 			if (ret) {
 				PMD_DRV_LOG(ERR,
 					    "Failed to add PCI device %s",
@@ -624,12 +634,20 @@ static void netvsc_hotplug_retry(void *args)
 		 * the device, or its MAC address did not match.
 		 */
 		closedir(di);
-		return;
+		goto free_hotadd_ctx;
 	}
 	closedir(di);
 retry:
 	/* The device is still being initialized, retry after 1 second */
-	rte_eal_alarm_set(1000000, netvsc_hotplug_retry, hv);
+	rte_eal_alarm_set(1000000, netvsc_hotplug_retry, hot_ctx);
+	return;
+
+free_hotadd_ctx:
+	rte_spinlock_lock(&hv->hotadd_lock);
+	LIST_REMOVE(hot_ctx, list);
+	rte_spinlock_unlock(&hv->hotadd_lock);
+
+	rte_free(hot_ctx);
 }
 
 static void
@@ -637,7 +655,8 @@ netvsc_hotadd_callback(const char *device_name, enum rte_dev_event_type type,
 		       void *arg)
 {
 	struct hn_data *hv = arg;
-	struct rte_devargs *d = &hv->devargs;
+	struct hv_hotadd_context *hot_ctx;
+	struct rte_devargs *d;
 	int ret;
 
 	PMD_DRV_LOG(INFO, "Device notification type=%d device_name=%s",
@@ -649,26 +668,42 @@ netvsc_hotadd_callback(const char *device_name, enum rte_dev_event_type type,
 		if (hv->vf_ctx.vf_state > vf_removed)
 			break;
 
+		hot_ctx = rte_zmalloc("NETVSC-HOTADD", sizeof(*hot_ctx),
+				      rte_mem_page_size());
+
+		if (!hot_ctx) {
+			PMD_DRV_LOG(ERR, "Failed to allocate hotadd context");
+			return;
+		}
+
+		hot_ctx->hv = hv;
+		d = &hot_ctx->da;
+
 		ret = rte_devargs_parse(d, device_name);
 		if (ret) {
 			PMD_DRV_LOG(ERR,
 				    "devargs parsing failed ret=%d", ret);
-			return;
+			goto free_ctx;
 		}
 
 		if (!strcmp(d->bus->name, "pci")) {
 			/* Start the process of figuring out if this
 			 * PCI device is a VF device
 			 */
-			hv->eal_hot_plug_retry = 0;
-			rte_eal_alarm_set(1000000, netvsc_hotplug_retry, hv);
+			rte_spinlock_lock(&hv->hotadd_lock);
+			LIST_INSERT_HEAD(&hv->hotadd_list, hot_ctx, list);
+			rte_spinlock_unlock(&hv->hotadd_lock);
+			rte_eal_alarm_set(1000000, netvsc_hotplug_retry, hot_ctx);
+			return;
 		}
 
 		/* We will switch to VF on RDNIS configure message
 		 * sent from VSP
 		 */
-
+free_ctx:
+		rte_free(hot_ctx);
 		break;
+
 	default:
 		break;
 	}
@@ -955,7 +990,7 @@ static int
 hn_dev_start(struct rte_eth_dev *dev)
 {
 	struct hn_data *hv = dev->data->dev_private;
-	int error;
+	int i, error;
 
 	PMD_INIT_FUNC_TRACE();
 
@@ -982,6 +1017,11 @@ hn_dev_start(struct rte_eth_dev *dev)
 	if (error == 0)
 		hn_dev_link_update(dev, 0);
 
+	for (i = 0; i < hv->num_queues; i++) {
+		dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
+		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
+	}
+
 	return error;
 }
 
@@ -989,13 +1029,21 @@ static int
 hn_dev_stop(struct rte_eth_dev *dev)
 {
 	struct hn_data *hv = dev->data->dev_private;
+	int i, ret;
 
 	PMD_INIT_FUNC_TRACE();
 	dev->data->dev_started = 0;
 
 	rte_dev_event_callback_unregister(NULL, netvsc_hotadd_callback, hv);
 	hn_rndis_set_rxfilter(hv, 0);
-	return hn_vf_stop(dev);
+	ret = hn_vf_stop(dev);
+
+	for (i = 0; i < hv->num_queues; i++) {
+		dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
+		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
+	}
+
+	return ret;
 }
 
 static int
@@ -1003,49 +1051,26 @@ hn_dev_close(struct rte_eth_dev *dev)
 {
 	int ret;
 	struct hn_data *hv = dev->data->dev_private;
+	struct hv_hotadd_context *hot_ctx;
 
 	PMD_INIT_FUNC_TRACE();
 	if (rte_eal_process_type() != RTE_PROC_PRIMARY)
 		return 0;
 
-	rte_eal_alarm_cancel(netvsc_hotplug_retry, &hv->devargs);
+	rte_spinlock_lock(&hv->hotadd_lock);
+	while (!LIST_EMPTY(&hv->hotadd_list)) {
+		hot_ctx = LIST_FIRST(&hv->hotadd_list);
+		rte_eal_alarm_cancel(netvsc_hotplug_retry, hot_ctx);
+		LIST_REMOVE(hot_ctx, list);
+		rte_free(hot_ctx);
+	}
+	rte_spinlock_unlock(&hv->hotadd_lock);
 
 	ret = hn_vf_close(dev);
 	hn_dev_free_queues(dev);
 
 	return ret;
 }
-
-static const struct eth_dev_ops hn_eth_dev_ops = {
-	.dev_configure		= hn_dev_configure,
-	.dev_start		= hn_dev_start,
-	.dev_stop		= hn_dev_stop,
-	.dev_close		= hn_dev_close,
-	.dev_infos_get		= hn_dev_info_get,
-	.txq_info_get		= hn_dev_tx_queue_info,
-	.rxq_info_get		= hn_dev_rx_queue_info,
-	.dev_supported_ptypes_get = hn_vf_supported_ptypes,
-	.promiscuous_enable     = hn_dev_promiscuous_enable,
-	.promiscuous_disable    = hn_dev_promiscuous_disable,
-	.allmulticast_enable    = hn_dev_allmulticast_enable,
-	.allmulticast_disable   = hn_dev_allmulticast_disable,
-	.set_mc_addr_list	= hn_dev_mc_addr_list,
-	.reta_update		= hn_rss_reta_update,
-	.reta_query             = hn_rss_reta_query,
-	.rss_hash_update	= hn_rss_hash_update,
-	.rss_hash_conf_get      = hn_rss_hash_conf_get,
-	.tx_queue_setup		= hn_dev_tx_queue_setup,
-	.tx_queue_release	= hn_dev_tx_queue_release,
-	.tx_done_cleanup        = hn_dev_tx_done_cleanup,
-	.rx_queue_setup		= hn_dev_rx_queue_setup,
-	.rx_queue_release	= hn_dev_rx_queue_release,
-	.link_update		= hn_dev_link_update,
-	.stats_get		= hn_dev_stats_get,
-	.stats_reset            = hn_dev_stats_reset,
-	.xstats_get		= hn_dev_xstats_get,
-	.xstats_get_names	= hn_dev_xstats_get_names,
-	.xstats_reset		= hn_dev_xstats_reset,
-};
 
 /*
  * Setup connection between PMD and kernel.
@@ -1086,16 +1111,165 @@ hn_detach(struct hn_data *hv)
 	hn_rndis_detach(hv);
 }
 
+/*
+ * Connects EXISTING rx/tx queues to NEW vmbus channel(s), and
+ * re-initializes NDIS and RNDIS, including re-sending initial
+ * NDIS/RNDIS configuration. To be used after the underlying vmbus
+ * has been un- and re-mapped, e.g. as must happen when the device
+ * MTU is changed.
+ */
+static int
+hn_reinit(struct rte_eth_dev *dev, uint16_t mtu)
+{
+	struct hn_data *hv = dev->data->dev_private;
+	struct hn_rx_queue **rxqs = (struct hn_rx_queue **)dev->data->rx_queues;
+	struct hn_tx_queue **txqs = (struct hn_tx_queue **)dev->data->tx_queues;
+	int i, ret = 0;
+
+	/* Point primary queues at new primary channel */
+	rxqs[0]->chan = hv->channels[0];
+	txqs[0]->chan = hv->channels[0];
+
+	ret = hn_attach(hv, mtu);
+	if (ret)
+		return ret;
+
+	/* Create vmbus subchannels, additional RNDIS configuration */
+	ret = hn_dev_configure(dev);
+	if (ret)
+		return ret;
+
+	/* Point any additional queues at new subchannels */
+	for (i = 1; i < dev->data->nb_rx_queues; i++)
+		rxqs[i]->chan = hv->channels[i];
+	for (i = 1; i < dev->data->nb_tx_queues; i++)
+		txqs[i]->chan = hv->channels[i];
+
+	return ret;
+}
+
+static int
+hn_dev_mtu_set(struct rte_eth_dev *dev, uint16_t mtu)
+{
+	struct hn_data *hv = dev->data->dev_private;
+	unsigned int orig_mtu = dev->data->mtu;
+	uint32_t rndis_mtu;
+	int ret = 0;
+	int i;
+
+	if (dev->data->dev_started) {
+		PMD_DRV_LOG(ERR, "Device must be stopped before changing MTU");
+		return -EBUSY;
+	}
+
+	/* Change MTU of underlying VF dev first, if it exists */
+	ret = hn_vf_mtu_set(dev, mtu);
+	if (ret)
+		return ret;
+
+	/* Release channel resources */
+	hn_detach(hv);
+
+	/* Close any secondary vmbus channels */
+	for (i = 1; i < hv->num_queues; i++)
+		rte_vmbus_chan_close(hv->channels[i]);
+
+	/* Close primary vmbus channel */
+	rte_free(hv->channels[0]);
+
+	/* Unmap and re-map vmbus device */
+	rte_vmbus_unmap_device(hv->vmbus);
+	ret = rte_vmbus_map_device(hv->vmbus);
+	if (ret) {
+		/* This is a catastrophic error - the device is unusable */
+		PMD_DRV_LOG(ERR, "Could not re-map vmbus device!");
+		return ret;
+	}
+
+	/* Update pointers to re-mapped UIO resources */
+	hv->rxbuf_res = hv->vmbus->resource[HV_RECV_BUF_MAP];
+	hv->chim_res  = hv->vmbus->resource[HV_SEND_BUF_MAP];
+
+	/* Re-open the primary vmbus channel */
+	ret = rte_vmbus_chan_open(hv->vmbus, &hv->channels[0]);
+	if (ret) {
+		/* This is a catastrophic error - the device is unusable */
+		PMD_DRV_LOG(ERR, "Could not re-open vmbus channel!");
+		return ret;
+	}
+
+	rte_vmbus_set_latency(hv->vmbus, hv->channels[0], hv->latency);
+
+	ret = hn_reinit(dev, mtu);
+	if (!ret)
+		goto out;
+
+	/* In case of error, attempt to restore original MTU */
+	ret = hn_reinit(dev, orig_mtu);
+	if (ret)
+		PMD_DRV_LOG(ERR, "Restoring original MTU failed for netvsc");
+
+	ret = hn_vf_mtu_set(dev, orig_mtu);
+	if (ret)
+		PMD_DRV_LOG(ERR, "Restoring original MTU failed for VF");
+
+out:
+	if (hn_rndis_get_mtu(hv, &rndis_mtu)) {
+		PMD_DRV_LOG(ERR, "Could not get MTU via RNDIS");
+	} else {
+		dev->data->mtu = (uint16_t)rndis_mtu;
+		PMD_DRV_LOG(DEBUG, "RNDIS MTU is %u", dev->data->mtu);
+	}
+
+	return ret;
+}
+
+static const struct eth_dev_ops hn_eth_dev_ops = {
+	.dev_configure		= hn_dev_configure,
+	.dev_start		= hn_dev_start,
+	.dev_stop		= hn_dev_stop,
+	.dev_close		= hn_dev_close,
+	.dev_infos_get		= hn_dev_info_get,
+	.txq_info_get		= hn_dev_tx_queue_info,
+	.rxq_info_get		= hn_dev_rx_queue_info,
+	.dev_supported_ptypes_get = hn_vf_supported_ptypes,
+	.promiscuous_enable     = hn_dev_promiscuous_enable,
+	.promiscuous_disable    = hn_dev_promiscuous_disable,
+	.allmulticast_enable    = hn_dev_allmulticast_enable,
+	.allmulticast_disable   = hn_dev_allmulticast_disable,
+	.set_mc_addr_list	= hn_dev_mc_addr_list,
+	.mtu_set                = hn_dev_mtu_set,
+	.reta_update		= hn_rss_reta_update,
+	.reta_query             = hn_rss_reta_query,
+	.rss_hash_update	= hn_rss_hash_update,
+	.rss_hash_conf_get      = hn_rss_hash_conf_get,
+	.tx_queue_setup		= hn_dev_tx_queue_setup,
+	.tx_queue_release	= hn_dev_tx_queue_release,
+	.tx_done_cleanup        = hn_dev_tx_done_cleanup,
+	.rx_queue_setup		= hn_dev_rx_queue_setup,
+	.rx_queue_release	= hn_dev_rx_queue_release,
+	.link_update		= hn_dev_link_update,
+	.stats_get		= hn_dev_stats_get,
+	.stats_reset            = hn_dev_stats_reset,
+	.xstats_get		= hn_dev_xstats_get,
+	.xstats_get_names	= hn_dev_xstats_get_names,
+	.xstats_reset		= hn_dev_xstats_reset,
+};
+
 static int
 eth_hn_dev_init(struct rte_eth_dev *eth_dev)
 {
 	struct hn_data *hv = eth_dev->data->dev_private;
 	struct rte_device *device = eth_dev->device;
 	struct rte_vmbus_device *vmbus;
+	uint32_t mtu;
 	unsigned int rxr_cnt;
 	int err, max_chan;
 
 	PMD_INIT_FUNC_TRACE();
+
+	rte_spinlock_init(&hv->hotadd_lock);
+	LIST_INIT(&hv->hotadd_list);
 
 	vmbus = container_of(device, struct rte_vmbus_device, device);
 	eth_dev->dev_ops = &hn_eth_dev_ops;
@@ -1124,8 +1298,8 @@ eth_hn_dev_init(struct rte_eth_dev *eth_dev)
 	}
 
 	hv->vmbus = vmbus;
-	hv->rxbuf_res = &vmbus->resource[HV_RECV_BUF_MAP];
-	hv->chim_res  = &vmbus->resource[HV_SEND_BUF_MAP];
+	hv->rxbuf_res = vmbus->resource[HV_RECV_BUF_MAP];
+	hv->chim_res  = vmbus->resource[HV_SEND_BUF_MAP];
 	hv->port_id = eth_dev->data->port_id;
 	hv->latency = HN_CHAN_LATENCY_NS;
 	hv->rx_copybreak = HN_RXCOPY_THRESHOLD;
@@ -1171,6 +1345,12 @@ eth_hn_dev_init(struct rte_eth_dev *eth_dev)
 	err = hn_chim_init(eth_dev);
 	if (err)
 		goto failed;
+
+	err = hn_rndis_get_mtu(hv, &mtu);
+	if (err)
+		goto failed;
+	eth_dev->data->mtu = (uint16_t)mtu;
+	PMD_INIT_LOG(DEBUG, "RNDIS MTU is %u", eth_dev->data->mtu);
 
 	err = hn_rndis_get_eaddr(hv, eth_dev->data->mac_addrs->addr_bytes);
 	if (err)
@@ -1221,9 +1401,12 @@ eth_hn_dev_uninit(struct rte_eth_dev *eth_dev)
 	ret_stop = hn_dev_stop(eth_dev);
 	hn_dev_close(eth_dev);
 
+	free(hv->vf_devargs);
+	hv->vf_devargs = NULL;
+
 	hn_detach(hv);
 	hn_chim_uninit(eth_dev);
-	rte_vmbus_chan_close(hv->primary->chan);
+	rte_vmbus_chan_close(hv->channels[0]);
 	rte_free(hv->primary);
 	ret = rte_eth_dev_owner_delete(hv->owner.id);
 	if (ret != 0)

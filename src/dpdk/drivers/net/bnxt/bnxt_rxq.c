@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(c) 2014-2021 Broadcom
+ * Copyright(c) 2014-2023 Broadcom
  * All rights reserved.
  */
 
@@ -19,6 +19,32 @@
 /*
  * RX Queues
  */
+
+uint64_t bnxt_get_rx_port_offloads(struct bnxt *bp)
+{
+	uint64_t rx_offload_capa;
+
+	rx_offload_capa = RTE_ETH_RX_OFFLOAD_IPV4_CKSUM  |
+			  RTE_ETH_RX_OFFLOAD_UDP_CKSUM   |
+			  RTE_ETH_RX_OFFLOAD_TCP_CKSUM   |
+			  RTE_ETH_RX_OFFLOAD_KEEP_CRC    |
+			  RTE_ETH_RX_OFFLOAD_VLAN_FILTER |
+			  RTE_ETH_RX_OFFLOAD_VLAN_EXTEND |
+			  RTE_ETH_RX_OFFLOAD_TCP_LRO |
+			  RTE_ETH_RX_OFFLOAD_SCATTER |
+			  RTE_ETH_RX_OFFLOAD_RSS_HASH;
+
+	if (bp->flags & BNXT_FLAG_PTP_SUPPORTED)
+		rx_offload_capa |= RTE_ETH_RX_OFFLOAD_TIMESTAMP;
+	if (bp->vnic_cap_flags & BNXT_VNIC_CAP_VLAN_RX_STRIP)
+		rx_offload_capa |= RTE_ETH_RX_OFFLOAD_VLAN_STRIP;
+
+	if (BNXT_TUNNELED_OFFLOADS_CAP_ALL_EN(bp))
+		rx_offload_capa |= RTE_ETH_RX_OFFLOAD_OUTER_IPV4_CKSUM |
+					RTE_ETH_RX_OFFLOAD_OUTER_UDP_CKSUM;
+
+	return rx_offload_capa;
+}
 
 /* Determine whether the current configuration needs aggregation ring in HW. */
 int bnxt_need_agg_ring(struct rte_eth_dev *eth_dev)
@@ -40,6 +66,7 @@ void bnxt_free_rxq_stats(struct bnxt_rx_queue *rxq)
 int bnxt_mq_rx_configure(struct bnxt *bp)
 {
 	struct rte_eth_conf *dev_conf = &bp->eth_dev->data->dev_conf;
+	struct rte_eth_rss_conf *rss = &bp->rss_conf;
 	const struct rte_eth_vmdq_rx_conf *conf =
 		    &dev_conf->rx_adv_conf.vmdq_rx_conf;
 	unsigned int i, j, nb_q_per_grp = 1, ring_idx = 0;
@@ -147,32 +174,19 @@ skip_filter_allocation:
 
 	bp->rx_num_qs_per_vnic = nb_q_per_grp;
 
-	if (dev_conf->rxmode.mq_mode & RTE_ETH_MQ_RX_RSS_FLAG) {
-		struct rte_eth_rss_conf *rss = &bp->rss_conf;
+	for (i = 0; i < bp->nr_vnics; i++) {
+		uint32_t lvl = RTE_ETH_RSS_LEVEL(rss->rss_hf);
 
-		if (bp->flags & BNXT_FLAG_UPDATE_HASH)
-			bp->flags &= ~BNXT_FLAG_UPDATE_HASH;
+		vnic = &bp->vnic_info[i];
+		vnic->hash_type = bnxt_rte_to_hwrm_hash_types(rss->rss_hf);
+		vnic->hash_mode = bnxt_rte_to_hwrm_hash_level(bp, rss->rss_hf, lvl);
 
-		for (i = 0; i < bp->nr_vnics; i++) {
-			uint32_t lvl = RTE_ETH_RSS_LEVEL(rss->rss_hf);
-
-			vnic = &bp->vnic_info[i];
-			vnic->hash_type =
-				bnxt_rte_to_hwrm_hash_types(rss->rss_hf);
-			vnic->hash_mode =
-				bnxt_rte_to_hwrm_hash_level(bp,
-							    rss->rss_hf,
-							    lvl);
-
-			/*
-			 * Use the supplied key if the key length is
-			 * acceptable and the rss_key is not NULL
-			 */
-			if (rss->rss_key &&
-			    rss->rss_key_len <= HW_HASH_KEY_SIZE)
-				memcpy(vnic->rss_hash_key,
-				       rss->rss_key, rss->rss_key_len);
-		}
+		/*
+		 * Use the supplied key if the key length is
+		 * acceptable and the rss_key is not NULL
+		 */
+		if (rss->rss_key && rss->rss_key_len <= HW_HASH_KEY_SIZE)
+			memcpy(vnic->rss_hash_key, rss->rss_key, rss->rss_key_len);
 	}
 
 	return rc;
@@ -346,9 +360,8 @@ int bnxt_rx_queue_setup_op(struct rte_eth_dev *eth_dev,
 	rxq->rx_free_thresh =
 		RTE_MIN(rte_align32pow2(nb_desc) / 4, RTE_BNXT_MAX_RX_BURST);
 
-	if (rx_conf->rx_drop_en != BNXT_DEFAULT_RX_DROP_EN)
-		PMD_DRV_LOG(NOTICE,
-			    "Per-queue config of drop-en is not supported.\n");
+	PMD_DRV_LOG(DEBUG,
+		    "App supplied RXQ drop_en status : %d\n", rx_conf->rx_drop_en);
 	rxq->drop_en = BNXT_DEFAULT_RX_DROP_EN;
 
 	PMD_DRV_LOG(DEBUG, "RX Buf MTU %d\n", eth_dev->data->mtu);
@@ -378,7 +391,7 @@ int bnxt_rx_queue_setup_op(struct rte_eth_dev *eth_dev,
 			    "ring_dma_zone_reserve for rx_ring failed!\n");
 		goto err;
 	}
-	rte_atomic64_init(&rxq->rx_mbuf_alloc_fail);
+	rxq->rx_mbuf_alloc_fail = 0;
 
 	/* rxq 0 must not be stopped when used as async CPR */
 	if (!BNXT_NUM_ASYNC_CPR(bp) && queue_idx == 0)
@@ -387,11 +400,7 @@ int bnxt_rx_queue_setup_op(struct rte_eth_dev *eth_dev,
 		rxq->rx_deferred_start = rx_conf->rx_deferred_start;
 
 	rxq->rx_started = rxq->rx_deferred_start ? false : true;
-	rxq->vnic = BNXT_GET_DEFAULT_VNIC(bp);
-
-	/* Configure mtu if it is different from what was configured before */
-	if (!queue_idx)
-		bnxt_mtu_set_op(eth_dev, eth_dev->data->mtu);
+	rxq->vnic = bnxt_get_default_vnic(bp);
 
 	return 0;
 err:
@@ -451,6 +460,8 @@ int bnxt_rx_queue_start(struct rte_eth_dev *dev, uint16_t rx_queue_id)
 	struct rte_eth_conf *dev_conf = &bp->eth_dev->data->dev_conf;
 	struct bnxt_rx_queue *rxq = bp->rx_queues[rx_queue_id];
 	struct bnxt_vnic_info *vnic = NULL;
+	uint16_t vnic_idx = 0;
+	uint16_t fw_grp_id = 0;
 	int rc = 0;
 
 	rc = is_bnxt_in_error(bp);
@@ -461,6 +472,23 @@ int bnxt_rx_queue_start(struct rte_eth_dev *dev, uint16_t rx_queue_id)
 		PMD_DRV_LOG(ERR, "Invalid Rx queue %d\n", rx_queue_id);
 		return -EINVAL;
 	}
+
+	vnic = bnxt_vnic_queue_id_get_next(bp, rx_queue_id, &vnic_idx);
+	if (vnic == NULL) {
+		PMD_DRV_LOG(ERR, "VNIC not initialized for RxQ %d\n",
+			    rx_queue_id);
+		return -EINVAL;
+	}
+
+	/* reset the previous stats for the rx_queue since the counters
+	 * will be cleared when the queue is started.
+	 */
+	if (BNXT_TPA_V2_P7(bp))
+		memset(&bp->prev_rx_ring_stats_ext[rx_queue_id], 0,
+		       sizeof(struct bnxt_ring_stats_ext));
+	else
+		memset(&bp->prev_rx_ring_stats[rx_queue_id], 0,
+		       sizeof(struct bnxt_ring_stats));
 
 	/* Set the queue state to started here.
 	 * We check the status of the queue while posting buffer.
@@ -474,29 +502,38 @@ int bnxt_rx_queue_start(struct rte_eth_dev *dev, uint16_t rx_queue_id)
 	if (rc)
 		return rc;
 
-	if (BNXT_CHIP_P5(bp)) {
+	if (BNXT_HAS_RING_GRPS(bp))
+		fw_grp_id = bp->grp_info[rx_queue_id].fw_grp_id;
+
+	do {
+		if (BNXT_HAS_RING_GRPS(bp))
+			vnic->dflt_ring_grp = fw_grp_id;
 		/* Reconfigure default receive ring and MRU. */
-		bnxt_hwrm_vnic_cfg(bp, rxq->vnic);
-	}
-	PMD_DRV_LOG(INFO, "Rx queue started %d\n", rx_queue_id);
+		bnxt_hwrm_vnic_cfg(bp, vnic);
 
-	if (dev_conf->rxmode.mq_mode & RTE_ETH_MQ_RX_RSS_FLAG) {
-		vnic = rxq->vnic;
+		PMD_DRV_LOG(INFO, "Rx queue started %d\n", rx_queue_id);
 
-		if (BNXT_HAS_RING_GRPS(bp)) {
-			if (vnic->fw_grp_ids[rx_queue_id] != INVALID_HW_RING_ID)
-				return 0;
+		if (dev_conf->rxmode.mq_mode & RTE_ETH_MQ_RX_RSS_FLAG) {
+			if (BNXT_HAS_RING_GRPS(bp)) {
+				if (vnic->fw_grp_ids[rx_queue_id] !=
+				    INVALID_HW_RING_ID) {
+					PMD_DRV_LOG(ERR, "invalid ring id %d\n",
+						    rx_queue_id);
+					return 0;
+				}
 
-			vnic->fw_grp_ids[rx_queue_id] =
-					bp->grp_info[rx_queue_id].fw_grp_id;
-			PMD_DRV_LOG(DEBUG,
-				    "vnic = %p fw_grp_id = %d\n",
-				    vnic, bp->grp_info[rx_queue_id].fw_grp_id);
+				vnic->fw_grp_ids[rx_queue_id] = fw_grp_id;
+				PMD_DRV_LOG(DEBUG, "vnic = %p fw_grp_id = %d\n",
+					    vnic, fw_grp_id);
+			}
+
+			PMD_DRV_LOG(DEBUG, "Rx Queue Count %d\n",
+				    vnic->rx_queue_cnt);
+			rc += bnxt_vnic_rss_queue_status_update(bp, vnic);
 		}
-
-		PMD_DRV_LOG(DEBUG, "Rx Queue Count %d\n", vnic->rx_queue_cnt);
-		rc = bnxt_vnic_rss_configure(bp, vnic);
-	}
+		vnic_idx++;
+	} while ((vnic = bnxt_vnic_queue_id_get_next(bp, rx_queue_id,
+						     &vnic_idx)) != NULL);
 
 	if (rc != 0) {
 		dev->data->rx_queue_state[rx_queue_id] =
@@ -519,6 +556,7 @@ int bnxt_rx_queue_stop(struct rte_eth_dev *dev, uint16_t rx_queue_id)
 	struct bnxt_vnic_info *vnic = NULL;
 	struct bnxt_rx_queue *rxq = NULL;
 	int active_queue_cnt = 0;
+	uint16_t vnic_idx = 0, q_id = rx_queue_id;
 	int i, rc = 0;
 
 	rc = is_bnxt_in_error(bp);
@@ -540,61 +578,64 @@ int bnxt_rx_queue_stop(struct rte_eth_dev *dev, uint16_t rx_queue_id)
 		return -EINVAL;
 	}
 
-	vnic = rxq->vnic;
+	vnic = bnxt_vnic_queue_id_get_next(bp, q_id, &vnic_idx);
 	if (!vnic) {
-		PMD_DRV_LOG(ERR, "VNIC not initialized for RxQ %d\n",
-			    rx_queue_id);
+		PMD_DRV_LOG(ERR, "VNIC not initialized for RxQ %d\n", q_id);
 		return -EINVAL;
 	}
 
-	dev->data->rx_queue_state[rx_queue_id] = RTE_ETH_QUEUE_STATE_STOPPED;
+	dev->data->rx_queue_state[q_id] = RTE_ETH_QUEUE_STATE_STOPPED;
 	rxq->rx_started = false;
 	PMD_DRV_LOG(DEBUG, "Rx queue stopped\n");
 
-	if (dev_conf->rxmode.mq_mode & RTE_ETH_MQ_RX_RSS_FLAG) {
-		if (BNXT_HAS_RING_GRPS(bp))
-			vnic->fw_grp_ids[rx_queue_id] = INVALID_HW_RING_ID;
+	do {
+		active_queue_cnt = 0;
+		if (dev_conf->rxmode.mq_mode & RTE_ETH_MQ_RX_RSS_FLAG) {
+			if (BNXT_HAS_RING_GRPS(bp))
+				vnic->fw_grp_ids[q_id] = INVALID_HW_RING_ID;
 
-		PMD_DRV_LOG(DEBUG, "Rx Queue Count %d\n", vnic->rx_queue_cnt);
-		rc = bnxt_vnic_rss_configure(bp, vnic);
-	}
-
-	/* Compute current number of active receive queues. */
-	for (i = vnic->start_grp_id; i < vnic->end_grp_id; i++)
-		if (bp->rx_queues[i]->rx_started)
-			active_queue_cnt++;
-
-	if (BNXT_CHIP_P5(bp)) {
-		/*
-		 * For Thor, we need to ensure that the VNIC default receive
-		 * ring corresponds to an active receive queue. When no queue
-		 * is active, we need to temporarily set the MRU to zero so
-		 * that packets are dropped early in the receive pipeline in
-		 * order to prevent the VNIC default receive ring from being
-		 * accessed.
-		 */
-		if (active_queue_cnt == 0) {
-			uint16_t saved_mru = vnic->mru;
-
-			/* clear RSS setting on vnic. */
-			bnxt_vnic_rss_clear_p5(bp, vnic);
-
-			vnic->mru = 0;
-			/* Reconfigure default receive ring and MRU. */
-			bnxt_hwrm_vnic_cfg(bp, vnic);
-			vnic->mru = saved_mru;
-		} else {
-			/* Reconfigure default receive ring. */
-			bnxt_hwrm_vnic_cfg(bp, vnic);
+			PMD_DRV_LOG(DEBUG, "Rx Queue Count %d\n",
+				    vnic->rx_queue_cnt);
+			rc = bnxt_vnic_rss_queue_status_update(bp, vnic);
 		}
-	} else if (active_queue_cnt) {
-		/*
-		 * If the queue being stopped is the current default queue and
-		 * there are other active queues, pick one of them as the
-		 * default and reconfigure the vnic.
-		 */
-		if (vnic->dflt_ring_grp == bp->grp_info[rx_queue_id].fw_grp_id) {
-			for (i = vnic->start_grp_id; i < vnic->end_grp_id; i++) {
+
+		/* Compute current number of active receive queues. */
+		for (i = vnic->start_grp_id; i < vnic->end_grp_id; i++)
+			if (bp->rx_queues[i]->rx_started)
+				active_queue_cnt++;
+
+		if (BNXT_CHIP_P5_P7(bp)) {
+			/*
+			 * For P5, we need to ensure that the VNIC default
+			 * receive ring corresponds to an active receive queue.
+			 * When no queue is active, we need to temporarily set
+			 * the MRU to zero so that packets are dropped early in
+			 * the receive pipeline in order to prevent the VNIC
+			 * default receive ring from being accessed.
+			 */
+			if (active_queue_cnt == 0) {
+				uint16_t saved_mru = vnic->mru;
+
+				/* clear RSS setting on vnic. */
+				bnxt_vnic_rss_clear_p5(bp, vnic);
+
+				vnic->mru = 0;
+				/* Reconfigure default receive ring and MRU. */
+				bnxt_hwrm_vnic_cfg(bp, vnic);
+				vnic->mru = saved_mru;
+			} else {
+				/* Reconfigure default receive ring. */
+				bnxt_hwrm_vnic_cfg(bp, vnic);
+			}
+		} else if (active_queue_cnt && vnic->dflt_ring_grp ==
+			   bp->grp_info[q_id].fw_grp_id) {
+			/*
+			 * If the queue being stopped is the current default
+			 * queue and there are other active queues, pick one of
+			 * them as the default and reconfigure the vnic.
+			 */
+			for (i = vnic->start_grp_id; i < vnic->end_grp_id;
+			      i++) {
 				if (bp->rx_queues[i]->rx_started) {
 					vnic->dflt_ring_grp =
 						bp->grp_info[i].fw_grp_id;
@@ -603,7 +644,9 @@ int bnxt_rx_queue_stop(struct rte_eth_dev *dev, uint16_t rx_queue_id)
 				}
 			}
 		}
-	}
+		vnic_idx++;
+	} while ((vnic = bnxt_vnic_queue_id_get_next(bp, q_id,
+						     &vnic_idx)) != NULL);
 
 	if (rc == 0)
 		bnxt_rx_queue_release_mbufs(rxq);

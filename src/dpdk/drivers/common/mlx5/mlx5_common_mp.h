@@ -7,6 +7,7 @@
 #define RTE_PMD_MLX5_COMMON_MP_H_
 
 #include <mlx5_glue.h>
+#include <rte_compat.h>
 #include <rte_eal.h>
 #include <rte_string_fns.h>
 
@@ -37,7 +38,6 @@ struct mlx5_mp_arg_queue_id {
 
 struct mlx5_mp_arg_mr_manage {
 	struct mlx5_common_device *cdev;
-	RTE_STD_C11
 	union {
 		struct {
 			struct rte_mempool *mempool;
@@ -52,7 +52,6 @@ struct mlx5_mp_param {
 	enum mlx5_mp_req_type type;
 	int port_id;
 	int result;
-	RTE_STD_C11
 	union {
 		struct mlx5_mp_arg_mr_manage mr_manage;
 		/* MLX5_MP_REQ_MEMPOOL_(UN)REGISTER, MLX5_MP_REQ_CREATE_MR */

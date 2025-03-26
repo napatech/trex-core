@@ -230,7 +230,7 @@ If you are confused you probably need Stateless. :-)
 | /exp            | Golden PCAP file for unit-tests
 | /cfg            | Examples of config files
 | /cap2           | Stateful profiles 
-| /avl            | Stateful profiles - SFR profile
+| /avl            | Stateful profiles - EMIX profile
 | /automation     | Python client/server code for both Stateful and Stateless
 | /automation/regression     | Regression for Stateless and Stateful
 | /automation/config     | Regression setups config files
@@ -4432,7 +4432,7 @@ Lastly, in some use cases you want to clear the stats for the updated **tag_id**
 
 Since the mapping between tags and tag_id can be updated, we can loose track of it. In order to see the mapping in the server at all time, we can use this API.
 
-The API can receive 2 optional parameters, **min_tag** and **max_tag** and it will return all the tags in the range (**max_tag** excluded). By default it will return all tags.לא זה 
+The API can receive 2 optional parameters, **min_tag** and **max_tag** and it will return all the tags in the range (**max_tag** excluded). By default it will return all tags.
 
 .Get Tags Output
 [source, python]

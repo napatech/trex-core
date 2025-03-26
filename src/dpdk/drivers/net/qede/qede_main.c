@@ -72,6 +72,12 @@ qed_probe(struct ecore_dev *edev, struct rte_pci_device *pci_dev,
 	hw_prepare_params.allow_mdump = false;
 	hw_prepare_params.b_en_pacing = false;
 	hw_prepare_params.epoch = OSAL_GET_EPOCH(ECORE_LEADING_HWFN(edev));
+	rc = ecore_mz_mapping_alloc();
+	if (rc) {
+		DP_ERR(edev, "mem zones array allocation failed\n");
+		return rc;
+	}
+
 	rc = ecore_hw_prepare(edev, &hw_prepare_params);
 	if (rc) {
 		DP_ERR(edev, "hw prepare failed\n");
@@ -372,7 +378,7 @@ qed_fill_dev_info(struct ecore_dev *edev, struct qed_dev_info *dev_info)
 	dev_info->mtu = ECORE_LEADING_HWFN(edev)->hw_info.mtu;
 	dev_info->dev_type = edev->type;
 
-	rte_memcpy(&dev_info->hw_mac, &edev->hwfns[0].hw_info.hw_mac_addr,
+	memcpy(&dev_info->hw_mac, &edev->hwfns[0].hw_info.hw_mac_addr,
 	       RTE_ETHER_ADDR_LEN);
 
 	dev_info->fw_major = FW_MAJOR_VERSION;
@@ -440,7 +446,7 @@ qed_fill_eth_dev_info(struct ecore_dev *edev, struct qed_dev_eth_info *info)
 		info->num_vlan_filters = RESC_NUM(&edev->hwfns[0], ECORE_VLAN) -
 					 max_vf_vlan_filters;
 
-		rte_memcpy(&info->port_mac, &edev->hwfns[0].hw_info.hw_mac_addr,
+		memcpy(&info->port_mac, &edev->hwfns[0].hw_info.hw_mac_addr,
 			   RTE_ETHER_ADDR_LEN);
 	} else {
 		ecore_vf_get_num_rxqs(ECORE_LEADING_HWFN(edev),
@@ -471,7 +477,7 @@ static void qed_set_name(struct ecore_dev *edev, char name[NAME_SIZE])
 {
 	int i;
 
-	rte_memcpy(edev->name, name, NAME_SIZE);
+	memcpy(edev->name, name, NAME_SIZE);
 	for_each_hwfn(edev, i) {
 		snprintf(edev->hwfns[i].name, NAME_SIZE, "%s-%d", name, i);
 	}
@@ -513,10 +519,9 @@ static void qed_fill_link(struct ecore_hwfn *hwfn,
 
 	/* Prepare source inputs */
 	if (IS_PF(hwfn->p_dev)) {
-		rte_memcpy(&params, ecore_mcp_get_link_params(hwfn),
-		       sizeof(params));
-		rte_memcpy(&link, ecore_mcp_get_link_state(hwfn), sizeof(link));
-		rte_memcpy(&link_caps, ecore_mcp_get_link_capabilities(hwfn),
+		memcpy(&params, ecore_mcp_get_link_params(hwfn), sizeof(params));
+		memcpy(&link, ecore_mcp_get_link_state(hwfn), sizeof(link));
+		memcpy(&link_caps, ecore_mcp_get_link_capabilities(hwfn),
 		       sizeof(link_caps));
 	} else {
 		ecore_vf_read_bulletin(hwfn, &change);
@@ -723,6 +728,7 @@ static void qed_remove(struct ecore_dev *edev)
 		return;
 
 	ecore_hw_remove(edev);
+	ecore_mz_mapping_free();
 }
 
 static int qed_send_drv_state(struct ecore_dev *edev, bool active)

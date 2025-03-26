@@ -3,11 +3,12 @@
  */
 
 #include <inttypes.h>
+#include <stdlib.h>
 
 #include <rte_common.h>
 #include <cryptodev_pmd.h>
 #include <rte_debug.h>
-#include <rte_dev.h>
+#include <dev_driver.h>
 #include <rte_eal.h>
 #include <ethdev_driver.h>
 #include <rte_event_eth_rx_adapter.h>
@@ -16,7 +17,7 @@
 #include <rte_log.h>
 #include <rte_malloc.h>
 #include <rte_memory.h>
-#include <rte_bus_vdev.h>
+#include <bus_vdev_driver.h>
 
 #include "ssovf_evdev.h"
 #include "timvf_evdev.h"
@@ -150,6 +151,9 @@ ssovf_info_get(struct rte_eventdev *dev, struct rte_event_dev_info *dev_info)
 	dev_info->max_event_port_enqueue_depth = 1;
 	dev_info->max_num_events =  edev->max_num_events;
 	dev_info->event_dev_cap = RTE_EVENT_DEV_CAP_QUEUE_QOS |
+					RTE_EVENT_DEV_CAP_ATOMIC |
+					RTE_EVENT_DEV_CAP_ORDERED |
+					RTE_EVENT_DEV_CAP_PARALLEL |
 					RTE_EVENT_DEV_CAP_DISTRIBUTED_SCHED |
 					RTE_EVENT_DEV_CAP_QUEUE_ALL_TYPES|
 					RTE_EVENT_DEV_CAP_RUNTIME_PORT_LINK |
@@ -157,7 +161,7 @@ ssovf_info_get(struct rte_eventdev *dev, struct rte_event_dev_info *dev_info)
 					RTE_EVENT_DEV_CAP_NONSEQ_MODE |
 					RTE_EVENT_DEV_CAP_CARRY_FLOW_ID |
 					RTE_EVENT_DEV_CAP_MAINTENANCE_FREE;
-
+	dev_info->max_profiles_per_port = 1;
 }
 
 static int
@@ -745,12 +749,12 @@ static int
 ssovf_crypto_adapter_qp_add(const struct rte_eventdev *dev,
 			    const struct rte_cryptodev *cdev,
 			    int32_t queue_pair_id,
-			    const struct rte_event *event)
+			    const struct rte_event_crypto_adapter_queue_conf *conf)
 {
 	struct cpt_instance *qp;
 	uint8_t qp_id;
 
-	RTE_SET_USED(event);
+	RTE_SET_USED(conf);
 
 	if (queue_pair_id == -1) {
 		for (qp_id = 0; qp_id < cdev->data->nb_queue_pairs; qp_id++) {
@@ -879,7 +883,7 @@ ssovf_vdev_probe(struct rte_vdev_device *vdev)
 	}
 
 	eventdev = rte_event_pmd_vdev_init(name, sizeof(struct ssovf_evdev),
-				rte_socket_id());
+				rte_socket_id(), vdev);
 	if (eventdev == NULL) {
 		ssovf_log_err("Failed to create eventdev vdev %s", name);
 		return -ENOMEM;

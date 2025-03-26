@@ -10,12 +10,15 @@
 #ifndef _SFC_FLOW_H
 #define _SFC_FLOW_H
 
+#include <stdbool.h>
+
 #include <rte_tailq.h>
 #include <rte_flow_driver.h>
 
 #include "efx.h"
 
 #include "sfc_flow_rss.h"
+#include "sfc_mae_ct.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,39 +56,60 @@ struct sfc_flow_spec_filter {
 };
 
 /* Indicates the role of a given flow in tunnel offload */
-enum sfc_flow_tunnel_rule_type {
+enum sfc_ft_rule_type {
 	/* The flow has nothing to do with tunnel offload */
 	SFC_FT_RULE_NONE = 0,
-	/* The flow represents a JUMP rule */
-	SFC_FT_RULE_JUMP,
-	/* The flow represents a GROUP rule */
-	SFC_FT_RULE_GROUP,
+	/* The flow is a TUNNEL rule, to match on an outer header */
+	SFC_FT_RULE_TUNNEL,
+	/*
+	 * The flow is a SWITCH rule, to discard the outer header
+	 * and dispatch the resulting packets to a vSwitch tenant
+	 */
+	SFC_FT_RULE_SWITCH,
 };
 
 /* MAE-specific flow specification */
 struct sfc_flow_spec_mae {
 	/* FLow Tunnel (FT) rule type (or NONE) */
-	enum sfc_flow_tunnel_rule_type	ft_rule_type;
+	enum sfc_ft_rule_type		ft_rule_type;
 	/* Flow Tunnel (FT) context (or NULL) */
-	struct sfc_flow_tunnel		*ft;
+	struct sfc_ft_ctx		*ft_ctx;
 	/* Desired priority level */
 	unsigned int			priority;
-	/* Outer rule registry entry */
+	/*
+	 * Outer rule registry entry (points to below action_rule->outer_rule
+	 * when action_rule is not NULL; self-sufficient entry otherwise)
+	 */
 	struct sfc_mae_outer_rule	*outer_rule;
-	/* EFX match specification */
-	efx_mae_match_spec_t		*match_spec;
-	/* Action set registry entry */
-	struct sfc_mae_action_set	*action_set;
-	/* Firmware-allocated rule ID */
-	efx_mae_rule_id_t		rule_id;
+	/* Action rule registry entry */
+	struct sfc_mae_action_rule	*action_rule;
+	/* Conntrack (CT) assistance table entry key and response */
+	sfc_mae_conntrack_response_t	ct_resp;
+	sfc_mae_conntrack_key_t		ct_key;
+	/* Conntrack (CT) assistance counter */
+	struct sfc_mae_counter		*ct_counter;
 };
+
+/* PMD-specific definition of the opaque type from rte_flow.h */
+struct rte_flow_action_handle {
+	TAILQ_ENTRY(rte_flow_action_handle)	entries;
+
+	bool					transfer;
+	enum rte_flow_action_type		type;
+
+	union {
+		struct sfc_mae_encap_header	*encap_header;
+		struct sfc_mae_counter		*counter;
+	};
+};
+
+TAILQ_HEAD(sfc_flow_indir_actions, rte_flow_action_handle);
 
 /* Flow specification */
 struct sfc_flow_spec {
 	/* Flow specification type (engine-based) */
 	enum sfc_flow_spec_type type;
 
-	RTE_STD_C11
 	union {
 		/* Filter-based (VNIC level flows) specification */
 		struct sfc_flow_spec_filter filter;
@@ -98,6 +122,7 @@ struct sfc_flow_spec {
 struct rte_flow {
 	struct sfc_flow_spec spec;	/* flow specification */
 	TAILQ_ENTRY(rte_flow) entries;	/* flow list entries */
+	bool internal;			/* true for internal rules */
 };
 
 TAILQ_HEAD(sfc_flow_list, rte_flow);
@@ -124,7 +149,6 @@ enum sfc_flow_parse_ctx_type {
 struct sfc_flow_parse_ctx {
 	enum sfc_flow_parse_ctx_type type;
 
-	RTE_STD_C11
 	union {
 		/* Context pointer valid for filter-based (VNIC) flows */
 		efx_filter_spec_t *filter;
@@ -191,6 +215,15 @@ typedef int (sfc_flow_query_cb_t)(struct rte_eth_dev *dev,
 				  const struct rte_flow_action *action,
 				  void *data,
 				  struct rte_flow_error *error);
+
+struct rte_flow *sfc_flow_create_locked(struct sfc_adapter *sa, bool internal,
+					const struct rte_flow_attr *attr,
+					const struct rte_flow_item pattern[],
+					const struct rte_flow_action actions[],
+					struct rte_flow_error *error);
+
+int sfc_flow_destroy_locked(struct sfc_adapter *sa, struct rte_flow *flow,
+			    struct rte_flow_error *error);
 
 #ifdef __cplusplus
 }

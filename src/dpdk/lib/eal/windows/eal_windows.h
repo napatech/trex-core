@@ -12,12 +12,14 @@
 #include <rte_errno.h>
 #include <rte_windows.h>
 
+#include "eal_private.h"
+
 /**
  * Log current function as not implemented and set rte_errno.
  */
 #define EAL_LOG_NOT_IMPLEMENTED() \
 	do { \
-		RTE_LOG(DEBUG, EAL, "%s() is not implemented\n", __func__); \
+		EAL_LOG(DEBUG, "%s() is not implemented", __func__); \
 		rte_errno = ENOTSUP; \
 	} while (0)
 
@@ -25,7 +27,7 @@
  * Log current function as a stub.
  */
 #define EAL_LOG_STUB() \
-	RTE_LOG(DEBUG, EAL, "Windows: %s() is a stub\n", __func__)
+	EAL_LOG(DEBUG, "Windows: %s() is a stub", __func__)
 
 /**
  * Create a map of processors and cores on the system.
@@ -36,16 +38,6 @@
 int eal_create_cpu_map(void);
 
 /**
- * Create a thread.
- *
- * @param thread
- *   The location to store the thread id if successful.
- * @return
- *   0 for success, -1 if the thread is not created.
- */
-int eal_thread_create(pthread_t *thread);
-
-/**
  * Get system NUMA node number for a socket ID.
  *
  * @param socket_id
@@ -54,6 +46,16 @@ int eal_thread_create(pthread_t *thread);
  *  NUMA node number to use with Win32 API.
  */
 unsigned int eal_socket_numa_node(unsigned int socket_id);
+
+/**
+ * Get pointer to the group affinity for the cpu.
+ *
+ * @param cpu_index
+ *  Index of the cpu, as it comes from rte_cpuset_t.
+ * @return
+ *  Pointer to the group affinity for the cpu.
+ */
+PGROUP_AFFINITY eal_get_cpu_affinity(size_t cpu_index);
 
 /**
  * Schedule code for execution in the interrupt thread.

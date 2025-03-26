@@ -25,8 +25,6 @@
 extern "C" {
 #endif
 
-#include <rte_compat.h>
-
 /** Maximum number of key/value associations */
 #define RTE_KVARGS_MAX 32
 
@@ -36,7 +34,19 @@ extern "C" {
 /** separator character used between key and value */
 #define RTE_KVARGS_KV_DELIM	"="
 
-/** Type of callback function used by rte_kvargs_process() */
+/**
+ * Callback prototype used by rte_kvargs_process().
+ *
+ * @param key
+ *   The key to consider, it will not be NULL.
+ * @param value
+ *   The value corresponding to the key, it may be NULL (e.g. only with key)
+ * @param opaque
+ *   An opaque pointer coming from the caller.
+ * @return
+ *   - >=0 handle key success.
+ *   - <0 on error.
+ */
 typedef int (*arg_handler_t)(const char *key, const char *value, void *opaque);
 
 /** A key/value association */
@@ -133,9 +143,6 @@ void rte_kvargs_free(struct rte_kvargs *kvlist);
 const char *rte_kvargs_get(const struct rte_kvargs *kvlist, const char *key);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * Get the value associated with a given key and value.
  *
  * Find the first entry in the kvlist whose key and value match the
@@ -155,7 +162,6 @@ const char *rte_kvargs_get(const struct rte_kvargs *kvlist, const char *key);
  *   NULL if no key matches the input,
  *   a value associated with a matching key otherwise.
  */
-__rte_experimental
 const char *rte_kvargs_get_with_value(const struct rte_kvargs *kvlist,
 				      const char *key, const char *value);
 

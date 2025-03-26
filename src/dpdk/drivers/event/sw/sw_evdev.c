@@ -3,9 +3,10 @@
  */
 
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
-#include <rte_bus_vdev.h>
+#include <bus_vdev_driver.h>
 #include <rte_kvargs.h>
 #include <rte_ring.h>
 #include <rte_errno.h>
@@ -166,8 +167,7 @@ sw_port_setup(struct rte_eventdev *dev, uint8_t port_id,
 	snprintf(buf, sizeof(buf), "sw%d_p%u_%s", dev->data->dev_id,
 			port_id, "rx_worker_ring");
 	struct rte_event_ring *existing_ring = rte_event_ring_lookup(buf);
-	if (existing_ring)
-		rte_event_ring_free(existing_ring);
+	rte_event_ring_free(existing_ring);
 
 	p->rx_worker_ring = rte_event_ring_create(buf, MAX_SW_PROD_Q_DEPTH,
 			dev->data->socket_id,
@@ -186,8 +186,7 @@ sw_port_setup(struct rte_eventdev *dev, uint8_t port_id,
 	snprintf(buf, sizeof(buf), "sw%d_p%u, %s", dev->data->dev_id,
 			port_id, "cq_worker_ring");
 	existing_ring = rte_event_ring_lookup(buf);
-	if (existing_ring)
-		rte_event_ring_free(existing_ring);
+	rte_event_ring_free(existing_ring);
 
 	p->cq_worker_ring = rte_event_ring_create(buf, conf->dequeue_depth,
 			dev->data->socket_id,
@@ -246,7 +245,7 @@ qid_init(struct sw_evdev *sw, unsigned int idx, int type,
 	if (qid->type == RTE_SCHED_TYPE_ORDERED) {
 		uint32_t window_size;
 
-		/* rte_ring and window_size_mask require require window_size to
+		/* rte_ring and window_size_mask require window_size to
 		 * be a power-of-2.
 		 */
 		window_size = rte_align32pow2(
@@ -566,7 +565,7 @@ sw_timer_adapter_caps_get(const struct rte_eventdev *dev, uint64_t flags,
 {
 	RTE_SET_USED(dev);
 	RTE_SET_USED(flags);
-	*caps = 0;
+	*caps = RTE_EVENT_TIMER_ADAPTER_SW_CAP;
 
 	/* Use default SW ops */
 	*ops = NULL;
@@ -601,6 +600,9 @@ sw_info_get(struct rte_eventdev *dev, struct rte_event_dev_info *info)
 			.max_event_port_enqueue_depth = MAX_SW_PROD_Q_DEPTH,
 			.max_num_events = SW_INFLIGHT_EVENTS_TOTAL,
 			.event_dev_cap = (
+				RTE_EVENT_DEV_CAP_ATOMIC |
+				RTE_EVENT_DEV_CAP_ORDERED |
+				RTE_EVENT_DEV_CAP_PARALLEL |
 				RTE_EVENT_DEV_CAP_QUEUE_QOS |
 				RTE_EVENT_DEV_CAP_BURST_MODE |
 				RTE_EVENT_DEV_CAP_EVENT_QOS |
@@ -610,6 +612,7 @@ sw_info_get(struct rte_eventdev *dev, struct rte_event_dev_info *info)
 				RTE_EVENT_DEV_CAP_NONSEQ_MODE |
 				RTE_EVENT_DEV_CAP_CARRY_FLOW_ID |
 				RTE_EVENT_DEV_CAP_MAINTENANCE_FREE),
+			.max_profiles_per_port = 1,
 	};
 
 	*info = evdev_sw_info;
@@ -624,8 +627,8 @@ sw_dump(struct rte_eventdev *dev, FILE *f)
 			"Ordered", "Atomic", "Parallel", "Directed"
 	};
 	uint32_t i;
-	fprintf(f, "EventDev %s: ports %d, qids %d\n", "todo-fix-name",
-			sw->port_count, sw->qid_count);
+	fprintf(f, "EventDev %s: ports %d, qids %d\n",
+		dev->data->name, sw->port_count, sw->qid_count);
 
 	fprintf(f, "\trx   %"PRIu64"\n\tdrop %"PRIu64"\n\ttx   %"PRIu64"\n",
 		sw->stats.rx_pkts, sw->stats.rx_dropped, sw->stats.tx_pkts);
@@ -935,8 +938,7 @@ set_refill_once(const char *key __rte_unused, const char *value, void *opaque)
 static int32_t sw_sched_service_func(void *args)
 {
 	struct rte_eventdev *dev = args;
-	sw_event_schedule(dev);
-	return 0;
+	return sw_event_schedule(dev);
 }
 
 static int
@@ -1076,7 +1078,7 @@ sw_probe(struct rte_vdev_device *vdev)
 			min_burst_size, deq_burst_size, refill_once);
 
 	dev = rte_event_pmd_vdev_init(name,
-			sizeof(struct sw_evdev), socket_id);
+			sizeof(struct sw_evdev), socket_id, vdev);
 	if (dev == NULL) {
 		SW_LOG_ERR("eventdev vdev init() failed");
 		return -EFAULT;

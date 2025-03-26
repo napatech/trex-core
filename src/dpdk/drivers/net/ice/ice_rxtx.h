@@ -16,6 +16,9 @@
 #define ICE_RX_MAX_BURST 32
 #define ICE_TX_MAX_BURST 32
 
+/* Maximal number of segments to split. */
+#define ICE_RX_MAX_NSEG 2
+
 #define ICE_CHK_Q_ENA_COUNT        100
 #define ICE_CHK_Q_ENA_INTERVAL_US  100
 
@@ -40,8 +43,39 @@
 
 #define ICE_RXDID_COMMS_OVS	22
 
+#define ICE_TX_MIN_PKT_LEN 17
+
+#define ICE_TX_OFFLOAD_MASK (    \
+		RTE_MBUF_F_TX_OUTER_IPV6 |	 \
+		RTE_MBUF_F_TX_OUTER_IPV4 |	 \
+		RTE_MBUF_F_TX_OUTER_IP_CKSUM |  \
+		RTE_MBUF_F_TX_VLAN |        \
+		RTE_MBUF_F_TX_IPV6 |		 \
+		RTE_MBUF_F_TX_IPV4 |		 \
+		RTE_MBUF_F_TX_IP_CKSUM |        \
+		RTE_MBUF_F_TX_L4_MASK |         \
+		RTE_MBUF_F_TX_IEEE1588_TMST |	 \
+		RTE_MBUF_F_TX_TCP_SEG |         \
+		RTE_MBUF_F_TX_QINQ |        \
+		RTE_MBUF_F_TX_TUNNEL_MASK |	 \
+		RTE_MBUF_F_TX_UDP_SEG |	 \
+		RTE_MBUF_F_TX_OUTER_UDP_CKSUM)
+
+#define ICE_TX_OFFLOAD_NOTSUP_MASK \
+		(RTE_MBUF_F_TX_OFFLOAD_MASK ^ ICE_TX_OFFLOAD_MASK)
+
 extern uint64_t ice_timestamp_dynflag;
 extern int ice_timestamp_dynfield_offset;
+
+/* Max header size can be 2K - 64 bytes */
+#define ICE_RX_HDR_BUF_SIZE    (2048 - 64)
+
+/* Max data buffer size must be 16K - 128 bytes */
+#define ICE_RX_MAX_DATA_BUF_SIZE	(16 * 1024 - 128)
+
+#define ICE_HEADER_SPLIT_ENA   BIT(0)
+
+#define ICE_TX_MTU_SEG_MAX	8
 
 typedef void (*ice_rx_release_mbufs_t)(struct ice_rx_queue *rxq);
 typedef void (*ice_tx_release_mbufs_t)(struct ice_tx_queue *txq);
@@ -51,6 +85,12 @@ typedef void (*ice_rxd_to_pkt_fields_t)(struct ice_rx_queue *rxq,
 
 struct ice_rx_entry {
 	struct rte_mbuf *mbuf;
+};
+
+enum ice_rx_dtype {
+	ICE_RX_DTYPE_NO_SPLIT       = 0,
+	ICE_RX_DTYPE_HEADER_SPLIT   = 1,
+	ICE_RX_DTYPE_SPLIT_ALWAYS   = 2,
 };
 
 struct ice_rx_queue {
@@ -88,6 +128,7 @@ struct ice_rx_queue {
 	bool q_set; /* indicate if rx queue has been configured */
 	bool rx_deferred_start; /* don't start this queue in dev start */
 	uint8_t proto_xtr; /* Protocol extraction from flexible descriptor */
+	int xtr_field_offs; /*Protocol extraction matedata offset*/
 	uint64_t xtr_ol_flag; /* Protocol extraction offload flag */
 	uint32_t rxdid; /* Receive Flex Descriptor profile ID */
 	ice_rx_release_mbufs_t rx_rel_mbufs;
@@ -95,6 +136,12 @@ struct ice_rx_queue {
 	uint32_t time_high;
 	uint32_t hw_register_set;
 	const struct rte_memzone *mz;
+	uint32_t hw_time_high; /* high 32 bits of timestamp */
+	uint32_t hw_time_low; /* low 32 bits of timestamp */
+	uint64_t hw_time_update; /* SW time of HW record updating */
+	struct rte_eth_rxseg_split rxseg[ICE_RX_MAX_NSEG];
+	uint32_t rxseg_nb;
+	bool ts_enable; /* if rxq timestamp is enabled */
 };
 
 struct ice_tx_entry {
@@ -136,6 +183,7 @@ struct ice_tx_queue {
 	struct ice_vsi *vsi; /* the VSI this queue belongs to */
 	uint16_t tx_next_dd;
 	uint16_t tx_next_rs;
+	uint64_t mbuf_errors;
 	bool tx_deferred_start; /* don't start this queue in dev start */
 	bool q_set; /* indicate if tx queue has been configured */
 	ice_tx_release_mbufs_t tx_rel_mbufs;
@@ -243,7 +291,8 @@ int ice_tx_burst_mode_get(struct rte_eth_dev *dev, uint16_t queue_id,
 int ice_rx_descriptor_status(void *rx_queue, uint16_t offset);
 int ice_tx_descriptor_status(void *tx_queue, uint16_t offset);
 void ice_set_default_ptype_table(struct rte_eth_dev *dev);
-const uint32_t *ice_dev_supported_ptypes_get(struct rte_eth_dev *dev);
+const uint32_t *ice_dev_supported_ptypes_get(struct rte_eth_dev *dev,
+					     size_t *no_of_elements);
 void ice_select_rxd_to_pkt_fields_handler(struct ice_rx_queue *rxq,
 					  uint32_t rxdid);
 
@@ -327,26 +376,27 @@ static inline
 uint64_t ice_tstamp_convert_32b_64b(struct ice_hw *hw, struct ice_adapter *ad,
 				    uint32_t flag, uint32_t in_timestamp)
 {
+	uint8_t tmr_idx = hw->func_caps.ts_func_info.tmr_index_assoc;
 	const uint64_t mask = 0xFFFFFFFF;
 	uint32_t hi, lo, lo2, delta;
 	uint64_t ns;
 
 	if (flag) {
-		lo = ICE_READ_REG(hw, GLTSYN_TIME_L(0));
-		hi = ICE_READ_REG(hw, GLTSYN_TIME_H(0));
+		lo = ICE_READ_REG(hw, GLTSYN_TIME_L(tmr_idx));
+		hi = ICE_READ_REG(hw, GLTSYN_TIME_H(tmr_idx));
 
 		/*
 		 * On typical system, the delta between lo and lo2 is ~1000ns,
 		 * so 10000 seems a large-enough but not overly-big guard band.
 		 */
 		if (lo > (UINT32_MAX - ICE_TIMESYNC_REG_WRAP_GUARD_BAND))
-			lo2 = ICE_READ_REG(hw, GLTSYN_TIME_L(0));
+			lo2 = ICE_READ_REG(hw, GLTSYN_TIME_L(tmr_idx));
 		else
 			lo2 = lo;
 
 		if (lo2 < lo) {
-			lo = ICE_READ_REG(hw, GLTSYN_TIME_L(0));
-			hi = ICE_READ_REG(hw, GLTSYN_TIME_H(0));
+			lo = ICE_READ_REG(hw, GLTSYN_TIME_L(tmr_idx));
+			hi = ICE_READ_REG(hw, GLTSYN_TIME_H(tmr_idx));
 		}
 
 		ad->time_hw = ((uint64_t)hi << 32) | lo;

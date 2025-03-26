@@ -2,7 +2,11 @@ from trex.emu.api import *
 from trex.emu.emu_plugins.emu_plugin_base import *
 from trex.emu.trex_emu_validator import EMUValidator
 import trex.utils.parsing_opts as parsing_opts
+from trex.emu.trex_emu_ipfix_generators import AVCGenerators
+from trex.emu.trex_emu_ipfix_profile import *
+from trex.emu.trex_emu_ipfix_json_config import *
 
+DEBUG = False
 
 class IPFIXPlugin(EMUPluginBase):
     """
@@ -250,7 +254,7 @@ class IPFIXPlugin(EMUPluginBase):
     # Plugins methods
     @plugin_api('ipfix_show_counters', 'emu')
     def ipfix_show_counters_line(self, line):
-        """Show IPFix data counters data.\n"""
+        """Show IPFix data counters data\n"""
         parser = parsing_opts.gen_parser(self,
                                         "show_counters_ipfix",
                                         self.ipfix_show_counters_line.__doc__,
@@ -282,7 +286,7 @@ class IPFIXPlugin(EMUPluginBase):
 
     @plugin_api('ipfix_get_gen_info', 'emu')
     def ipfix_get_gen_info_line(self, line):
-        """Get IPFix generators information.\n"""
+        """Get IPFix generators information\n"""
         parser = parsing_opts.gen_parser(self,
                                         "ipfix_get_gens_info",
                                         self.ipfix_get_gen_info_line.__doc__,
@@ -320,13 +324,13 @@ class IPFIXPlugin(EMUPluginBase):
 
     @plugin_api('ipfix_enable_gen', 'emu')
     def ipfix_enable_gen_line(self, line):
-        """Enable an IPFix generator.\n"""
+        """Enable an IPFix generator\n"""
         res = self._enable_disable_gen_line(line, self.ipfix_enable_gen_line, "enable")
         self.logger.post_cmd(res)
 
     @plugin_api('ipfix_disable_gen', 'emu')
     def ipfix_disable_gen_line(self, line):
-        """Disable an IPFix generator.\n"""
+        """Disable an IPFix generator\n"""
         res = self._enable_disable_gen_line(line, self.ipfix_enable_gen_line, "disable")
         self.logger.post_cmd(res)
 
@@ -336,7 +340,7 @@ class IPFIXPlugin(EMUPluginBase):
                                         caller_func.__doc__,
                                         parsing_opts.EMU_NS_GROUP_NOT_REQ,
                                         parsing_opts.MAC_ADDRESS,
-                                        parsing_opts.GEN_NAME,
+                                        parsing_opts.IPFIX_GEN_NAME,
                                         )
 
         opts = parser.parse_args(line.split())
@@ -347,13 +351,13 @@ class IPFIXPlugin(EMUPluginBase):
 
     @plugin_api('ipfix_enable', 'emu')
     def ipfix_enable_line(self, line):
-        """Enable IPFix plugin for a client.\n"""
+        """Enable IPFix plugin for a client\n"""
         res = self._enable_disable_line(line, self.ipfix_enable_line, "enable")
         self.logger.post_cmd(res)
 
     @plugin_api('ipfix_disable', 'emu')
     def ipfix_disable_line(self, line):
-        """Disable IPFix plugin for a client.\n"""
+        """Disable IPFix plugin for a client\n"""
         res = self._enable_disable_line(line, self.ipfix_enable_line, "disable")
         self.logger.post_cmd(res)
 
@@ -373,14 +377,14 @@ class IPFIXPlugin(EMUPluginBase):
 
     @plugin_api('ipfix_set_data_rate', 'emu')
     def ipfix_set_data_rate_line(self, line):
-        """Set IPFix generator data rate.\n"""
+        """Set IPFix generator data rate\n"""
         parser = parsing_opts.gen_parser(self,
                                         "ipfix_set_data_rate",
                                         self.ipfix_set_data_rate_line.__doc__,
                                         parsing_opts.EMU_NS_GROUP_NOT_REQ,
                                         parsing_opts.MAC_ADDRESS,
-                                        parsing_opts.GEN_NAME,
-                                        parsing_opts.GEN_RATE,
+                                        parsing_opts.IPFIX_GEN_NAME,
+                                        parsing_opts.IPFIX_GEN_RATE,
                                         )
 
         opts = parser.parse_args(line.split())
@@ -391,14 +395,14 @@ class IPFIXPlugin(EMUPluginBase):
 
     @plugin_api('ipfix_set_template_rate', 'emu')
     def ipfix_set_template_rate_line(self, line):
-        """Set IPFix generator template rate.\n"""
+        """Set IPFix generator template rate\n"""
         parser = parsing_opts.gen_parser(self,
                                         "ipfix_set_template_rate",
                                         self.ipfix_set_template_rate_line.__doc__,
                                         parsing_opts.EMU_NS_GROUP_NOT_REQ,
                                         parsing_opts.MAC_ADDRESS,
-                                        parsing_opts.GEN_NAME,
-                                        parsing_opts.GEN_RATE,
+                                        parsing_opts.IPFIX_GEN_NAME,
+                                        parsing_opts.IPFIX_GEN_RATE,
                                         )
 
         opts = parser.parse_args(line.split())
@@ -461,7 +465,7 @@ class IPFIXPlugin(EMUPluginBase):
 
     @plugin_api('ipfix_get_exp_info', 'emu')
     def ipfix_get_exporter_info_line(self, line):
-        """Get IPFix exporter information.\n"""
+        """Get IPFix exporter information\n"""
         parser = parsing_opts.gen_parser(self,
                                         "ipfix_get_exp_info",
                                         self.ipfix_get_exporter_info_line.__doc__,
@@ -496,3 +500,92 @@ class IPFIXPlugin(EMUPluginBase):
         
         if 'files' in res:
             self.print_table_by_keys(list(res['files']), keys_to_headers, title = "Files Info")
+
+    @plugin_api('ipfix_push', 'emu')
+    def ipfix_push(self, line):
+        """Pushing IPFIX files to destination URL using HTTP or UDP. To stop, use 'emu_remove_profile'.\n"""
+        parser = parsing_opts.gen_parser(self,
+                                        "ipfix_push",
+                                        self.ipfix_push.__doc__,
+                                        parsing_opts.IPFIX_DST_URL,
+                                        parsing_opts.IPFIX_DIR,
+                                        parsing_opts.IPFIX_DIR_SCANS_NUM,
+                                        parsing_opts.IPFIX_FILES_WAIT_TIME,
+                                        parsing_opts.IPFIX_FILES_WAIT_TIME_SPEEDUP,
+                                        parsing_opts.IPFIX_HTTP_REPEATS_NUM,
+                                        parsing_opts.IPFIX_HTTP_REPEATS_WAIT_TIME,
+                                        parsing_opts.IPFIX_HTTP_SITES_PER_TENANT,
+                                        parsing_opts.IPFIX_HTTP_DEVICES_PER_SITE,
+                                        parsing_opts.IPFIX_HTTP_HEADER_FIELDS_JSON_FILE,
+                                        parsing_opts.IPFIX_UDP_PACKETS_WAIT_TIME,
+                                        )
+        opts = parser.parse_args(line.split())
+
+        exporter_params = IpfixExporterParamsFactory().create_obj_from_dst_url(opts.dst_url)
+        if exporter_params is None:
+            raise TRexError("Failed to create ipfix exporter")
+
+        header_fields_json = None
+
+        if opts.header_fields_json_file:
+            try:
+                with open(opts.header_fields_json_file, 'r') as file:
+                    header_fields_json = file.read()
+            except FileNotFoundError:
+                raise TRexError("Header fields JSON file doesn't exist")
+
+        exporter_params.set_export_from_dir(True)
+        if exporter_params.get_type() == "http":
+            exporter_params.set_repeats_num(opts.http_repeats_num)
+            exporter_params.set_repeats_wait_time(opts.http_repeats_wait_time)
+            exporter_params.set_export_from_dir_params(dir = opts.dir,
+                                                       dir_scans_num = opts.dir_scans_num,
+                                                       files_wait_time = opts.files_wait_time,
+                                                       files_wait_time_speedup = opts.files_wait_time_speedup)
+            exporter_params.set_header_fields(header_fields_json)
+
+        if exporter_params.get_type() == "udp":
+            exporter_params.set_export_from_dir_params(dir = opts.dir,
+                                                       dir_scans_num = opts.dir_scans_num,
+                                                       files_wait_time = opts.files_wait_time,
+                                                       files_wait_time_speedup = opts.files_wait_time_speedup,
+                                                       packets_wait_time = opts.udp_packets_wait_time)
+
+        generators = AVCGenerators(["Dummy"])
+        ipfix_plugin = IpfixPlugin(exporter_params, generators)
+        ipfix_plugin.set_domain_id(270) 
+
+        profile = IpfixDevicesAutoTriggerProfile(ipfix_plugin=ipfix_plugin,
+                                                 device_mac = "00:00:00:00:00:01",
+                                                 device_ipv4 = "1.1.1.1",
+                                                 sites_per_tenant = opts.http_sites_per_tenant,
+                                                 devices_per_site = opts.http_devices_per_site)
+
+        if DEBUG:
+            print(profile.dump_json())
+
+        self.emu_c.remove_profile()
+        self.emu_c.load_profile(profile.get_profile())
+
+    @plugin_api('ipfix_load_profile_cfg', 'emu')
+    def ipfix_load_profile_from_cfg_file(self, line):
+        """Create an IPFIX profile based on a JSON config file.\n"""
+        parser = parsing_opts.gen_parser(self,
+                                        "ipfix_load_profile_from_cfg_file",
+                                        self.ipfix_load_profile_from_cfg_file.__doc__,
+                                        parsing_opts.IPFIX_PROFILE_CFG_FILE,
+                                        )
+        opts = parser.parse_args(line.split())
+
+        try:
+            config = IpfixProfileJsonConfig(opts.profile_cfg_file)
+            profile = config.get_profile()
+        except ValueError as error:
+            print("Failed to create profile from config file, err:", error)
+            return
+
+        if DEBUG:
+            print(config.dump_profile_json())
+
+        self.emu_c.remove_profile()
+        self.emu_c.load_profile(profile)

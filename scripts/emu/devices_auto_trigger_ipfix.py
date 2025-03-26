@@ -1,8 +1,9 @@
 import argparse
-from emu.avc_ipfix_generators import AVCGenerators
-from emu.ipfix_profile import *
+from trex.emu.trex_emu_ipfix_generators import AVCGenerators
+from trex.emu.trex_emu_ipfix_profile import *
 from trex.emu.api import *
 
+DEBUG = False
 
 class AVCProfiles:
     def __init__(self):
@@ -107,7 +108,7 @@ class Prof1:
         parser.add_argument('--exporter-compressed', default=None, dest="exporter_compressed", action=argparse.BooleanOptionalAction, help="HTTP exporter store exported files on disk")
         parser.add_argument('--exporter-store-exported-files-on-disk', default=None, dest="exporter_store_exported_files_on_disk", action=argparse.BooleanOptionalAction, help="HTTP exporter store exported files on disk")
         parser.add_argument('--exporter-repeats-num', type=int, default=None, dest="exporter_repeats_num", help="HTTP exporter number of times to repeat each export")
-        parser.add_argument('--exporter-repeats-wait-time', type=str, default=None, dest="exporter_repeats_wait_time", help="HTTP exporter time to wait between repeats")
+        parser.add_argument('--exporter-repeats-wait-time', type=str, default=None, dest="exporter_repeats_wait_time", help="HTTP exporter time to wait between file export repeats")
 
         args = parser.parse_args(tuneables)
 
@@ -132,7 +133,7 @@ class Prof1:
         if args.domain_id not in domain_ids:
             raise TRexError("Invalid domain id {}. Domain id should be in {}".format(args.domain_id, domain_ids))
 
-        return self.avc_profiles.get_devices_auto_trigger_profile(
+        profile = self.avc_profiles.get_devices_auto_trigger_profile(
             args.domain_id, 
             device_mac = args.device_mac,
             device_ipv4 = args.device_ipv4,
@@ -142,6 +143,11 @@ class Prof1:
             devices_per_site = args.devices_per_site,
             total_rate_pps = args.total_rate_pps
         ).get_profile()
+
+        if DEBUG:
+            print(profile.dump_json())
+
+        return profile
 
 def register():
     return Prof1()

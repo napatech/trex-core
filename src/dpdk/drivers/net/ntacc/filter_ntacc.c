@@ -311,11 +311,9 @@ int CreateHashModeHash(uint64_t rss_hf, struct pmd_internals *internals, struct 
     return -1;
   }
 
-  if (flow) {
-    flow->port = internals->port;
-    flow->rss_hf = rss_hf;
-    flow->priority = priority;
-  }
+  flow->port = internals->port;
+  flow->rss_hf = rss_hf;
+  flow->priority = priority;
 
   NTACC_LOCK(&internals->lock);
   if (FindHash(rss_hf, internals, priority)) {

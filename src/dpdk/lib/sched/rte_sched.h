@@ -53,10 +53,8 @@ extern "C" {
  *	    the same user;
  *           - Weighted Round Robin (WRR) is used to service the
  *	    queues within same pipe lowest priority traffic class (best-effort).
- *
  */
 
-#include <rte_compat.h>
 #include <rte_mbuf.h>
 #include <rte_meter.h>
 
@@ -310,8 +308,7 @@ struct rte_sched_port_params {
 
 /*
  * Configuration
- *
- ***/
+ */
 
 /**
  * Hierarchical scheduler port configuration
@@ -328,7 +325,8 @@ rte_sched_port_config(struct rte_sched_port_params *params);
  * Hierarchical scheduler port free
  *
  * @param port
- *   Handle to port scheduler instance
+ *   Handle to port scheduler instance.
+ *   If port is NULL, no operation is performed.
  */
 void
 rte_sched_port_free(struct rte_sched_port *port);
@@ -354,9 +352,6 @@ rte_sched_subport_pipe_profile_add(struct rte_sched_port *port,
 	uint32_t *pipe_profile_id);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice.
- *
  * Hierarchical scheduler subport bandwidth profile add
  * Note that this function is safe to use in runtime for adding new
  * subport bandwidth profile as it doesn't have any impact on hierarchical
@@ -370,7 +365,6 @@ rte_sched_subport_pipe_profile_add(struct rte_sched_port *port,
  * @return
  *   0 upon success, error code otherwise
  */
-__rte_experimental
 int
 rte_sched_port_subport_profile_add(struct rte_sched_port *port,
 	struct rte_sched_subport_profile_params *profile,
@@ -433,10 +427,10 @@ rte_sched_pipe_config(struct rte_sched_port *port,
 uint32_t
 rte_sched_port_get_memory_footprint(struct rte_sched_port_params *port_params,
 	struct rte_sched_subport_params **subport_params);
+
 /*
  * Statistics
- *
- ***/
+ */
 
 /**
  * Hierarchical scheduler subport statistics read
@@ -578,6 +572,23 @@ rte_sched_port_enqueue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint
  */
 int
 rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint32_t n_pkts);
+
+/**
+ * Hierarchical scheduler subport traffic class
+ * oversubscription enable/disable.
+ * This function should be called at the time of subport initialization.
+ *
+ * @param port
+ *   Handle to port scheduler instance
+ * @param subport_id
+ *   Subport ID
+ * @param tc_ov_enable
+ *  Boolean flag to enable/disable TC OV
+ * @return
+ *   0 upon success, error code otherwise
+ */
+int
+rte_sched_subport_tc_ov_config(struct rte_sched_port *port, uint32_t subport_id, bool tc_ov_enable);
 
 #ifdef __cplusplus
 }

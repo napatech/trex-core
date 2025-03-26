@@ -60,6 +60,7 @@ gcc_flags = ['-Wall',
              '-Wno-literal-suffix',
              '-Wno-sign-compare',
              '-Wno-strict-aliasing',
+             '-mrtm',
              '-Wno-address-of-packed-member']
 
 
@@ -69,7 +70,7 @@ SANITIZE_CC_VERSION = "4.9.0"
 
 GCC6_DIRS = ['/usr/local/gcc-6.2/bin', '/opt/rh/devtoolset-6/root/usr/bin']
 GCC7_DIRS = ['/usr/local/gcc-7.4/bin', '/opt/rh/devtoolset-7/root/usr/bin']
-GCC8_DIRS = ['/usr/local/gcc-8.3/bin']
+GCC8_DIRS = ['/usr/local/gcc-8.3/bin', '/opt/rh/devtoolset-8/root/usr/bin']
 
 MAX_PKG_SIZE = 290 # MB
 
@@ -146,6 +147,7 @@ def options(opt):
     opt.add_option('--publish-commit', '--publish_commit', dest='publish_commit', default=False, action='store', help="Specify commit id for 'publish_both' option (Please make sure it's good!)")
     opt.add_option('--no-bnxt', dest='no_bnxt', default=False, action='store_true', help="don't use bnxt dpdk driver. use with ./b configure --no-bnxt. no need to run build with it")
     opt.add_option('--no-mlx', dest='no_mlx', default=(True if march == 'aarch64' else False), action='store', help="don't use mlx4/mlx5 dpdk driver. use with ./b configure --no-mlx. no need to run build with it")
+    opt.add_option('--with-mana', dest='with_mana', default=False, action='store_true', help="Use Mana dpdk driver. Use with ./b configure --with-mana.")
     opt.add_option('--with-ntacc', dest='with_ntacc', default=False, action='store_true', help="Use Napatech dpdk driver. Use with ./b configure --with-ntacc.")    
     opt.add_option('--with-bird', default=False, action='store_true', help="Build Bird server. Use with ./b configure --with-bird.")
     opt.add_option('--new-memory', default=False, action='store_true', help="Build by new DPDK memory subsystem.")
@@ -671,9 +673,10 @@ def check_ofed(ctx):
     ctx.start_msg('Checking for OFED')
     ofed_info='/usr/bin/ofed_info'
 
-    ofed_ver_re = re.compile('.*[-](\d)[.](\d)[-].*')
+    ofed_ver_re = re.compile('.*[-](\d+)[.](\d+)[-].*')
 
-    ofed_ver= 42
+    ofed_major_ver = 4
+    ofed_minor_ver = 2
     ofed_ver_show= '4.2'
 
     if not os.path.isfile(ofed_info):
@@ -692,8 +695,12 @@ def check_ofed(ctx):
 
     m= ofed_ver_re.match(str(lines[0]))
     if m:
-        ver=int(m.group(1))*10+int(m.group(2))
-        if ver < ofed_ver:
+        is_version_okay = False
+        if int(m.group(1)) > ofed_major_ver:
+            is_version_okay = True
+        elif int(m.group(1)) == ofed_major_ver and int(m.group(2)) >= ofed_minor_ver:
+            is_version_okay = True
+        if not is_version_okay:
           ctx.end_msg("installed OFED version is '%s' should be at least '%s' and up - try with ./b configure --no-mlx flag" % (lines[0],ofed_ver_show),'YELLOW')
           return False
     else:
@@ -817,6 +824,7 @@ def configure(conf):
     conf.check_cxx(lib = 'z', errmsg = missing_pkg_msg(fedora = 'zlib-devel', ubuntu = 'zlib1g-dev'))
     no_mlx          = conf.options.no_mlx
     no_bnxt         = conf.options.no_bnxt
+    with_mana       = conf.options.with_mana
     with_ntacc      = conf.options.with_ntacc
     with_bird       = conf.options.with_bird
     with_sanitized  = conf.options.sanitized
@@ -854,8 +862,14 @@ def configure(conf):
     if conf.env.TAP:
         conf.configure_tap(mandatory = False)
 
+    conf.env.WITH_MANA = with_mana
     conf.env.WITH_NTACC = with_ntacc
     conf.env.WITH_BIRD = with_bird
+
+    if with_mana:
+        conf.get_ld_search_path(mandatory = True)
+        conf.check_cxx(lib = 'mana', errmsg = 'Could not find library mana, will use internal version.', mandatory = False)
+        Logs.pprint('YELLOW', 'Building mana PMD')
 
     if with_ntacc:
         ntapi_ok = conf.check_ntapi(mandatory = False)
@@ -871,6 +885,10 @@ def configure(conf):
         s += '#define RTE_EAL_NUMA_AWARE_HUGEPAGES 1\n'
         s += '#endif\n'
         write_file(os.path.join(conf.bldnode.abspath(), H_DPDK_CONFIG), s)
+
+    conf.env.DPDK_WITH_ARCHIVE = False
+    if conf.check_cxx(lib = 'archive', errmsg = 'Could not find libarchive', mandatory = False):
+        conf.env.DPDK_WITH_ARCHIVE = True
 
 def search_in_paths(paths):
     for path in paths:
@@ -960,6 +978,8 @@ main_src = SrcGroup(dir='src',
              '44bsd/tick_cmd_clock.cpp',
              '44bsd/udp.cpp',
 
+             '44bsd/udp_latency.cpp',
+
              'tunnels/gtp_man.cpp',
              'tunnels/tunnel_db.cpp',
 
@@ -1016,6 +1036,7 @@ main_src = SrcGroup(dir='src',
              'drivers/trex_driver_i40e.cpp',
              'drivers/trex_driver_igb.cpp',
              'drivers/trex_driver_ixgbe.cpp',
+             'drivers/trex_driver_igc.cpp',
              'drivers/trex_driver_mlx5.cpp',
              'drivers/trex_driver_ice.cpp',
              'drivers/trex_driver_ntacc.cpp',
@@ -1274,6 +1295,7 @@ dpdk_src_x86_64 = SrcGroup(dir='src/dpdk/',
                 'drivers/net/ice/base/ice_mk_grp.c',
                 'drivers/net/ice/base/ice_imem.c',
                 'drivers/net/ice/base/ice_metainit.c',
+                'drivers/net/ice/base/ice_ddp.c',
 
                 'drivers/net/ice/ice_dcf_vf_representor.c',
                 'drivers/net/ice/ice_acl_filter.c',
@@ -1290,6 +1312,7 @@ dpdk_src_x86_64 = SrcGroup(dir='src/dpdk/',
                 #'drivers/net/ice/ice_rxtx_vec_avx512.c',
                 'drivers/net/ice/ice_generic_flow.c',
                 'drivers/net/ice/ice_dcf_sched.c',
+                'drivers/net/ice/ice_tm.c',
 
                  #ixgbe
                  'drivers/net/ixgbe/base/ixgbe_82598.c',
@@ -1311,6 +1334,7 @@ dpdk_src_x86_64 = SrcGroup(dir='src/dpdk/',
                  'drivers/net/ixgbe/ixgbe_pf.c',
                  'drivers/net/ixgbe/ixgbe_rxtx.c',
                  'drivers/net/ixgbe/ixgbe_rxtx_vec_sse.c',
+                 'drivers/net/ixgbe/ixgbe_recycle_mbufs_vec_common.c',
                  #'drivers/net/ixgbe/ixgbe_ipsec.c',
                  'drivers/net/ixgbe/ixgbe_tm.c',
                  'drivers/net/ixgbe/ixgbe_vf_representor.c',
@@ -1318,16 +1342,31 @@ dpdk_src_x86_64 = SrcGroup(dir='src/dpdk/',
 
                  #i40e
                  'drivers/net/i40e/i40e_rxtx_vec_sse.c',
+                 'drivers/net/i40e/i40e_recycle_mbufs_vec_common.c',
 
+                 #igc
+                 'drivers/net/igc/base/igc_api.c',
+                 'drivers/net/igc/base/igc_base.c',
+                 'drivers/net/igc/base/igc_i225.c',
+                 'drivers/net/igc/base/igc_mac.c',
+                 'drivers/net/igc/base/igc_manage.c',
+                 'drivers/net/igc/base/igc_nvm.c',
+                 'drivers/net/igc/base/igc_osdep.c',
+                 'drivers/net/igc/base/igc_phy.c',
+                 'drivers/net/igc/igc_txrx.c',
+                 'drivers/net/igc/igc_ethdev.c',
+                 'drivers/net/igc/igc_filter.c',
+                 'drivers/net/igc/igc_flow.c',
+                 'drivers/net/igc/igc_logs.c',
 
-                #  #virtio
-                  'drivers/net/virtio/virtio_rxtx_simple_sse.c',
+                 #virtio
+                 'drivers/net/virtio/virtio_rxtx_simple_sse.c',
 
-                #  #vmxnet3
+                 #vmxnet3
                  'drivers/net/vmxnet3/vmxnet3_ethdev.c',
                  'drivers/net/vmxnet3/vmxnet3_rxtx.c',
 
-                #  #af_packet
+                 #af_packet
                  'drivers/net/af_packet/rte_eth_af_packet.c',
 
                 #  #Amazone ENA
@@ -1374,7 +1413,7 @@ dpdk_src_x86_64 = SrcGroup(dir='src/dpdk/',
                  'lib/ip_frag/rte_ip_frag_common.c',
                  'lib/ip_frag/ip_frag_internal.c',
 
-                #  #bonding
+                 #bonding
                  'drivers/net/bonding/rte_eth_bond_api.c',
                  'drivers/net/bonding/rte_eth_bond_pmd.c',
                  'drivers/net/bonding/rte_eth_bond_flow.c',
@@ -1385,8 +1424,9 @@ dpdk_src_x86_64 = SrcGroup(dir='src/dpdk/',
                  ])
 
 dpdk_src_x86_64_ext = SrcGroup(dir='src',
-        src_list=['drivers/trex_ixgbe_fdir.c',
-                  'drivers/trex_i40e_fdir.c'
+        src_list=[
+                    'drivers/trex_ixgbe_fdir.c',
+                    'drivers/trex_i40e_fdir.c',
                   ]
 )
 
@@ -1405,7 +1445,7 @@ dpdk_src_x86_64_tap = SrcGroup(dir='src/dpdk/',
 
 dpdk_src_aarch64 = SrcGroup(dir='src/dpdk/',
         src_list=[
-                #  #virtio
+                 #virtio
                  'drivers/net/virtio/virtio_rxtx_simple_neon.c',
 
                 #  #libs
@@ -1417,7 +1457,7 @@ dpdk_src_aarch64 = SrcGroup(dir='src/dpdk/',
 
 dpdk_src_ppc64le = SrcGroup(dir='src/dpdk/',
         src_list=[
-                #  #i40e
+                 #i40e
                  'drivers/net/i40e/i40e_rxtx_vec_altivec.c',
 
                  #libs
@@ -1447,7 +1487,7 @@ dpdk_src = SrcGroup(dir='src/dpdk/',
                  'drivers/bus/vmbus/linux/vmbus_bus.c',
                  'drivers/bus/vmbus/linux/vmbus_uio.c',
                 'drivers/mempool/ring/rte_mempool_ring.c',
-                 ##'drivers/mempool/stack/rte_mempool_stack.c', # requires dpdk/lib/librte_stack/rte_stack.h
+                 #'drivers/mempool/stack/rte_mempool_stack.c', # requires dpdk/lib/librte_stack/rte_stack.h
 
 
                  # drivers
@@ -1485,14 +1525,12 @@ dpdk_src = SrcGroup(dir='src/dpdk/',
                  'drivers/net/bnxt/tf_core/tf_device_p4.c',
                  'drivers/net/bnxt/tf_core/tf_device_p58.c',
                  'drivers/net/bnxt/tf_core/tf_identifier.c',
-                 'drivers/net/bnxt/tf_core/tf_shadow_tcam.c',
                  'drivers/net/bnxt/tf_core/tf_tcam.c',
                  'drivers/net/bnxt/tf_core/tf_util.c',
                  'drivers/net/bnxt/tf_core/tf_if_tbl.c',
                  'drivers/net/bnxt/tf_core/ll.c',
                  'drivers/net/bnxt/tf_core/tf_global_cfg.c',
                  'drivers/net/bnxt/tf_core/tf_em_host.c',
-                 'drivers/net/bnxt/tf_core/tf_shadow_identifier.c',
                  'drivers/net/bnxt/tf_core/tf_hash.c',
                  'drivers/net/bnxt/tf_core/dpool.c',
                  'drivers/net/bnxt/tf_core/tf_tcam_shared.c',
@@ -1528,6 +1566,13 @@ dpdk_src = SrcGroup(dir='src/dpdk/',
                  "drivers/net/bnxt/tf_ulp/ulp_rte_handler_tbl.c",
                  'drivers/net/bnxt/tf_ulp/generic_templates/ulp_template_db_wh_plus_act.c',
                  'drivers/net/bnxt/tf_ulp/generic_templates/ulp_template_db_wh_plus_class.c',
+                 'drivers/net/bnxt/tf_core/tf_tcam_mgr_msg.c',
+                 'drivers/net/bnxt/tf_ulp/bnxt_ulp_meter.c',
+                 'drivers/net/bnxt/tf_core/cfa_tcam_mgr.c',
+                 'drivers/net/bnxt/tf_core/cfa_tcam_mgr_session.c',
+                 'drivers/net/bnxt/tf_core/cfa_tcam_mgr_p4.c',
+                 'drivers/net/bnxt/tf_core/cfa_tcam_mgr_hwop_msg.c',
+                 'drivers/net/bnxt/tf_core/cfa_tcam_mgr_p58.c',
 
                  #e1000
                  'drivers/net/e1000/base/e1000_base.c',
@@ -1566,10 +1611,8 @@ dpdk_src = SrcGroup(dir='src/dpdk/',
                  'drivers/net/virtio/virtio_pci.c',
                  'drivers/net/virtio/virtio_pci_ethdev.c',
                  'drivers/net/virtio/virtio_rxtx.c',
-
-                 
+                 'drivers/net/virtio/virtio_cvq.c',
                  #'drivers/net/virtio/virtio_rxtx_packed.c',
-
                  'drivers/net/virtio/virtio_rxtx_simple.c',
                  'drivers/net/virtio/virtqueue.c',
                  'drivers/net/virtio/virtio_user_ethdev.c',
@@ -1612,7 +1655,6 @@ dpdk_src = SrcGroup(dir='src/dpdk/',
                  'lib/eal/common/eal_common_hexdump.c',
                  'lib/eal/common/eal_common_launch.c',
                  'lib/eal/common/eal_common_lcore.c',
-                 'lib/eal/common/eal_common_log.c',
                  'lib/eal/common/eal_common_memalloc.c',
                  'lib/eal/common/eal_common_memory.c',
                  'lib/eal/common/eal_common_memzone.c',
@@ -1650,11 +1692,9 @@ dpdk_src = SrcGroup(dir='src/dpdk/',
                  'lib/eal/linux/eal.c',
                  'lib/eal/linux/eal_alarm.c',
                  'lib/eal/linux/eal_cpuflags.c',
-                 'lib/eal/linux/eal_debug.c',
                  'lib/eal/linux/eal_hugepage_info.c',
                  'lib/eal/linux/eal_interrupts.c',
                  'lib/eal/linux/eal_lcore.c',
-                 'lib/eal/linux/eal_log.c',
                  'lib/eal/linux/eal_memalloc.c',
                  'lib/eal/linux/eal_memory.c',
                  'lib/eal/linux/eal_thread.c',
@@ -1663,8 +1703,12 @@ dpdk_src = SrcGroup(dir='src/dpdk/',
                  'lib/eal/linux/eal_vfio.c',
                  'lib/eal/linux/eal_dev.c',
 
+                 'lib/eal/unix/eal_debug.c',
+                 'lib/eal/unix/eal_unix_thread.c',
+
                  'lib/ethdev/rte_ethdev.c',
                  'lib/ethdev/rte_flow.c',
+                 'lib/ethdev/ethdev_linux_ethtool.c',
 
                  'lib/ethdev/ethdev_trace_points.c',
                  'lib/ethdev/ethdev_private.c',
@@ -1673,6 +1717,11 @@ dpdk_src = SrcGroup(dir='src/dpdk/',
                  'lib/ethdev/rte_mtr.c',
                  'lib/ethdev/rte_tm.c',
                  'lib/ethdev/ethdev_driver.c',
+                 'lib/ethdev/sff_telemetry.c',
+                 'lib/ethdev/sff_common.c',
+                 'lib/ethdev/sff_8079.c',
+                 'lib/ethdev/sff_8472.c',
+                 'lib/ethdev/sff_8636.c',
                                   
                  'lib/telemetry/telemetry.c',
                  'lib/telemetry/telemetry_data.c',
@@ -1704,7 +1753,23 @@ dpdk_src = SrcGroup(dir='src/dpdk/',
                  'lib/gso/gso_tunnel_tcp4.c',
                  'lib/gso/gso_udp4.c',
 
+                 'lib/log/log.c',
+                 'lib/log/log_linux.c',
+
+                 'lib/hash/rte_hash_crc.c'
+
             ])
+
+mana_dpdk_src = SrcGroup(
+    dir = 'src/dpdk/drivers/',
+    src_list = [
+        'net/mana/gdma.c',
+        'net/mana/mana.c',
+        'net/mana/mp.c',
+        'net/mana/mr.c',
+        'net/mana/rx.c',
+        'net/mana/tx.c',
+    ])
 
 ntacc_dpdk_src = SrcGroup(dir='src/dpdk/drivers/net/ntacc',
                 src_list=[
@@ -1734,7 +1799,7 @@ i40e_dpdk_src = SrcGroup(
         'base/i40e_nvm.c',
         'i40e_hash.c',
         'i40e_ethdev.c',
-        'i40e_ethdev_vf.c',
+        #'i40e_ethdev_vf.c',
         'i40e_fdir.c',
         'i40e_flow.c',
         'i40e_pf.c',
@@ -1764,7 +1829,6 @@ mlx5_x86_64_dpdk_src = SrcGroup(
 
 
         'net/mlx5/mlx5_rxq.c',
-        'net/mlx5/mlx5_dr.c',
         'net/mlx5/mlx5_flow_hw.c',
         'net/mlx5/mlx5_flow_aso.c',
         'net/mlx5/mlx5_flow_flex.c',
@@ -1787,10 +1851,24 @@ mlx5_x86_64_dpdk_src = SrcGroup(
         'net/mlx5/mlx5_mac.c',
         'net/mlx5/mlx5_flow_meter.c',
         'net/mlx5/mlx5_rss.c',
+        'net/mlx5/mlx5_hws_cnt.c',
+
+        'net/mlx5/hws/mlx5dr_matcher.c',
+        'net/mlx5/hws/mlx5dr_pool.c',
+        'net/mlx5/hws/mlx5dr_cmd.c',
+        'net/mlx5/hws/mlx5dr_buddy.c',
+
+        'net/mlx5/hws/mlx5dr_action.c',
+        'net/mlx5/hws/mlx5dr_context.c',
+        'net/mlx5/hws/mlx5dr_debug.c',
+        'net/mlx5/hws/mlx5dr_definer.c',
+        'net/mlx5/hws/mlx5dr_pat_arg.c',
+        'net/mlx5/hws/mlx5dr_rule.c',
+        'net/mlx5/hws/mlx5dr_send.c',
+        'net/mlx5/hws/mlx5dr_table.c',
 
         'net/mlx5/linux/mlx5_verbs.c',
         'net/mlx5/linux/mlx5_os.c',
-        'net/mlx5/linux/mlx5_mp_os.c',
         'net/mlx5/linux/mlx5_ethdev_os.c',
         'net/mlx5/linux/mlx5_flow_os.c',
         'net/mlx5/linux/mlx5_socket.c',
@@ -1800,6 +1878,11 @@ mlx5_x86_64_dpdk_src = SrcGroup(
         'net/mlx5/mlx5_vlan.c',
         'net/mlx5/mlx5_rxtx_vec.c',
         'net/mlx5/mlx5_rxmode.c',
+        'net/mlx5/linux/mlx5_mp_os.c',
+        'net/mlx5/mlx5_flow_geneve.c',
+        'net/mlx5/mlx5_flow_quota.c',
+        'net/mlx5/mlx5_trace.c',
+        'net/mlx5/hws/mlx5dr_crc32.c',
 
     ])
 
@@ -1860,6 +1943,10 @@ memif_dpdk_src = SrcGroup(
 
 libmnl =SrcGroups([
                 libmnl_src
+                ])
+
+mana_dpdk =SrcGroups([
+                mana_dpdk_src
                 ])
 
 ntacc_dpdk =SrcGroups([
@@ -1934,8 +2021,10 @@ common_flags = ['-DWIN_UCODE_SIM',
                 '-D__STDC_CONSTANT_MACROS',
                 '-D_GNU_SOURCE',
                 '-DALLOW_INTERNAL_API',
-                '-DABI_VERSION="22.1"',
+                '-DABI_VERSION="24.1"',
                 '-DALLOW_EXPERIMENTAL_API',
+                '-DRTE_USE_FUNCTION_VERSIONING',
+                '-DBNXT_TF_APP_ID=0',
                 #'-D_GLIBCXX_USE_CXX11_ABI=0', # see libstdc++ ABI changes for string and list
                 #'-DTREX_PERF', # used when using TRex and PERF for performance measurement
                 #'-D__DEBUG_FUNC_ENTRY__', # Added by Ido to debug Flow Stats
@@ -1960,10 +2049,9 @@ if march == 'x86_64':
                     '-DTREX_USE_BPFJIT',
                     '-D_GNU_SOURCE',
                     '-DALLOW_INTERNAL_API',
-                    '-DABI_VERSION="22.1"',
+                    '-DABI_VERSION="24.1"',
                     '-DALLOW_EXPERIMENTAL_API',
                     '-DSUPPORT_CFA_HW_ALL=1',
-
                    ]
 
     common_flags_old = common_flags + [
@@ -1975,7 +2063,7 @@ if march == 'x86_64':
                       '-DTREX_USE_BPFJIT',
                       '-DALLOW_INTERNAL_API',
                       '-DALLOW_EXPERIMENTAL_API',
-                      '-DABI_VERSION="22.1"',
+                      '-DABI_VERSION="24.1"',
                       '-DSUPPORT_CFA_HW_ALL=1',
 
                       ]
@@ -2043,7 +2131,7 @@ dpdk_includes_path_ppc64le ='''
 
 dpdk_includes_path =''' ../src/
                         ../src/pal/linux_dpdk/
-                        ../src/pal/linux_dpdk/dpdk_2203_'''+ march +'''/
+                        ../src/pal/linux_dpdk/dpdk_2403_'''+ march +'''/
                         ../src/dpdk/drivers/
                         ../src/dpdk/drivers/common/mlx5/
                         ../src/dpdk/drivers/common/mlx5/linux/
@@ -2061,6 +2149,9 @@ dpdk_includes_path =''' ../src/
                         ../src/dpdk/drivers/net/i40e/base/
                         ../src/dpdk/drivers/net/ixgbe/
                         ../src/dpdk/drivers/net/ixgbe/base/
+                        ../src/dpdk/drivers/net/igc/
+                        ../src/dpdk/drivers/net/igc/base/
+                        ../src/dpdk/drivers/net/mana/
                         ../src/dpdk/drivers/net/mlx4/
                         ../src/dpdk/drivers/net/mlx5/
                         ../src/dpdk/drivers/net/ntacc/
@@ -2118,6 +2209,7 @@ dpdk_includes_path =''' ../src/
                         ../src/dpdk/
                         
                         ../src/dpdk/lib/security/
+                        ../src/dpdk/lib/log/
 
                         ../src/dpdk/drivers/bus/pci/
                         ../src/dpdk/drivers/bus/auxiliary/
@@ -2162,11 +2254,11 @@ bpf_includes_path = '../external_libs/bpf ../external_libs/bpf/bpfjit'
 
 
 if march == 'x86_64':
-    DPDK_FLAGS=['-DTAP_MAX_QUEUES=16','-D_GNU_SOURCE', '-DPF_DRIVER', '-DX722_SUPPORT', '-DX722_A0_SUPPORT', '-DVF_DRIVER', '-DINTEGRATED_VF', '-include', '../src/pal/linux_dpdk/dpdk_2203_x86_64/rte_config.h','-DALLOW_INTERNAL_API','-DABI_VERSION="22.1"']
+    DPDK_FLAGS=['-DTAP_MAX_QUEUES=16','-D_GNU_SOURCE', '-DPF_DRIVER', '-DX722_SUPPORT', '-DX722_A0_SUPPORT', '-DVF_DRIVER', '-DINTEGRATED_VF', '-include', '../src/pal/linux_dpdk/dpdk_2403_x86_64/rte_config.h','-DALLOW_INTERNAL_API','-DABI_VERSION="24.1"']
 elif march == 'aarch64':
-    DPDK_FLAGS=['-DTAP_MAX_QUEUES=16','-D_GNU_SOURCE', '-DPF_DRIVER', '-DVF_DRIVER', '-DINTEGRATED_VF', '-DRTE_FORCE_INTRINSICS', '-include', '../src/pal/linux_dpdk/dpdk_2203_x86_64_aarch64/rte_config.h']
+    DPDK_FLAGS=['-DTAP_MAX_QUEUES=16','-D_GNU_SOURCE', '-DPF_DRIVER', '-DVF_DRIVER', '-DINTEGRATED_VF', '-DRTE_FORCE_INTRINSICS', '-include', '../src/pal/linux_dpdk/dpdk_2403_x86_64_aarch64/rte_config.h']
 elif march == 'ppc64le':
-    DPDK_FLAGS=['-DTAP_MAX_QUEUES=16','-D_GNU_SOURCE', '-DPF_DRIVER', '-DX722_SUPPORT', '-DX722_A0_SUPPORT', '-DVF_DRIVER', '-DINTEGRATED_VF', '-include', '../src/pal/linux_dpdk/dpdk_2203_x86_64_ppc64le/rte_config.h']
+    DPDK_FLAGS=['-DTAP_MAX_QUEUES=16','-D_GNU_SOURCE', '-DPF_DRIVER', '-DX722_SUPPORT', '-DX722_A0_SUPPORT', '-DVF_DRIVER', '-DINTEGRATED_VF', '-include', '../src/pal/linux_dpdk/dpdk_2403_x86_64_ppc64le/rte_config.h']
 
 client_external_libs = [
         'simple_enum',
@@ -2274,6 +2366,9 @@ class build_option:
     def get_dpdk_target (self):
         return self.update_executable_name("dpdk")
 
+    def get_mana_target (self):
+        return self.update_executable_name("mana")
+
     def get_ntacc_target (self):
         return self.update_executable_name("ntacc")
 
@@ -2285,6 +2380,9 @@ class build_option:
 
     def get_mlx4_target (self):
         return self.update_executable_name("mlx4")
+
+    def get_manaso_target (self):
+        return self.update_executable_name("libmana")+'.so'
 
     def get_ntaccso_target (self):
         return self.update_executable_name("libntacc")+'.so'
@@ -2459,6 +2557,10 @@ def build_prog (bld, build_obj):
             DPDK_FLAGS.extend(['-include', H_DPDK_CONFIG])
         lib_ext.append('numa')
 
+    if bld.env.DPDK_WITH_ARCHIVE == True:
+        DPDK_FLAGS.extend(['-DRTE_HAS_LIBARCHIVE'])
+        linkflags += ['-larchive']
+
     if march == 'x86_64':
         bp_dpdk = SrcGroups([
                     dpdk_src,
@@ -2553,6 +2655,17 @@ def build_prog (bld, build_obj):
             source   = mlx4_dpdk.file_list(top),
             target   = build_obj.get_mlx4_target()
            )
+
+    if bld.env.WITH_MANA == True:
+        bld.shlib(
+            feature  = 'c',
+            includes = dpdk_includes_path +
+                       bld.env.dpdk_includes_verb_path,
+            cflags   = (cflags + DPDK_FLAGS),
+            use      = ['ibverbs', 'mana'],
+            source   = mana_dpdk.file_list(top),
+            target   = build_obj.get_mana_target()
+        )
 
     if bld.env.WITH_NTACC == True:
         bld.shlib(
@@ -2684,6 +2797,16 @@ def build(bld):
             bld.env.libmnl_path=' \n ../external_libs/libmnl/include/ \n'
             bld.env.mlx5_kw  = {}
 
+    if bld.env.WITH_MANA == True:
+        Logs.pprint('GREEN', 'Info: Using external libverbs libmana.')
+        if not bld.env.LD_SEARCH_PATH:
+            bld.fatal('LD_SEARCH_PATH is empty, run configure')
+        from waflib.Tools.ccroot import SYSTEM_LIB_PATHS
+        SYSTEM_LIB_PATHS.extend(bld.env.LD_SEARCH_PATH)
+
+        bld.read_shlib(name='ibverbs')
+        bld.read_shlib(name='mana')
+
     if bld.env.WITH_BIRD:
         bld(rule=build_bird, source='compile_bird.py', target='bird')
 
@@ -2736,6 +2859,11 @@ def install_single_system (bld, exec_p, build_obj):
                    where = exec_p)
 
     # SO libraries below
+
+    # MANA
+    do_create_link(src = os.path.realpath(o + build_obj.get_manaso_target()),
+                   name = build_obj.get_manaso_target(),
+                   where = so_path)
 
     # NTACC
     do_create_link(src = os.path.realpath(o + build_obj.get_ntaccso_target()),

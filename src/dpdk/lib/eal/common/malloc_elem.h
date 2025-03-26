@@ -7,6 +7,8 @@
 
 #include <stdbool.h>
 
+#include <rte_common.h>
+
 #define MIN_DATA_SIZE (RTE_CACHE_LINE_SIZE)
 
 /* dummy definition of struct so we can use pointers to it in malloc_elem struct */
@@ -18,7 +20,7 @@ enum elem_state {
 	ELEM_PAD  /* element is a padding-only header */
 };
 
-struct malloc_elem {
+struct __rte_cache_aligned malloc_elem {
 	struct malloc_heap *heap;
 	struct malloc_elem *volatile prev;
 	/**< points to prev elem in memseg */
@@ -46,7 +48,7 @@ struct malloc_elem {
 	size_t user_size;
 	uint64_t asan_cookie[2]; /* must be next to header_cookie */
 #endif
-} __rte_cache_aligned;
+};
 
 static const unsigned int MALLOC_ELEM_HEADER_LEN = sizeof(struct malloc_elem);
 
@@ -130,12 +132,6 @@ malloc_elem_cookies_ok(const struct malloc_elem *elem)
 #define ASAN_MEM_SHIFT(mem) ((void *)((uintptr_t)(mem) >> ASAN_SHADOW_SCALE))
 #define ASAN_MEM_TO_SHADOW(mem) \
 	RTE_PTR_ADD(ASAN_MEM_SHIFT(mem), ASAN_SHADOW_OFFSET)
-
-#if defined(__clang__)
-#define __rte_no_asan __attribute__((no_sanitize("address", "hwaddress")))
-#else
-#define __rte_no_asan __attribute__((no_sanitize_address))
-#endif
 
 __rte_no_asan
 static inline void
@@ -276,7 +272,9 @@ old_malloc_size(struct malloc_elem *elem)
 
 #else /* !RTE_MALLOC_ASAN */
 
-#define __rte_no_asan
+static inline void
+asan_set_zone(void *ptr __rte_unused, size_t len __rte_unused,
+		uint32_t val __rte_unused) { }
 
 static inline void
 asan_set_freezone(void *ptr __rte_unused, size_t size __rte_unused) { }

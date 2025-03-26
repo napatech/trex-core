@@ -2,10 +2,13 @@
  * Copyright(c) 2018-2021 HiSilicon Limited.
  */
 
-#ifndef _HNS3_CMD_H_
-#define _HNS3_CMD_H_
+#ifndef HNS3_CMD_H
+#define HNS3_CMD_H
 
 #include <stdint.h>
+
+#include <rte_byteorder.h>
+#include <rte_spinlock.h>
 
 #define HNS3_CMDQ_TX_TIMEOUT		30000
 #define HNS3_CMDQ_CLEAR_WAIT_TIME	200
@@ -54,11 +57,6 @@ enum hns3_cmd_return_status {
 	HNS3_CMD_QUEUE_ILLEGAL  = 10,
 	HNS3_CMD_INVALID        = 11,
 	HNS3_CMD_ROH_CHECK_FAIL = 12
-};
-
-struct hns3_misc_vector {
-	uint8_t *addr;
-	int vector_irq;
 };
 
 struct hns3_cmq {
@@ -315,6 +313,7 @@ enum HNS3_CAPS_BITS {
 	 */
 	HNS3_CAPS_FD_QUEUE_REGION_B = 2,
 	HNS3_CAPS_PTP_B,
+	HNS3_CAPS_SIMPLE_BD_B = 5,
 	HNS3_CAPS_TX_PUSH_B = 6,
 	HNS3_CAPS_PHY_IMP_B = 7,
 	HNS3_CAPS_TQP_TXRX_INDEP_B,
@@ -323,7 +322,9 @@ enum HNS3_CAPS_BITS {
 	HNS3_CAPS_UDP_TUNNEL_CSUM_B,
 	HNS3_CAPS_RAS_IMP_B,
 	HNS3_CAPS_RXD_ADV_LAYOUT_B = 15,
-	HNS3_CAPS_TM_B = 17,
+	HNS3_CAPS_TM_B = 19,
+	HNS3_CAPS_GRO_B = 20,
+	HNS3_CAPS_FC_AUTO_B = 30,
 };
 
 /* Capabilities of VF dependent on the PF */
@@ -392,20 +393,6 @@ struct hns3_shared_buf {
 struct hns3_pkt_buf_alloc {
 	struct hns3_priv_buf priv_buf[HNS3_MAX_TC_NUM];
 	struct hns3_shared_buf s_buf;
-};
-
-#define HNS3_RX_COM_WL_EN_B	15
-struct hns3_rx_com_wl_buf_cmd {
-	uint16_t high_wl;
-	uint16_t low_wl;
-	uint8_t rsv[20];
-};
-
-#define HNS3_RX_PKT_EN_B	15
-struct hns3_rx_pkt_buf_cmd {
-	uint16_t high_pkt;
-	uint16_t low_pkt;
-	uint8_t rsv[20];
 };
 
 #define HNS3_PF_STATE_DONE_B	0
@@ -622,6 +609,7 @@ struct hns3_rss_input_tuple_cmd {
 #define HNS3_RSS_CFG_TBL_SIZE_H		4
 #define HNS3_RSS_CFG_TBL_BW_H		2
 #define HNS3_RSS_CFG_TBL_BW_L		8
+#define HNS3_RSS_CFG_TBL_BW_H_M		0x3
 
 /* Configure the indirection table, opcode:0x0D07 */
 struct hns3_rss_indirection_table_cmd {
@@ -680,6 +668,10 @@ enum hns3_promisc_type {
 #define HNS3_LINK_EVENT_REPORT_EN_B	0
 #define HNS3_NCSI_ERROR_REPORT_EN_B	1
 #define HNS3_FIRMWARE_PHY_DRIVER_EN_B	2
+
+#define HNS3_LLRS_FEC_EN_B		5
+#define HNS3_MAC_FC_AUTONEG_EN_B	6
+
 struct hns3_firmware_compat_cmd {
 	uint32_t compat;
 	uint8_t rsv[20];
@@ -694,6 +686,7 @@ struct hns3_firmware_compat_cmd {
 #define HNS3_PHY_LINK_MODE_AUTONEG_BIT		BIT(6)
 #define HNS3_PHY_LINK_MODE_PAUSE_BIT		BIT(13)
 #define HNS3_PHY_LINK_MODE_ASYM_PAUSE_BIT	BIT(14)
+#define HNS3_PHY_LINK_MODE_PAUSE_S		13
 
 #define HNS3_PHY_PARAM_CFG_BD_NUM	2
 struct hns3_phy_params_bd0_cmd {
@@ -803,6 +796,23 @@ struct hns3_sfp_type {
 #define HNS3_FIBER_LINK_SPEED_10M_BIT		BIT(7)
 #define HNS3_FIBER_LINK_SPEED_200G_BIT		BIT(8)
 
+#define HNS3_FIBER_FEC_AUTO_BIT		BIT(0)
+#define HNS3_FIBER_FEC_BASER_BIT	BIT(1)
+#define HNS3_FIBER_FEC_RS_BIT		BIT(2)
+#define HNS3_FIBER_FEC_LLRS_BIT		BIT(3)
+#define HNS3_FIBER_FEC_NOFEC_BIT	BIT(4)
+
+/* Flags for pause status field */
+#define HNS3_FIBER_LOCAL_PAUSE_BIT	BIT(0)
+#define HNS3_FIBER_LOCAL_ASYM_PAUSE_BIT	BIT(1)
+#define HNS3_FIBER_LP_PAUSE_BIT		BIT(2)
+#define HNS3_FIBER_LP_ASYM_PAUSE_BIT	BIT(3)
+#define HNS3_FIBER_LOCAL_PAUSE_MASK	(HNS3_FIBER_LOCAL_PAUSE_BIT | \
+					 HNS3_FIBER_LOCAL_ASYM_PAUSE_BIT)
+#define HNS3_FIBER_LP_PAUSE_MASK	(HNS3_FIBER_LP_PAUSE_BIT | \
+					 HNS3_FIBER_LP_ASYM_PAUSE_BIT)
+#define HNS3_FIBER_LP_PAUSE_S		2
+
 struct hns3_sfp_info_cmd {
 	uint32_t sfp_speed;
 	uint8_t query_type; /* 0: sfp speed, 1: active */
@@ -812,7 +822,10 @@ struct hns3_sfp_info_cmd {
 	uint8_t autoneg_ability;
 	uint32_t supported_speed; /* speed supported by current media */
 	uint32_t module_type;
-	uint8_t rsv1[8];
+	uint8_t fec_ability; /* supported fec modes, see HNS3_FIBER_FEC_XXX_BIT */
+	uint8_t rsv0;
+	uint8_t pause_status;
+	uint8_t rsv1[5];
 };
 
 #define HNS3_MAC_CFG_FEC_AUTO_EN_B	0
@@ -821,6 +834,7 @@ struct hns3_sfp_info_cmd {
 #define HNS3_MAC_FEC_OFF		0
 #define HNS3_MAC_FEC_BASER		1
 #define HNS3_MAC_FEC_RS			2
+#define HNS3_MAC_FEC_LLRS		3
 
 /* Configure FEC mode, opcode:0x031A */
 struct hns3_config_fec_cmd {
@@ -983,6 +997,12 @@ struct hns3_dev_specs_0_cmd {
 	uint32_t max_tm_rate;
 };
 
+struct hns3_dev_specs_1_cmd {
+	uint8_t rsv0[12];
+	uint8_t min_tx_pkt_len;
+	uint8_t rsv1[11];
+};
+
 struct hns3_query_rpu_cmd {
 	uint32_t tc_queue_num;
 	uint32_t rsv1[2];
@@ -1054,4 +1074,4 @@ int hns3_cmd_init(struct hns3_hw *hw);
 void hns3_cmd_destroy_queue(struct hns3_hw *hw);
 void hns3_cmd_uninit(struct hns3_hw *hw);
 
-#endif /* _HNS3_CMD_H_ */
+#endif /* HNS3_CMD_H */

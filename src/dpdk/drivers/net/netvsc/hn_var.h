@@ -13,7 +13,7 @@
  * Tunable ethdev params
  */
 #define HN_MIN_RX_BUF_SIZE	1024
-#define HN_MAX_XFER_LEN		2048
+#define HN_MAX_XFER_LEN		RTE_ETHER_MAX_JUMBO_FRAME_LEN
 #define	HN_MAX_MAC_ADDRS	1
 #define HN_MAX_CHANNELS		64
 
@@ -126,6 +126,13 @@ struct hn_vf_ctx {
 	enum vf_device_state	vf_state;
 };
 
+struct hv_hotadd_context {
+	LIST_ENTRY(hv_hotadd_context) list;
+	struct hn_data *hv;
+	struct rte_devargs da;
+	int eal_hot_plug_retry;
+};
+
 struct hn_data {
 	struct rte_vmbus_device *vmbus;
 	struct hn_rx_queue *primary;
@@ -140,7 +147,7 @@ struct hn_data {
 	uint32_t	link_status;
 	uint32_t	link_speed;
 
-	struct rte_mem_resource *rxbuf_res;	/* UIO resource for Rx */
+	struct rte_mem_resource rxbuf_res;	/* UIO resource for Rx */
 	uint32_t	rxbuf_section_cnt;	/* # of Rx sections */
 	uint32_t	rx_copybreak;
 	uint32_t	rx_extmbuf_enable;
@@ -149,7 +156,7 @@ struct hn_data {
 	uint64_t	rss_offloads;
 
 	rte_spinlock_t	chim_lock;
-	struct rte_mem_resource *chim_res;	/* UIO resource for Tx */
+	struct rte_mem_resource chim_res;	/* UIO resource for Tx */
 	struct rte_bitmap *chim_bmap;		/* Send buffer map */
 	void		*chim_bmem;
 	uint32_t	tx_copybreak;
@@ -175,8 +182,9 @@ struct hn_data {
 
 	struct vmbus_channel *channels[HN_MAX_CHANNELS];
 
-	struct rte_devargs devargs;
-	int		eal_hot_plug_retry;
+	rte_spinlock_t	hotadd_lock;
+	LIST_HEAD(hotadd_list, hv_hotadd_context) hotadd_list;
+	char		*vf_devargs;
 };
 
 static inline struct vmbus_channel *
@@ -238,9 +246,9 @@ int	hn_vf_info_get(struct hn_data *hv,
 int	hn_vf_add(struct rte_eth_dev *dev, struct hn_data *hv);
 int	hn_vf_configure_locked(struct rte_eth_dev *dev,
 			       const struct rte_eth_conf *dev_conf);
-const uint32_t *hn_vf_supported_ptypes(struct rte_eth_dev *dev);
+const uint32_t *hn_vf_supported_ptypes(struct rte_eth_dev *dev,
+				       size_t *no_of_elements);
 int	hn_vf_start(struct rte_eth_dev *dev);
-void	hn_vf_reset(struct rte_eth_dev *dev);
 int	hn_vf_close(struct rte_eth_dev *dev);
 int	hn_vf_stop(struct rte_eth_dev *dev);
 
@@ -280,6 +288,7 @@ int	hn_vf_rss_hash_update(struct rte_eth_dev *dev,
 int	hn_vf_reta_hash_update(struct rte_eth_dev *dev,
 			       struct rte_eth_rss_reta_entry64 *reta_conf,
 			       uint16_t reta_size);
+int hn_vf_mtu_set(struct rte_eth_dev *dev, uint16_t mtu);
 int	hn_eth_rmv_event_callback(uint16_t port_id,
 				  enum rte_eth_event_type event __rte_unused,
 				  void *cb_arg, void *out __rte_unused);

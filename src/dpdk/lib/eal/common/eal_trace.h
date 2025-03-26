@@ -16,22 +16,19 @@
 #include "eal_private.h"
 #include "eal_thread.h"
 
-#define trace_err(fmt, args...) \
-	RTE_LOG(ERR, EAL, "%s():%u " fmt "\n", __func__, __LINE__, ## args)
+#define trace_err(...) \
+	RTE_LOG_LINE_PREFIX(ERR, EAL, "%s():%u ", __func__ RTE_LOG_COMMA __LINE__, __VA_ARGS__)
 
-#define trace_crit(fmt, args...) \
-	RTE_LOG(CRIT, EAL, "%s():%u " fmt "\n", __func__, __LINE__, ## args)
+#define trace_crit(...) \
+	RTE_LOG_LINE_PREFIX(CRIT, EAL, "%s():%u ", __func__ RTE_LOG_COMMA __LINE__, __VA_ARGS__)
 
-#define TRACE_PREFIX_LEN 12
-#define TRACE_DIR_STR_LEN (sizeof("YYYY-mm-dd-AM-HH-MM-SS") + TRACE_PREFIX_LEN)
-#define TRACE_POINT_NAME_SIZE 64
 #define TRACE_CTF_MAGIC 0xC1FC1FC1
 #define TRACE_MAX_ARGS	32
 
 struct trace_point {
 	STAILQ_ENTRY(trace_point) next;
 	rte_trace_point_t *handle;
-	char name[TRACE_POINT_NAME_SIZE];
+	const char *name;
 	char *ctf_field;
 };
 
@@ -51,10 +48,9 @@ struct trace_arg {
 };
 
 struct trace {
-	char dir[PATH_MAX];
-	int dir_offset;
+	char *dir;
 	int register_errno;
-	bool status;
+	RTE_ATOMIC(uint32_t) status;
 	enum rte_trace_mode mode;
 	rte_uuid_t uuid;
 	uint32_t buff_len;
@@ -69,7 +65,7 @@ struct trace {
 	uint32_t ctf_meta_offset_freq;
 	uint32_t ctf_meta_offset_freq_off_s;
 	uint32_t ctf_meta_offset_freq_off;
-	uint16_t ctf_fixup_done;
+	RTE_ATOMIC(uint16_t) ctf_fixup_done;
 	rte_spinlock_t lock;
 };
 
@@ -104,7 +100,6 @@ void trace_uuid_generate(void);
 int trace_metadata_create(void);
 void trace_metadata_destroy(void);
 char *trace_metadata_fixup_field(const char *field);
-int trace_mkdir(void);
 int trace_epoch_time_save(void);
 void trace_mem_free(void);
 void trace_mem_per_thread_free(void);

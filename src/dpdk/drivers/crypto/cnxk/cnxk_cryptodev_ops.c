@@ -5,17 +5,33 @@
 #include <rte_cryptodev.h>
 #include <cryptodev_pmd.h>
 #include <rte_errno.h>
+#include <rte_security_driver.h>
 
+#include "roc_ae_fpm_tables.h"
 #include "roc_cpt.h"
+#include "roc_errata.h"
+#include "roc_idev.h"
+#include "roc_ie_on.h"
+#if defined(__aarch64__)
+#include "roc_io.h"
+#else
+#include "roc_io_generic.h"
+#endif
 
 #include "cnxk_ae.h"
 #include "cnxk_cryptodev.h"
-#include "cnxk_cryptodev_ops.h"
 #include "cnxk_cryptodev_capabilities.h"
+#include "cnxk_cryptodev_ops.h"
 #include "cnxk_se.h"
 
-#define CNXK_CPT_MAX_ASYM_OP_NUM_PARAMS 5
-#define CNXK_CPT_MAX_ASYM_OP_MOD_LEN	1024
+#include "cn10k_cryptodev_ops.h"
+#include "cn9k_cryptodev_ops.h"
+
+#include "rte_pmd_cnxk_crypto.h"
+
+#define CNXK_CPT_MAX_ASYM_OP_NUM_PARAMS	 5
+#define CNXK_CPT_MAX_ASYM_OP_MOD_LEN	 1024
+#define CNXK_CPT_META_BUF_MAX_CACHE_SIZE 128
 
 static int
 cnxk_cpt_get_mlen(void)
@@ -26,10 +42,24 @@ cnxk_cpt_get_mlen(void)
 	len = 2 * sizeof(uint64_t);
 	len += ROC_SE_MAX_MAC_LEN * sizeof(uint8_t);
 
+	/* For PDCP_CHAIN passthrough alignment */
+	len += 8;
 	len += ROC_SE_OFF_CTRL_LEN + ROC_CPT_AES_CBC_IV_LEN;
-	len += RTE_ALIGN_CEIL((ROC_SE_SG_LIST_HDR_SIZE +
-			       (RTE_ALIGN_CEIL(ROC_SE_MAX_SG_IN_OUT_CNT, 4) >>
-				2) * ROC_SE_SG_ENTRY_SIZE),
+	len += RTE_ALIGN_CEIL((ROC_SG_LIST_HDR_SIZE +
+			       (RTE_ALIGN_CEIL(ROC_MAX_SG_IN_OUT_CNT, 4) >> 2) * ROC_SG_ENTRY_SIZE),
+			      8);
+
+	return len;
+}
+
+static int
+cnxk_cpt_sec_get_mlen(void)
+{
+	uint32_t len;
+
+	len = ROC_IE_ON_OUTB_DPTR_HDR + ROC_IE_ON_MAX_IV_LEN;
+	len += RTE_ALIGN_CEIL((ROC_SG_LIST_HDR_SIZE +
+			       (RTE_ALIGN_CEIL(ROC_MAX_SG_IN_OUT_CNT, 4) >> 2) * ROC_SG_ENTRY_SIZE),
 			      8);
 
 	return len;
@@ -49,14 +79,42 @@ cnxk_cpt_asym_get_mlen(void)
 	return len;
 }
 
+static int
+cnxk_cpt_dev_clear(struct rte_cryptodev *dev)
+{
+	struct cnxk_cpt_vf *vf = dev->data->dev_private;
+	int ret;
+
+	if (dev->feature_flags & RTE_CRYPTODEV_FF_ASYMMETRIC_CRYPTO) {
+		roc_ae_fpm_put();
+		roc_ae_ec_grp_put();
+	}
+
+	ret = roc_cpt_int_misc_cb_unregister(cnxk_cpt_int_misc_cb, NULL);
+	if (ret < 0) {
+		plt_err("Could not unregister CPT_MISC_INT cb");
+		return ret;
+	}
+
+	roc_cpt_dev_clear(&vf->cpt);
+
+	return 0;
+}
+
 int
-cnxk_cpt_dev_config(struct rte_cryptodev *dev,
-		    struct rte_cryptodev_config *conf)
+cnxk_cpt_dev_config(struct rte_cryptodev *dev, struct rte_cryptodev_config *conf)
 {
 	struct cnxk_cpt_vf *vf = dev->data->dev_private;
 	struct roc_cpt *roc_cpt = &vf->cpt;
 	uint16_t nb_lf_avail, nb_lf;
+	bool rxc_ena = false;
 	int ret;
+
+	/* If this is a reconfigure attempt, clear the device and configure again */
+	if (roc_cpt->nb_lf > 0) {
+		cnxk_cpt_dev_clear(dev);
+		roc_cpt->opaque = NULL;
+	}
 
 	dev->feature_flags = cnxk_cpt_default_ff_get() & ~conf->ff_disable;
 
@@ -66,7 +124,14 @@ cnxk_cpt_dev_config(struct rte_cryptodev *dev,
 	if (nb_lf > nb_lf_avail)
 		return -ENOTSUP;
 
-	ret = roc_cpt_dev_configure(roc_cpt, nb_lf);
+	if (dev->feature_flags & RTE_CRYPTODEV_FF_SECURITY_RX_INJECT) {
+		if (rte_security_dynfield_register() < 0)
+			return -ENOTSUP;
+		rxc_ena = true;
+		vf->rx_chan_base = roc_idev_nix_rx_chan_base_get();
+	}
+
+	ret = roc_cpt_dev_configure(roc_cpt, nb_lf, rxc_ena, vf->rx_inject_qp);
 	if (ret) {
 		plt_err("Could not configure device");
 		return ret;
@@ -88,6 +153,9 @@ cnxk_cpt_dev_config(struct rte_cryptodev *dev,
 			return ret;
 		}
 	}
+	roc_cpt->opaque = dev;
+	/* Register callback to handle CPT_MISC_INT */
+	roc_cpt_int_misc_cb_register(cnxk_cpt_int_misc_cb, NULL);
 
 	return 0;
 }
@@ -130,7 +198,6 @@ cnxk_cpt_dev_stop(struct rte_cryptodev *dev)
 int
 cnxk_cpt_dev_close(struct rte_cryptodev *dev)
 {
-	struct cnxk_cpt_vf *vf = dev->data->dev_private;
 	uint16_t i;
 	int ret;
 
@@ -142,14 +209,7 @@ cnxk_cpt_dev_close(struct rte_cryptodev *dev)
 		}
 	}
 
-	if (dev->feature_flags & RTE_CRYPTODEV_FF_ASYMMETRIC_CRYPTO) {
-		roc_ae_fpm_put();
-		roc_ae_ec_grp_put();
-	}
-
-	roc_cpt_dev_clear(&vf->cpt);
-
-	return 0;
+	return cnxk_cpt_dev_clear(dev);
 }
 
 void
@@ -168,6 +228,10 @@ cnxk_cpt_dev_info_get(struct rte_cryptodev *dev,
 	info->sym.max_nb_sessions = 0;
 	info->min_mbuf_headroom_req = CNXK_CPT_MIN_HEADROOM_REQ;
 	info->min_mbuf_tailroom_req = CNXK_CPT_MIN_TAILROOM_REQ;
+
+	/* If the LF ID for RX Inject is less than the available lfs. */
+	if (vf->rx_inject_qp > info->max_nb_queue_pairs)
+		info->feature_flags &= ~RTE_CRYPTODEV_FF_SECURITY_RX_INJECT;
 }
 
 static void
@@ -193,6 +257,11 @@ cnxk_cpt_metabuf_mempool_create(const struct rte_cryptodev *dev,
 		mlen = cnxk_cpt_get_mlen();
 	}
 
+	if (dev->feature_flags & RTE_CRYPTODEV_FF_SECURITY) {
+		/* Get meta len for security operations */
+		mlen = cnxk_cpt_sec_get_mlen();
+	}
+
 	if (dev->feature_flags & RTE_CRYPTODEV_FF_ASYMMETRIC_CRYPTO) {
 
 		/* Get meta len required for asymmetric operations */
@@ -200,7 +269,7 @@ cnxk_cpt_metabuf_mempool_create(const struct rte_cryptodev *dev,
 	}
 
 	mb_pool_sz = nb_elements;
-	cache_sz = RTE_MIN(RTE_MEMPOOL_CACHE_MAX_SIZE, nb_elements / 1.5);
+	cache_sz = RTE_MIN(CNXK_CPT_META_BUF_MAX_CACHE_SIZE, nb_elements / 1.5);
 
 	/* For poll mode, core that enqueues and core that dequeues can be
 	 * different. For event mode, all cores are allowed to use same crypto
@@ -405,8 +474,20 @@ cnxk_cpt_queue_pair_setup(struct rte_cryptodev *dev, uint16_t qp_id,
 	}
 
 	qp->sess_mp = conf->mp_session;
-	qp->sess_mp_priv = conf->mp_session_private;
 	dev->data->queue_pairs[qp_id] = qp;
+
+	if (qp_id == vf->rx_inject_qp) {
+		ret = roc_cpt_lmtline_init(roc_cpt, &vf->rx_inj_lmtline, vf->rx_inject_qp);
+		if (ret) {
+			plt_err("Could not init lmtline Rx inject");
+			goto exit;
+		}
+
+		vf->rx_inj_pf_func = qp->lf.pf_func;
+
+		/* Block the queue for other submissions */
+		qp->pend_q.pq_mask = 0;
+	}
 
 	return 0;
 
@@ -421,13 +502,37 @@ cnxk_cpt_sym_session_get_size(struct rte_cryptodev *dev __rte_unused)
 	return sizeof(struct cnxk_se_sess);
 }
 
+static bool
+is_valid_pdcp_cipher_alg(struct rte_crypto_sym_xform *c_xfrm,
+			 struct cnxk_se_sess *sess)
+{
+	switch (c_xfrm->cipher.algo) {
+	case RTE_CRYPTO_CIPHER_SNOW3G_UEA2:
+	case RTE_CRYPTO_CIPHER_ZUC_EEA3:
+		break;
+	case RTE_CRYPTO_CIPHER_AES_CTR:
+		sess->aes_ctr_eea2 = 1;
+		break;
+	default:
+		return false;
+	}
+
+	return true;
+}
+
 static int
-cnxk_sess_fill(struct rte_crypto_sym_xform *xform, struct cnxk_se_sess *sess)
+cnxk_sess_fill(struct roc_cpt *roc_cpt, struct rte_crypto_sym_xform *xform,
+	       struct cnxk_se_sess *sess)
 {
 	struct rte_crypto_sym_xform *aead_xfrm = NULL;
 	struct rte_crypto_sym_xform *c_xfrm = NULL;
 	struct rte_crypto_sym_xform *a_xfrm = NULL;
 	bool ciph_then_auth = false;
+
+	if (roc_cpt->hw_caps[CPT_ENG_TYPE_SE].pdcp_chain_zuc256)
+		sess->roc_se_ctx.pdcp_iv_offset = 24;
+	else
+		sess->roc_se_ctx.pdcp_iv_offset = 16;
 
 	if (xform == NULL)
 		return -EINVAL;
@@ -459,16 +564,13 @@ cnxk_sess_fill(struct rte_crypto_sym_xform *xform, struct cnxk_se_sess *sess)
 		return -EINVAL;
 	}
 
-	if ((c_xfrm == NULL || c_xfrm->cipher.algo == RTE_CRYPTO_CIPHER_NULL) &&
-	    a_xfrm != NULL && a_xfrm->auth.algo == RTE_CRYPTO_AUTH_NULL &&
-	    a_xfrm->auth.op == RTE_CRYPTO_AUTH_OP_VERIFY) {
-		plt_dp_err("Null cipher + null auth verify is not supported");
-		return -ENOTSUP;
-	}
+	if ((aead_xfrm == NULL) &&
+	    (c_xfrm == NULL || c_xfrm->cipher.algo == RTE_CRYPTO_CIPHER_NULL) &&
+	    (a_xfrm == NULL || a_xfrm->auth.algo == RTE_CRYPTO_AUTH_NULL))
+		sess->passthrough = 1;
 
 	/* Cipher only */
-	if (c_xfrm != NULL &&
-	    (a_xfrm == NULL || a_xfrm->auth.algo == RTE_CRYPTO_AUTH_NULL)) {
+	if (c_xfrm != NULL && (a_xfrm == NULL || a_xfrm->auth.algo == RTE_CRYPTO_AUTH_NULL)) {
 		if (fill_sess_cipher(c_xfrm, sess))
 			return -ENOTSUP;
 		else
@@ -498,6 +600,11 @@ cnxk_sess_fill(struct rte_crypto_sym_xform *xform, struct cnxk_se_sess *sess)
 		return -EINVAL;
 	}
 
+	if (c_xfrm->cipher.algo == RTE_CRYPTO_CIPHER_AES_XTS) {
+		plt_err("AES XTS with auth algorithm is not supported");
+		return -ENOTSUP;
+	}
+
 	if (c_xfrm->cipher.algo == RTE_CRYPTO_CIPHER_3DES_CBC &&
 	    a_xfrm->auth.algo == RTE_CRYPTO_AUTH_SHA1) {
 		plt_dp_err("3DES-CBC + SHA1 is not supported");
@@ -506,6 +613,31 @@ cnxk_sess_fill(struct rte_crypto_sym_xform *xform, struct cnxk_se_sess *sess)
 
 	/* Cipher then auth */
 	if (ciph_then_auth) {
+		if (c_xfrm->cipher.op == RTE_CRYPTO_CIPHER_OP_DECRYPT) {
+			if (a_xfrm->auth.op != RTE_CRYPTO_AUTH_OP_VERIFY)
+				return -EINVAL;
+			sess->auth_first = 1;
+			switch (a_xfrm->auth.algo) {
+			case RTE_CRYPTO_AUTH_SHA1_HMAC:
+				switch (c_xfrm->cipher.algo) {
+				case RTE_CRYPTO_CIPHER_AES_CBC:
+					break;
+				default:
+					return -ENOTSUP;
+				}
+				break;
+			case RTE_CRYPTO_AUTH_SNOW3G_UIA2:
+			case RTE_CRYPTO_AUTH_ZUC_EIA3:
+			case RTE_CRYPTO_AUTH_AES_CMAC:
+				if (!is_valid_pdcp_cipher_alg(c_xfrm, sess))
+					return -ENOTSUP;
+				break;
+			default:
+				return -ENOTSUP;
+			}
+		}
+		sess->roc_se_ctx.ciph_then_auth = 1;
+		sess->chained_op = 1;
 		if (fill_sess_cipher(c_xfrm, sess))
 			return -ENOTSUP;
 		if (fill_sess_auth(a_xfrm, sess))
@@ -517,6 +649,9 @@ cnxk_sess_fill(struct rte_crypto_sym_xform *xform, struct cnxk_se_sess *sess)
 	/* else */
 
 	if (c_xfrm->cipher.op == RTE_CRYPTO_CIPHER_OP_ENCRYPT) {
+		if (a_xfrm->auth.op != RTE_CRYPTO_AUTH_OP_GENERATE)
+			return -EINVAL;
+		sess->auth_first = 1;
 		switch (a_xfrm->auth.algo) {
 		case RTE_CRYPTO_AUTH_SHA1_HMAC:
 			switch (c_xfrm->cipher.algo) {
@@ -526,11 +661,19 @@ cnxk_sess_fill(struct rte_crypto_sym_xform *xform, struct cnxk_se_sess *sess)
 				return -ENOTSUP;
 			}
 			break;
+		case RTE_CRYPTO_AUTH_SNOW3G_UIA2:
+		case RTE_CRYPTO_AUTH_ZUC_EIA3:
+		case RTE_CRYPTO_AUTH_AES_CMAC:
+			if (!is_valid_pdcp_cipher_alg(c_xfrm, sess))
+				return -ENOTSUP;
+			break;
 		default:
 			return -ENOTSUP;
 		}
 	}
 
+	sess->roc_se_ctx.auth_then_ciph = 1;
+	sess->chained_op = 1;
 	if (fill_sess_auth(a_xfrm, sess))
 		return -ENOTSUP;
 	if (fill_sess_cipher(c_xfrm, sess))
@@ -546,8 +689,14 @@ cnxk_cpt_inst_w7_get(struct cnxk_se_sess *sess, struct roc_cpt *roc_cpt)
 
 	inst_w7.s.cptr = (uint64_t)&sess->roc_se_ctx.se_ctx;
 
+	if (hw_ctx_cache_enable())
+		inst_w7.s.ctx_val = 1;
+	else
+		inst_w7.s.cptr += 8;
+
 	/* Set the engine group */
-	if (sess->zsk_flag || sess->chacha_poly)
+	if (sess->zsk_flag || sess->aes_ctr_eea2 || sess->is_sha3 || sess->is_sm3 ||
+	    sess->passthrough || sess->is_sm4)
 		inst_w7.s.egrp = roc_cpt->eng_grp[CPT_ENG_TYPE_SE];
 	else
 		inst_w7.s.egrp = roc_cpt->eng_grp[CPT_ENG_TYPE_IE];
@@ -556,27 +705,54 @@ cnxk_cpt_inst_w7_get(struct cnxk_se_sess *sess, struct roc_cpt *roc_cpt)
 }
 
 int
-sym_session_configure(struct roc_cpt *roc_cpt, int driver_id,
-		      struct rte_crypto_sym_xform *xform,
-		      struct rte_cryptodev_sym_session *sess,
-		      struct rte_mempool *pool)
+sym_session_configure(struct roc_cpt *roc_cpt, struct rte_crypto_sym_xform *xform,
+		      struct rte_cryptodev_sym_session *sess, bool is_session_less)
 {
-	struct cnxk_se_sess *sess_priv;
-	void *priv;
+	enum cpt_dp_thread_type thr_type;
+	struct cnxk_se_sess *sess_priv = (struct cnxk_se_sess *)sess;
 	int ret;
 
-	if (unlikely(rte_mempool_get(pool, &priv))) {
-		plt_dp_err("Could not allocate session private data");
-		return -ENOMEM;
-	}
+	if (is_session_less)
+		memset(sess_priv, 0, sizeof(struct cnxk_se_sess));
 
-	memset(priv, 0, sizeof(struct cnxk_se_sess));
-
-	sess_priv = priv;
-
-	ret = cnxk_sess_fill(xform, sess_priv);
+	ret = cnxk_sess_fill(roc_cpt, xform, sess_priv);
 	if (ret)
 		goto priv_put;
+
+	sess_priv->lf = roc_cpt->lf[0];
+
+	if (sess_priv->passthrough)
+		thr_type = CPT_DP_THREAD_TYPE_PT;
+	else if (sess_priv->cpt_op & ROC_SE_OP_CIPHER_MASK) {
+		switch (sess_priv->roc_se_ctx.fc_type) {
+		case ROC_SE_FC_GEN:
+			if (sess_priv->aes_gcm || sess_priv->aes_ccm || sess_priv->chacha_poly)
+				thr_type = CPT_DP_THREAD_TYPE_FC_AEAD;
+			else
+				thr_type = CPT_DP_THREAD_TYPE_FC_CHAIN;
+			break;
+		case ROC_SE_PDCP:
+			thr_type = CPT_DP_THREAD_TYPE_PDCP;
+			break;
+		case ROC_SE_KASUMI:
+			thr_type = CPT_DP_THREAD_TYPE_KASUMI;
+			break;
+		case ROC_SE_PDCP_CHAIN:
+			thr_type = CPT_DP_THREAD_TYPE_PDCP_CHAIN;
+			break;
+		case ROC_SE_SM:
+			thr_type = CPT_DP_THREAD_TYPE_SM;
+			break;
+		default:
+			plt_err("Invalid op type");
+			ret = -ENOTSUP;
+			goto priv_put;
+		}
+	} else {
+		thr_type = CPT_DP_THREAD_AUTH_ONLY;
+	}
+
+	sess_priv->dp_thr_type = thr_type;
 
 	if ((sess_priv->roc_se_ctx.fc_type == ROC_SE_HASH_HMAC) &&
 	    cpt_mac_len_verify(&xform->auth)) {
@@ -592,60 +768,47 @@ sym_session_configure(struct roc_cpt *roc_cpt, int driver_id,
 
 	sess_priv->cpt_inst_w7 = cnxk_cpt_inst_w7_get(sess_priv, roc_cpt);
 
-	set_sym_session_private_data(sess, driver_id, sess_priv);
+	if (hw_ctx_cache_enable())
+		roc_se_ctx_init(&sess_priv->roc_se_ctx);
 
 	return 0;
 
 priv_put:
-	rte_mempool_put(pool, priv);
-
 	return ret;
 }
 
 int
 cnxk_cpt_sym_session_configure(struct rte_cryptodev *dev,
 			       struct rte_crypto_sym_xform *xform,
-			       struct rte_cryptodev_sym_session *sess,
-			       struct rte_mempool *pool)
+			       struct rte_cryptodev_sym_session *sess)
 {
 	struct cnxk_cpt_vf *vf = dev->data->dev_private;
 	struct roc_cpt *roc_cpt = &vf->cpt;
-	uint8_t driver_id;
 
-	driver_id = dev->driver_id;
-
-	return sym_session_configure(roc_cpt, driver_id, xform, sess, pool);
+	return sym_session_configure(roc_cpt, xform, sess, false);
 }
 
 void
-sym_session_clear(int driver_id, struct rte_cryptodev_sym_session *sess)
+sym_session_clear(struct rte_cryptodev_sym_session *sess, bool is_session_less)
 {
-	void *priv = get_sym_session_private_data(sess, driver_id);
-	struct cnxk_se_sess *sess_priv;
-	struct rte_mempool *pool;
+	struct cnxk_se_sess *sess_priv = (struct cnxk_se_sess *)sess;
 
-	if (priv == NULL)
-		return;
-
-	sess_priv = priv;
+	/* Trigger CTX flush + invalidate to remove from CTX_CACHE */
+	if (hw_ctx_cache_enable())
+		roc_cpt_lf_ctx_flush(sess_priv->lf, &sess_priv->roc_se_ctx.se_ctx, true);
 
 	if (sess_priv->roc_se_ctx.auth_key != NULL)
 		plt_free(sess_priv->roc_se_ctx.auth_key);
 
-	memset(priv, 0, cnxk_cpt_sym_session_get_size(NULL));
-
-	pool = rte_mempool_from_obj(priv);
-
-	set_sym_session_private_data(sess, driver_id, NULL);
-
-	rte_mempool_put(pool, priv);
+	if (is_session_less)
+		memset(sess_priv, 0, cnxk_cpt_sym_session_get_size(NULL));
 }
 
 void
-cnxk_cpt_sym_session_clear(struct rte_cryptodev *dev,
+cnxk_cpt_sym_session_clear(struct rte_cryptodev *dev __rte_unused,
 			   struct rte_cryptodev_sym_session *sess)
 {
-	return sym_session_clear(dev->driver_id, sess);
+	return sym_session_clear(sess, false);
 }
 
 unsigned int
@@ -655,14 +818,13 @@ cnxk_ae_session_size_get(struct rte_cryptodev *dev __rte_unused)
 }
 
 void
-cnxk_ae_session_clear(struct rte_cryptodev *dev,
-		      struct rte_cryptodev_asym_session *sess)
+cnxk_ae_session_clear(struct rte_cryptodev *dev, struct rte_cryptodev_asym_session *sess)
 {
-	struct cnxk_ae_sess *priv;
+	struct cnxk_ae_sess *priv = (struct cnxk_ae_sess *)sess;
 
-	priv = (struct cnxk_ae_sess *) sess->sess_private_data;
-	if (priv == NULL)
-		return;
+	/* Trigger CTX flush + invalidate to remove from CTX_CACHE */
+	if (roc_errata_cpt_hang_on_mixed_ctx_val())
+		roc_cpt_lf_ctx_flush(priv->lf, &priv->hw_ctx, true);
 
 	/* Free resources allocated in session_cfg */
 	cnxk_ae_free_session_parameters(priv);
@@ -672,23 +834,36 @@ cnxk_ae_session_clear(struct rte_cryptodev *dev,
 }
 
 int
-cnxk_ae_session_cfg(struct rte_cryptodev *dev,
-		    struct rte_crypto_asym_xform *xform,
+cnxk_ae_session_cfg(struct rte_cryptodev *dev, struct rte_crypto_asym_xform *xform,
 		    struct rte_cryptodev_asym_session *sess)
 {
-	struct cnxk_ae_sess *priv =
-			(struct cnxk_ae_sess *) sess->sess_private_data;
+	struct cnxk_ae_sess *priv = (struct cnxk_ae_sess *)sess;
 	struct cnxk_cpt_vf *vf = dev->data->dev_private;
 	struct roc_cpt *roc_cpt = &vf->cpt;
 	union cpt_inst_w7 w7;
+	struct hw_ctx_s *hwc;
 	int ret;
 
 	ret = cnxk_ae_fill_session_parameters(priv, xform);
 	if (ret)
 		return ret;
 
+	priv->lf = roc_cpt->lf[0];
+
 	w7.u64 = 0;
 	w7.s.egrp = roc_cpt->eng_grp[CPT_ENG_TYPE_AE];
+
+	if (roc_errata_cpt_hang_on_mixed_ctx_val()) {
+		hwc = &priv->hw_ctx;
+		hwc->w0.s.aop_valid = 1;
+		hwc->w0.s.ctx_hdr_size = 0;
+		hwc->w0.s.ctx_size = 1;
+		hwc->w0.s.ctx_push_size = 1;
+
+		w7.s.cptr = (uint64_t)hwc;
+		w7.s.ctx_val = 1;
+	}
+
 	priv->cpt_inst_w7 = w7.u64;
 	priv->cnxk_fpm_iova = vf->cnxk_fpm_iova;
 	priv->ec_grp = vf->ec_grp;
@@ -737,4 +912,108 @@ cnxk_cpt_dump_on_err(struct cnxk_cpt_qp *qp)
 
 	plt_print("");
 	roc_cpt_afs_print(qp->lf.roc_cpt);
+}
+
+int
+cnxk_cpt_queue_pair_event_error_query(struct rte_cryptodev *dev, uint16_t qp_id)
+{
+	struct cnxk_cpt_vf *vf = dev->data->dev_private;
+	struct roc_cpt *roc_cpt = &vf->cpt;
+	struct roc_cpt_lf *lf;
+
+	lf = roc_cpt->lf[qp_id];
+	if (lf && lf->error_event_pending) {
+		lf->error_event_pending = 0;
+		return 1;
+	}
+	return 0;
+}
+
+void *
+rte_pmd_cnxk_crypto_qptr_get(uint8_t dev_id, uint16_t qp_id)
+{
+	const struct rte_crypto_fp_ops *fp_ops;
+	void *qptr;
+
+	fp_ops = &rte_crypto_fp_ops[dev_id];
+	qptr = fp_ops->qp.data[qp_id];
+
+	return qptr;
+}
+
+static inline void
+cnxk_crypto_cn10k_submit(void *qptr, void *inst, uint16_t nb_inst)
+{
+	uint64_t lmt_base, lmt_arg, io_addr;
+	struct cnxk_cpt_qp *qp = qptr;
+	uint16_t i, j, lmt_id;
+	void *lmt_dst;
+
+	lmt_base = qp->lmtline.lmt_base;
+	io_addr = qp->lmtline.io_addr;
+
+	ROC_LMT_BASE_ID_GET(lmt_base, lmt_id);
+
+again:
+	i = RTE_MIN(nb_inst, CN10K_PKTS_PER_LOOP);
+	lmt_dst = PLT_PTR_CAST(lmt_base);
+
+	for (j = 0; j < i; j++) {
+		rte_memcpy(lmt_dst, inst, sizeof(struct cpt_inst_s));
+		inst = RTE_PTR_ADD(inst, sizeof(struct cpt_inst_s));
+		lmt_dst = RTE_PTR_ADD(lmt_dst, 2 * sizeof(struct cpt_inst_s));
+	}
+
+	rte_io_wmb();
+
+	if (i > CN10K_PKTS_PER_STEORL) {
+		lmt_arg = ROC_CN10K_CPT_LMT_ARG | (CN10K_PKTS_PER_STEORL - 1) << 12 |
+			  (uint64_t)lmt_id;
+		roc_lmt_submit_steorl(lmt_arg, io_addr);
+		lmt_arg = ROC_CN10K_CPT_LMT_ARG | (i - CN10K_PKTS_PER_STEORL - 1) << 12 |
+			  (uint64_t)(lmt_id + CN10K_PKTS_PER_STEORL);
+		roc_lmt_submit_steorl(lmt_arg, io_addr);
+	} else {
+		lmt_arg = ROC_CN10K_CPT_LMT_ARG | (i - 1) << 12 | (uint64_t)lmt_id;
+		roc_lmt_submit_steorl(lmt_arg, io_addr);
+	}
+
+	rte_io_wmb();
+
+	if (nb_inst - i > 0) {
+		nb_inst -= i;
+		goto again;
+	}
+}
+
+static inline void
+cnxk_crypto_cn9k_submit(void *qptr, void *inst, uint16_t nb_inst)
+{
+	struct cnxk_cpt_qp *qp = qptr;
+
+	const uint64_t lmt_base = qp->lf.lmt_base;
+	const uint64_t io_addr = qp->lf.io_addr;
+
+	if (unlikely(nb_inst & 1)) {
+		cn9k_cpt_inst_submit(inst, lmt_base, io_addr);
+		inst = RTE_PTR_ADD(inst, sizeof(struct cpt_inst_s));
+		nb_inst -= 1;
+	}
+
+	while (nb_inst > 0) {
+		cn9k_cpt_inst_submit_dual(inst, lmt_base, io_addr);
+		inst = RTE_PTR_ADD(inst, 2 * sizeof(struct cpt_inst_s));
+		nb_inst -= 2;
+	}
+}
+
+void
+rte_pmd_cnxk_crypto_submit(void *qptr, void *inst, uint16_t nb_inst)
+{
+	if (roc_model_is_cn10k())
+		return cnxk_crypto_cn10k_submit(qptr, inst, nb_inst);
+	else if (roc_model_is_cn9k())
+		return cnxk_crypto_cn9k_submit(qptr, inst, nb_inst);
+
+	plt_err("Invalid cnxk model");
 }

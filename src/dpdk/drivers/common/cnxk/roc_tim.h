@@ -5,6 +5,8 @@
 #ifndef _ROC_TIM_H_
 #define _ROC_TIM_H_
 
+#include "roc_platform.h"
+
 enum roc_tim_clk_src {
 	ROC_TIM_CLK_SRC_10NS = 0,
 	ROC_TIM_CLK_SRC_GPIO,
@@ -12,6 +14,8 @@ enum roc_tim_clk_src {
 	ROC_TIM_CLK_SRC_PTP,
 	ROC_TIM_CLK_SRC_SYNCE,
 	ROC_TIM_CLK_SRC_BTS,
+	ROC_TIM_CLK_SRC_EXT_MIO,
+	ROC_TIM_CLK_SRC_EXT_GTI,
 	ROC_TIM_CLK_SRC_INVALID,
 };
 
@@ -46,5 +50,6 @@ int __roc_api roc_tim_lf_alloc(struct roc_tim *roc_tim, uint8_t ring_id,
 int __roc_api roc_tim_lf_free(struct roc_tim *roc_tim, uint8_t ring_id);
 uintptr_t __roc_api roc_tim_lf_base_get(struct roc_tim *roc_tim,
 					uint8_t ring_id);
+int roc_tim_capture_counters(struct roc_tim *roc_tim, uint64_t *counters, uint8_t nb_cntrs);
 
 #endif

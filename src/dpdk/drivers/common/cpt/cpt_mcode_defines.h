@@ -364,6 +364,24 @@ struct cpt_ec_group {
 struct cpt_asym_ec_ctx {
 	/* Prime length defined by microcode for EC operations */
 	uint8_t curveid;
+
+	/* Private key */
+	struct {
+		uint8_t data[66];
+		unsigned int length;
+	} pkey;
+
+	/* Public key */
+	struct {
+		struct {
+			uint8_t data[66];
+			unsigned int length;
+		} x;
+		struct {
+			uint8_t data[66];
+			unsigned int length;
+		} y;
+	} q;
 };
 
 struct cpt_asym_sess_misc {
@@ -387,7 +405,7 @@ typedef struct buf_ptr {
 /* IOV Pointer */
 typedef struct{
 	int buf_cnt;
-	buf_ptr_t bufs[0];
+	buf_ptr_t bufs[];
 } iov_ptr_t;
 
 typedef struct fc_params {

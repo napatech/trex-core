@@ -1,4 +1,4 @@
-DPDK_22 {
+DPDK_24 {
 	global:
 
 	rte_acl_add_rules;

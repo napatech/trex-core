@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0)
- * Copyright(c) 2018-2019 Pensando Systems, Inc. All rights reserved.
+/* SPDX-License-Identifier: BSD-3-Clause
+ * Copyright 2018-2022 Advanced Micro Devices, Inc.
  */
 
 #include <stdbool.h>
@@ -180,6 +180,12 @@ ionic_adminq_service(struct ionic_cq *cq, uint16_t cq_desc_index,
 	return true;
 }
 
+uint16_t
+ionic_adminq_space_avail(struct ionic_lif *lif)
+{
+	return ionic_q_space_avail(&lif->adminqcq->qcq.q);
+}
+
 /** ionic_adminq_post - Post an admin command.
  * @lif:                Handle to lif.
  * @cmd_ctx:            Api admin command context.
@@ -191,7 +197,7 @@ ionic_adminq_service(struct ionic_cq *cq, uint16_t cq_desc_index,
  *
  * Return: zero or negative error status.
  */
-static int
+int
 ionic_adminq_post(struct ionic_lif *lif, struct ionic_admin_ctx *ctx)
 {
 	struct ionic_queue *q = &lif->adminqcq->qcq.q;
@@ -217,7 +223,6 @@ ionic_adminq_post(struct ionic_lif *lif, struct ionic_admin_ctx *ctx)
 	q->head_idx = Q_NEXT_TO_POST(q, 1);
 
 	/* Ring doorbell */
-	rte_wmb();
 	ionic_q_flush(q);
 
 err_out:
@@ -230,10 +235,16 @@ static int
 ionic_adminq_wait_for_completion(struct ionic_lif *lif,
 		struct ionic_admin_ctx *ctx, unsigned long max_wait)
 {
+	struct ionic_queue *q = &lif->adminqcq->qcq.q;
 	unsigned long step_usec = IONIC_DEVCMD_CHECK_PERIOD_US;
+	unsigned long step_deadline;
 	unsigned long max_wait_usec = max_wait * 1000000L;
 	unsigned long elapsed_usec = 0;
 	int budget = 8;
+	uint16_t idx;
+	void **info;
+
+	step_deadline = IONIC_ADMINQ_WDOG_MS * 1000 / step_usec;
 
 	while (ctx->pending_work && elapsed_usec < max_wait_usec) {
 		/*
@@ -245,10 +256,26 @@ ionic_adminq_wait_for_completion(struct ionic_lif *lif,
 		ionic_qcq_service(&lif->adminqcq->qcq, budget,
 				ionic_adminq_service, NULL);
 
+		/*
+		 * Ring the doorbell again if work is pending after deadline.
+		 */
+		if (ctx->pending_work && !step_deadline) {
+			step_deadline = IONIC_ADMINQ_WDOG_MS *
+				1000 / step_usec;
+
+			rte_spinlock_lock(&lif->adminq_lock);
+			idx = Q_NEXT_TO_POST(q, -1);
+			info = IONIC_INFO_PTR(q, idx);
+			if (info[0] == ctx)
+				ionic_q_flush(q);
+			rte_spinlock_unlock(&lif->adminq_lock);
+		}
+
 		rte_spinlock_unlock(&lif->adminq_service_lock);
 
 		rte_delay_us_block(step_usec);
 		elapsed_usec += step_usec;
+		step_deadline--;
 	}
 
 	return (!ctx->pending_work);
@@ -257,7 +284,6 @@ ionic_adminq_wait_for_completion(struct ionic_lif *lif,
 int
 ionic_adminq_post_wait(struct ionic_lif *lif, struct ionic_admin_ctx *ctx)
 {
-	bool done;
 	int err;
 
 	IONIC_PRINT(DEBUG, "Sending %s (%d) via the admin queue",
@@ -269,6 +295,14 @@ ionic_adminq_post_wait(struct ionic_lif *lif, struct ionic_admin_ctx *ctx)
 			ctx->cmd.cmd.opcode, err);
 		return err;
 	}
+
+	return ionic_adminq_wait(lif, ctx);
+}
+
+int
+ionic_adminq_wait(struct ionic_lif *lif, struct ionic_admin_ctx *ctx)
+{
+	bool done;
 
 	done = ionic_adminq_wait_for_completion(lif, ctx,
 		IONIC_DEVCMD_TIMEOUT);
@@ -313,10 +347,10 @@ ionic_dev_cmd_check_error(struct ionic_dev *idev)
 	uint8_t status;
 
 	status = ionic_dev_cmd_status(idev);
-	if (status == 0)
+	if (status == IONIC_RC_SUCCESS)
 		return 0;
 
-	return -EIO;
+	return (status == IONIC_RC_EAGAIN) ? -EAGAIN : -EIO;
 }
 
 int
@@ -336,7 +370,7 @@ ionic_dev_cmd_wait_check(struct ionic_dev *idev, unsigned long max_wait)
 int
 ionic_setup(struct ionic_adapter *adapter)
 {
-	return ionic_dev_setup(adapter);
+	return (*adapter->intf->setup)(adapter);
 }
 
 int

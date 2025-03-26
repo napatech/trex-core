@@ -5,11 +5,14 @@ headers = files(
         'rte_ip.h',
         'rte_tcp.h',
         'rte_udp.h',
+        'rte_tls.h',
+        'rte_dtls.h',
         'rte_esp.h',
         'rte_sctp.h',
         'rte_icmp.h',
         'rte_arp.h',
         'rte_ether.h',
+        'rte_macsec.h',
         'rte_vxlan.h',
         'rte_gre.h',
         'rte_gtp.h',
@@ -18,9 +21,11 @@ headers = files(
         'rte_mpls.h',
         'rte_higig.h',
         'rte_ecpri.h',
+        'rte_pdcp_hdr.h',
         'rte_geneve.h',
         'rte_l2tpv2.h',
         'rte_ppp.h',
+        'rte_ib.h',
 )
 
 sources = files(

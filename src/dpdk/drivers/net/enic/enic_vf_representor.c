@@ -5,9 +5,9 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include <rte_bus_pci.h>
+#include <bus_pci_driver.h>
 #include <rte_common.h>
-#include <rte_dev.h>
+#include <dev_driver.h>
 #include <ethdev_driver.h>
 #include <ethdev_pci.h>
 #include <rte_flow_driver.h>
@@ -707,7 +707,7 @@ int enic_vf_representor_init(struct rte_eth_dev *eth_dev, void *init_params)
 	LIST_INIT(&vf_enic->memzone_list);
 	rte_spinlock_init(&vf_enic->memzone_list_lock);
 	addr = &vf->bdf;
-	snprintf(vf_enic->bdf_name, ENICPMD_BDF_LENGTH, "%04x:%02x:%02x.%x",
+	snprintf(vf_enic->bdf_name, PCI_PRI_STR_SIZE, PCI_PRI_FMT,
 		 addr->domain, addr->bus, addr->devid, addr->function);
 	return 0;
 }

@@ -10,6 +10,7 @@
 
 #include <sys/queue.h>
 
+#include <dev_driver.h>
 #include <rte_class.h>
 #include <rte_malloc.h>
 #include <rte_spinlock.h>
@@ -18,25 +19,27 @@
 #include "rte_vdpa.h"
 #include "vdpa_driver.h"
 #include "vhost.h"
+#include "iotlb.h"
 
 /** Double linked list of vDPA devices. */
 TAILQ_HEAD(vdpa_device_list, rte_vdpa_device);
 
-static struct vdpa_device_list vdpa_device_list =
-		TAILQ_HEAD_INITIALIZER(vdpa_device_list);
+static struct vdpa_device_list vdpa_device_list__ =
+	TAILQ_HEAD_INITIALIZER(vdpa_device_list__);
 static rte_spinlock_t vdpa_device_list_lock = RTE_SPINLOCK_INITIALIZER;
+static struct vdpa_device_list * const vdpa_device_list
+	__rte_guarded_by(&vdpa_device_list_lock) = &vdpa_device_list__;
 
-
-/* Unsafe, needs to be called with vdpa_device_list_lock held */
 static struct rte_vdpa_device *
 __vdpa_find_device_by_name(const char *name)
+	__rte_exclusive_locks_required(&vdpa_device_list_lock)
 {
 	struct rte_vdpa_device *dev, *ret = NULL;
 
 	if (name == NULL)
 		return NULL;
 
-	TAILQ_FOREACH(dev, &vdpa_device_list, next) {
+	TAILQ_FOREACH(dev, vdpa_device_list, next) {
 		if (!strncmp(dev->device->name, name, RTE_DEV_NAME_MAX_LEN)) {
 			ret = dev;
 			break;
@@ -72,6 +75,7 @@ rte_vdpa_register_device(struct rte_device *rte_dev,
 		struct rte_vdpa_dev_ops *ops)
 {
 	struct rte_vdpa_device *dev;
+	int ret = 0;
 
 	if (ops == NULL)
 		return NULL;
@@ -81,8 +85,8 @@ rte_vdpa_register_device(struct rte_device *rte_dev,
 			!ops->get_protocol_features || !ops->dev_conf ||
 			!ops->dev_close || !ops->set_vring_state ||
 			!ops->set_features) {
-		VHOST_LOG_CONFIG(ERR, "(%s) Some mandatory vDPA ops aren't implemented\n",
-				rte_dev->name);
+		VHOST_CONFIG_LOG(rte_dev->name, ERR,
+			"Some mandatory vDPA ops aren't implemented");
 		return NULL;
 	}
 
@@ -100,7 +104,21 @@ rte_vdpa_register_device(struct rte_device *rte_dev,
 
 	dev->device = rte_dev;
 	dev->ops = ops;
-	TAILQ_INSERT_TAIL(&vdpa_device_list, dev, next);
+
+	if (ops->get_dev_type) {
+		ret = ops->get_dev_type(dev, &dev->type);
+		if (ret) {
+			VHOST_CONFIG_LOG(rte_dev->name, ERR,
+					 "Failed to get vdpa dev type.");
+			ret = -1;
+			goto out_unlock;
+		}
+	} else {
+		/** by default, we assume vdpa device is a net device */
+		dev->type = RTE_VHOST_VDPA_DEVICE_TYPE_NET;
+	}
+
+	TAILQ_INSERT_TAIL(vdpa_device_list, dev, next);
 out_unlock:
 	rte_spinlock_unlock(&vdpa_device_list_lock);
 
@@ -114,11 +132,11 @@ rte_vdpa_unregister_device(struct rte_vdpa_device *dev)
 	int ret = -1;
 
 	rte_spinlock_lock(&vdpa_device_list_lock);
-	RTE_TAILQ_FOREACH_SAFE(cur_dev, &vdpa_device_list, next, tmp_dev) {
+	RTE_TAILQ_FOREACH_SAFE(cur_dev, vdpa_device_list, next, tmp_dev) {
 		if (dev != cur_dev)
 			continue;
 
-		TAILQ_REMOVE(&vdpa_device_list, dev, next);
+		TAILQ_REMOVE(vdpa_device_list, dev, next);
 		rte_free(dev);
 		ret = 0;
 		break;
@@ -175,17 +193,21 @@ rte_vdpa_relay_vring_used(int vid, uint16_t qid, void *vring_m)
 			if (unlikely(nr_descs > vq->size))
 				return -1;
 
+			vhost_user_iotlb_rd_lock(vq);
 			desc_ring = (struct vring_desc *)(uintptr_t)
 				vhost_iova_to_vva(dev, vq,
 						vq->desc[desc_id].addr, &dlen,
 						VHOST_ACCESS_RO);
+			vhost_user_iotlb_rd_unlock(vq);
 			if (unlikely(!desc_ring))
 				return -1;
 
 			if (unlikely(dlen < vq->desc[desc_id].len)) {
+				vhost_user_iotlb_rd_lock(vq);
 				idesc = vhost_alloc_copy_ind_table(dev, vq,
 						vq->desc[desc_id].addr,
 						vq->desc[desc_id].len);
+				vhost_user_iotlb_rd_unlock(vq);
 				if (unlikely(!idesc))
 					return -1;
 
@@ -202,9 +224,12 @@ rte_vdpa_relay_vring_used(int vid, uint16_t qid, void *vring_m)
 			if (unlikely(nr_descs-- == 0))
 				goto fail;
 			desc = desc_ring[desc_id];
-			if (desc.flags & VRING_DESC_F_WRITE)
+			if (desc.flags & VRING_DESC_F_WRITE) {
+				vhost_user_iotlb_rd_lock(vq);
 				vhost_log_write_iova(dev, vq, desc.addr,
 						     desc.len);
+				vhost_user_iotlb_rd_unlock(vq);
+			}
 			desc_id = desc.next;
 		} while (desc.flags & VRING_DESC_F_NEXT);
 
@@ -217,7 +242,8 @@ rte_vdpa_relay_vring_used(int vid, uint16_t qid, void *vring_m)
 	}
 
 	/* used idx is the synchronization point for the split vring */
-	__atomic_store_n(&vq->used->idx, idx_m, __ATOMIC_RELEASE);
+	rte_atomic_store_explicit((unsigned short __rte_atomic *)&vq->used->idx,
+		idx_m, rte_memory_order_release);
 
 	if (dev->features & (1ULL << VIRTIO_RING_F_EVENT_IDX))
 		vring_used_event(s_vring) = idx_m;
@@ -266,7 +292,8 @@ rte_vdpa_get_stats_names(struct rte_vdpa_device *dev,
 	if (!dev)
 		return -EINVAL;
 
-	RTE_FUNC_PTR_OR_ERR_RET(dev->ops->get_stats_names, -ENOTSUP);
+	if (dev->ops->get_stats_names == NULL)
+		return -ENOTSUP;
 
 	return dev->ops->get_stats_names(dev, stats_names, size);
 }
@@ -278,7 +305,8 @@ rte_vdpa_get_stats(struct rte_vdpa_device *dev, uint16_t qid,
 	if (!dev || !stats || !n)
 		return -EINVAL;
 
-	RTE_FUNC_PTR_OR_ERR_RET(dev->ops->get_stats, -ENOTSUP);
+	if (dev->ops->get_stats == NULL)
+		return -ENOTSUP;
 
 	return dev->ops->get_stats(dev, qid, stats, n);
 }
@@ -289,7 +317,8 @@ rte_vdpa_reset_stats(struct rte_vdpa_device *dev, uint16_t qid)
 	if (!dev)
 		return -EINVAL;
 
-	RTE_FUNC_PTR_OR_ERR_RET(dev->ops->reset_stats, -ENOTSUP);
+	if (dev->ops->reset_stats == NULL)
+		return -ENOTSUP;
 
 	return dev->ops->reset_stats(dev, qid);
 }
@@ -316,7 +345,7 @@ vdpa_find_device(const struct rte_vdpa_device *start, rte_vdpa_cmp_t cmp,
 
 	rte_spinlock_lock(&vdpa_device_list_lock);
 	if (start == NULL)
-		dev = TAILQ_FIRST(&vdpa_device_list);
+		dev = TAILQ_FIRST(vdpa_device_list);
 	else
 		dev = TAILQ_NEXT(start, next);
 

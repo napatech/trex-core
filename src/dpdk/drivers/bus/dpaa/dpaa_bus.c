@@ -4,6 +4,7 @@
  *
  */
 /* System headers */
+#include <stdalign.h>
 #include <stdio.h>
 #include <inttypes.h>
 #include <unistd.h>
@@ -29,12 +30,12 @@
 #include <ethdev_driver.h>
 #include <rte_malloc.h>
 #include <rte_ring.h>
-#include <rte_bus.h>
+#include <bus_driver.h>
 #include <rte_mbuf_pool_ops.h>
 #include <rte_mbuf_dyn.h>
 
 #include <dpaa_of.h>
-#include <rte_dpaa_bus.h>
+#include <bus_dpaa_driver.h>
 #include <rte_dpaa_logs.h>
 #include <dpaax_iova_table.h>
 
@@ -42,6 +43,14 @@
 #include <fsl_qman.h>
 #include <fsl_bman.h>
 #include <netcfg.h>
+
+struct rte_dpaa_bus {
+	struct rte_bus bus;
+	TAILQ_HEAD(, rte_dpaa_device) device_list;
+	TAILQ_HEAD(, rte_dpaa_driver) driver_list;
+	int device_count;
+	int detected;
+};
 
 static struct rte_dpaa_bus rte_dpaa_bus;
 struct netcfg_info *dpaa_netcfg;
@@ -171,6 +180,7 @@ dpaa_create_device_list(void)
 		}
 
 		dev->device.bus = &rte_dpaa_bus.bus;
+		dev->device.numa_node = SOCKET_ID_ANY;
 
 		/* Allocate interrupt handle instance */
 		dev->intr_handle =
@@ -298,7 +308,7 @@ int rte_dpaa_portal_init(void *arg)
 	static const struct rte_mbuf_dynfield dpaa_seqn_dynfield_desc = {
 		.name = DPAA_SEQN_DYNFIELD_NAME,
 		.size = sizeof(dpaa_seqn_t),
-		.align = __alignof__(dpaa_seqn_t),
+		.align = alignof(dpaa_seqn_t),
 	};
 	unsigned int cpu, lcore = rte_lcore_id();
 	int ret;
@@ -520,23 +530,15 @@ rte_dpaa_driver_register(struct rte_dpaa_driver *driver)
 	BUS_INIT_FUNC_TRACE();
 
 	TAILQ_INSERT_TAIL(&rte_dpaa_bus.driver_list, driver, next);
-	/* Update Bus references */
-	driver->dpaa_bus = &rte_dpaa_bus;
 }
 
 /* un-register a dpaa bus based dpaa driver */
 void
 rte_dpaa_driver_unregister(struct rte_dpaa_driver *driver)
 {
-	struct rte_dpaa_bus *dpaa_bus;
-
 	BUS_INIT_FUNC_TRACE();
 
-	dpaa_bus = driver->dpaa_bus;
-
-	TAILQ_REMOVE(&dpaa_bus->driver_list, driver, next);
-	/* Update Bus references */
-	driver->dpaa_bus = NULL;
+	TAILQ_REMOVE(&rte_dpaa_bus.driver_list, driver, next);
 }
 
 static int
@@ -655,6 +657,11 @@ rte_dpaa_bus_probe(void)
 	if (TAILQ_EMPTY(&rte_dpaa_bus.device_list))
 		return 0;
 
+	/* Register DPAA mempool ops only if any DPAA device has
+	 * been detected.
+	 */
+	rte_mbuf_set_platform_mempool_ops(DPAA_MEMPOOL_OPS_NAME);
+
 	svr_file = fopen(DPAA_SOC_ID_FILE, "r");
 	if (svr_file) {
 		if (fscanf(svr_file, "svr:%x", &svr_ver) > 0)
@@ -703,11 +710,6 @@ rte_dpaa_bus_probe(void)
 			break;
 		}
 	}
-
-	/* Register DPAA mempool ops only if any DPAA device has
-	 * been detected.
-	 */
-	rte_mbuf_set_platform_mempool_ops(DPAA_MEMPOOL_OPS_NAME);
 
 	return 0;
 }
@@ -790,6 +792,10 @@ dpaa_bus_dev_iterate(const void *start, const char *str,
 
 	/* Now that name=device_name format is available, split */
 	dup = strdup(str);
+	if (dup == NULL) {
+		DPAA_BUS_DEBUG("Dup string (%s) failed!\n", str);
+		return NULL;
+	}
 	dev_name = dup + strlen("name=");
 
 	if (start != NULL) {

@@ -20,8 +20,13 @@ extern "C" {
 #include <stdio.h>
 
 #include <rte_config.h>
-#include <rte_compat.h>
+#include <rte_common.h>
 #include <rte_log.h>
+
+struct rte_bus;
+struct rte_devargs;
+struct rte_device;
+struct rte_driver;
 
 /**
  * The device event type.
@@ -35,17 +40,6 @@ enum rte_dev_event_type {
 typedef void (*rte_dev_event_cb_fn)(const char *device_name,
 					enum rte_dev_event_type event,
 					void *cb_arg);
-
-/* Macros to check for invalid function pointers */
-#define RTE_FUNC_PTR_OR_ERR_RET(func, retval) do { \
-	if ((func) == NULL) \
-		return retval; \
-} while (0)
-
-#define RTE_FUNC_PTR_OR_RET(func) do { \
-	if ((func) == NULL) \
-		return; \
-} while (0)
 
 /**
  * Device policies.
@@ -65,31 +59,87 @@ struct rte_mem_resource {
 };
 
 /**
- * A structure describing a device driver.
+ * Retrieve a driver name.
+ *
+ * @param driver
+ *   A pointer to a driver structure.
+ * @return
+ *   A pointer to the driver name string.
  */
-struct rte_driver {
-	RTE_TAILQ_ENTRY(rte_driver) next; /**< Next in list. */
-	const char *name;                   /**< Driver name. */
-	const char *alias;              /**< Driver alias. */
-};
+const char *
+rte_driver_name(const struct rte_driver *driver);
+
+/**
+ * Retrieve a device bus.
+ *
+ * @param dev
+ *   A pointer to a device structure.
+ * @return
+ *   A pointer to this device bus.
+ */
+const struct rte_bus *
+rte_dev_bus(const struct rte_device *dev);
+
+/**
+ * Retrieve bus specific information for a device.
+ *
+ * @param dev
+ *   A pointer to a device structure.
+ * @return
+ *   A string describing this device or NULL if none is available.
+ */
+const char *
+rte_dev_bus_info(const struct rte_device *dev);
+
+/**
+ * Retrieve a device arguments.
+ *
+ * @param dev
+ *   A pointer to a device structure.
+ * @return
+ *   A pointer to this device devargs.
+ */
+const struct rte_devargs *
+rte_dev_devargs(const struct rte_device *dev);
+
+/**
+ * Retrieve a device driver.
+ *
+ * @param dev
+ *   A pointer to a device structure.
+ * @return
+ *   A pointer to this device driver.
+ */
+const struct rte_driver *
+rte_dev_driver(const struct rte_device *dev);
+
+/**
+ * Retrieve a device name.
+ *
+ * @param dev
+ *   A pointer to a device structure.
+ * @return
+ *   A pointer to this device name.
+ */
+const char *
+rte_dev_name(const struct rte_device *dev);
+
+/**
+ * Retrieve a device numa node.
+ *
+ * @param dev
+ *   A pointer to a device structure.
+ * @return
+ *   A pointer to this device numa node.
+ */
+int
+rte_dev_numa_node(const struct rte_device *dev);
 
 /*
  * Internal identifier length
  * Sufficiently large to allow for UUID or PCI address
  */
 #define RTE_DEV_NAME_MAX_LEN 64
-
-/**
- * A structure describing a generic device.
- */
-struct rte_device {
-	RTE_TAILQ_ENTRY(rte_device) next; /**< Next device */
-	const char *name;             /**< Device name */
-	const struct rte_driver *driver; /**< Driver assigned after probing */
-	const struct rte_bus *bus;    /**< Bus handle assigned on scan */
-	int numa_node;                /**< NUMA node connection */
-	struct rte_devargs *devargs;  /**< Arguments for latest probing */
-};
 
 /**
  * Query status of a device.
@@ -290,7 +340,6 @@ typedef void *(*rte_dev_iterate_t)(const void *start,
  *   0 on successful initialization.
  *   <0 on error.
  */
-__rte_experimental
 int
 rte_dev_iterator_init(struct rte_dev_iterator *it, const char *str);
 
@@ -310,7 +359,6 @@ rte_dev_iterator_init(struct rte_dev_iterator *it, const char *str);
  *   NULL if an error occurred (rte_errno is set).
  *   NULL if no device could be found (rte_errno is not set).
  */
-__rte_experimental
 struct rte_device *
 rte_dev_iterator_next(struct rte_dev_iterator *it);
 
@@ -320,14 +368,7 @@ rte_dev_iterator_next(struct rte_dev_iterator *it);
 	     dev != NULL; \
 	     dev = rte_dev_iterator_next(it))
 
-#ifdef __cplusplus
-}
-#endif
-
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * It registers the callback for the specific device.
  * Multiple callbacks can be registered at the same time.
  *
@@ -343,16 +384,12 @@ rte_dev_iterator_next(struct rte_dev_iterator *it);
  *  - On success, zero.
  *  - On failure, a negative value.
  */
-__rte_experimental
 int
 rte_dev_event_callback_register(const char *device_name,
 				rte_dev_event_cb_fn cb_fn,
 				void *cb_arg);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * It unregisters the callback according to the specified device.
  *
  * @param device_name
@@ -368,16 +405,12 @@ rte_dev_event_callback_register(const char *device_name,
  *  - On success, return the number of callback entities removed.
  *  - On failure, a negative value.
  */
-__rte_experimental
 int
 rte_dev_event_callback_unregister(const char *device_name,
 				  rte_dev_event_cb_fn cb_fn,
 				  void *cb_arg);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * Executes all the user application registered callbacks for
  * the specific device.
  *
@@ -386,64 +419,47 @@ rte_dev_event_callback_unregister(const char *device_name,
  * @param event
  *  the device event type.
  */
-__rte_experimental
 void
 rte_dev_event_callback_process(const char *device_name,
 			       enum rte_dev_event_type event);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * Start the device event monitoring.
  *
  * @return
  *   - On success, zero.
  *   - On failure, a negative value.
  */
-__rte_experimental
 int
 rte_dev_event_monitor_start(void);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * Stop the device event monitoring.
  *
  * @return
  *   - On success, zero.
  *   - On failure, a negative value.
  */
-__rte_experimental
 int
 rte_dev_event_monitor_stop(void);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * Enable hotplug handling for devices.
  *
  * @return
  *   - On success, zero.
  *   - On failure, a negative value.
  */
-__rte_experimental
 int
 rte_dev_hotplug_handle_enable(void);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * Disable hotplug handling for devices.
  *
  * @return
  *   - On success, zero.
  *   - On failure, a negative value.
  */
-__rte_experimental
 int
 rte_dev_hotplug_handle_disable(void);
 
@@ -467,7 +483,6 @@ rte_dev_hotplug_handle_disable(void);
  *	0 if mapping was successful.
  *	Negative value and rte_errno is set otherwise.
  */
-__rte_experimental
 int
 rte_dev_dma_map(struct rte_device *dev, void *addr, uint64_t iova, size_t len);
 
@@ -491,9 +506,12 @@ rte_dev_dma_map(struct rte_device *dev, void *addr, uint64_t iova, size_t len);
  *	0 if un-mapping was successful.
  *	Negative value and rte_errno is set otherwise.
  */
-__rte_experimental
 int
 rte_dev_dma_unmap(struct rte_device *dev, void *addr, uint64_t iova,
 		  size_t len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _RTE_DEV_H_ */

@@ -139,6 +139,8 @@ class CTRexGeneral_Test(unittest.TestCase):
 
         cls.router            = CTRexScenario.router
 
+    def get_tst_name(self):
+        return self.id().split(".")[-1]
 
     def get_elk_obj (self):
         obj=trex_scenario.copy_elk_info ()
@@ -571,6 +573,17 @@ class CTRexGeneral_Test(unittest.TestCase):
             },
 
             'net_i40e_vf': {
+                'rate_percent': 20,
+                'rate_percent_soft': 1,
+                'total_pkts': 1000,
+                'rate_latency': 1,
+                'latency_9k_enable': True,
+                'latency_9k_max_average': 300,
+                'latency_9k_max_latency': 750,
+                'no_vlan_even_in_software_mode': True,
+            },
+
+            'net_iavf': {
                 'rate_percent': 20,
                 'rate_percent_soft': 1,
                 'total_pkts': 1000,

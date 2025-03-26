@@ -48,6 +48,9 @@
 #define I40E_MAX_VF               128
 /*flag of no loopback*/
 #define I40E_AQ_LB_MODE_NONE	  0x0
+#define I40E_AQ_LB_MODE_EN	  0x01
+#define I40E_AQ_LB_MAC		  0x01
+#define I40E_AQ_LB_MAC_LOCAL_X722 0x04
 /*
  * vlan_id is a 12 bit number.
  * The VFTA array is actually a 4096 bit array, 128 of 32bit elements.
@@ -275,6 +278,7 @@ enum i40e_flxpld_layer_idx {
 #define I40E_DEFAULT_DCB_APP_PRIO   3
 
 #define I40E_FDIR_PRG_PKT_CNT       128
+#define I40E_FDIR_ID_BIT_SHIFT	    13
 
 /*
  * Struct to store flow created.
@@ -1109,6 +1113,10 @@ struct i40e_vf_msg_cfg {
 	uint32_t ignore_second;
 };
 
+struct i40e_mbuf_stats {
+	uint64_t tx_pkt_errors;
+};
+
 /*
  * Structure to store private data specific for PF instance.
  */
@@ -1123,6 +1131,7 @@ struct i40e_pf {
 
 	struct i40e_hw_port_stats stats_offset;
 	struct i40e_hw_port_stats stats;
+	struct i40e_mbuf_stats mbuf_stats;
 	u64 rx_err1;	/* rxerr1 */
 	u64 rx_err1_offset;
 
@@ -1192,6 +1201,9 @@ struct i40e_pf {
 	/* Switch Domain Id */
 	uint16_t switch_domain_id;
 
+	/* When firmware > 8.3, the enable flag for outer VLAN processing */
+	bool fw8_3gt;
+
 	struct i40e_vf_msg_cfg vf_msg_cfg;
 	uint64_t prev_rx_bytes;
 	uint64_t prev_tx_bytes;
@@ -1219,69 +1231,13 @@ struct i40e_vsi_vlan_pvid_info {
 	} config;
 };
 
-#ifdef TREX_PATCH
-// support for i40evf
-struct i40e_vf_rx_queues {
-	uint64_t rx_dma_addr;
-	uint32_t rx_ring_len;
-	uint32_t buff_size;
-};
-
-struct i40e_vf_tx_queues {
-	uint64_t tx_dma_addr;
-	uint32_t tx_ring_len;
-};
-
-/*
- * Structure to store private data specific for VF instance.
- */
-struct i40e_vf {
-	struct i40e_adapter *adapter; /* The adapter this VF associate to */
-	struct rte_eth_dev_data *dev_data; /* Pointer to the device data */
-	uint16_t num_queue_pairs;
-	uint16_t max_pkt_len; /* Maximum packet length */
-	bool promisc_unicast_enabled;
-	bool promisc_multicast_enabled;
-
-	rte_spinlock_t cmd_send_lock;
-	uint32_t version_major; /* Major version number */
-	uint32_t version_minor; /* Minor version number */
-	uint16_t promisc_flags; /* Promiscuous setting */
-	uint32_t vlan[I40E_VFTA_SIZE]; /* VLAN bit map */
-
-	/* Multicast addrs */
-	struct rte_ether_addr mc_addrs[I40E_NUM_MACADDR_MAX];
-	uint16_t mc_addrs_num;   /* Multicast mac addresses number */
-
-	/* Event from pf */
-	bool dev_closed;
-	bool link_up;
-	enum virtchnl_link_speed link_speed;
-	bool vf_reset;
-	volatile uint32_t pend_cmd; /* pending command not finished yet */
-	int32_t cmd_retval; /* return value of the cmd response from PF */
-	u16 pend_msg; /* flags indicates events from pf not handled yet */
-	uint8_t *aq_resp; /* buffer to store the adminq response from PF */
-
-	/* VSI info */
-	struct virtchnl_vf_resource *vf_res; /* All VSIs */
-	struct virtchnl_vsi_resource *vsi_res; /* LAN VSI */
-	struct i40e_vsi vsi;
-	uint64_t flags;
-};
-/* I40EVF_DEV_PRIVATE_TO */
-#define I40EVF_DEV_PRIVATE_TO_VF(adapter) \
-	(&((struct i40e_adapter *)adapter)->vf)
-
-
-/* I40E_VF_TO */
-#define I40E_VF_TO_HW(vf) \
-	(&(((struct i40e_vf *)vf)->adapter->hw))
-
-#endif
-
 #define I40E_MAX_PKT_TYPE  256
 #define I40E_FLOW_TYPE_MAX 64
+
+#define I40E_MBUF_CHECK_F_TX_MBUF        (1ULL << 0)
+#define I40E_MBUF_CHECK_F_TX_SIZE        (1ULL << 1)
+#define I40E_MBUF_CHECK_F_TX_SEGMENT     (1ULL << 2)
+#define I40E_MBUF_CHECK_F_TX_OFFLOAD     (1ULL << 3)
 
 /*
  * Structure to store private data for each PF/VF instance.
@@ -1289,22 +1245,19 @@ struct i40e_vf {
 struct i40e_adapter {
 	/* Common for both PF and VF */
 	struct i40e_hw hw;
-#ifdef TREX_PATCH
-//support for i40evf
-	union {
-		struct i40e_pf pf;
-		struct i40e_vf vf;
-	};
-#else
-    /* Specific for PF */
+
+	/* Specific for PF */
 	struct i40e_pf pf;
-#endif
 
 	/* For vector PMD */
 	bool rx_bulk_alloc_allowed;
 	bool rx_vec_allowed;
 	bool tx_simple_allowed;
 	bool tx_vec_allowed;
+
+	uint64_t mbuf_check; /* mbuf check flags. */
+	uint16_t max_pkt_len; /* Maximum packet length */
+	eth_tx_burst_t tx_pkt_burst;
 
 	/* For PTP */
 	struct rte_timecounter systime_tc;
@@ -1391,13 +1344,16 @@ uint64_t i40e_parse_hena(const struct i40e_adapter *adapter, uint64_t flags);
 enum i40e_status_code i40e_fdir_setup_tx_resources(struct i40e_pf *pf);
 enum i40e_status_code i40e_fdir_setup_rx_resources(struct i40e_pf *pf);
 int i40e_fdir_setup(struct i40e_pf *pf);
+
+#ifdef TREX_PATCH
 int trex_i40e_fdir_setup(struct i40e_pf *pf, struct rte_eth_dev *dev);
+int trex_i40e_fdir_configure(struct rte_eth_dev *dev);
+#endif
 void i40e_vsi_enable_queues_intr(struct i40e_vsi *vsi);
 const struct rte_memzone *i40e_memzone_reserve(const char *name,
 					uint32_t len,
 					int socket_id);
 int i40e_fdir_configure(struct rte_eth_dev *dev);
-int trex_i40e_fdir_configure(struct rte_eth_dev *dev);
 void i40e_fdir_rx_proc_enable(struct rte_eth_dev *dev, bool on);
 void i40e_fdir_teardown(struct i40e_pf *pf);
 enum i40e_filter_pctype
@@ -1423,6 +1379,8 @@ void i40e_rxq_info_get(struct rte_eth_dev *dev, uint16_t queue_id,
 	struct rte_eth_rxq_info *qinfo);
 void i40e_txq_info_get(struct rte_eth_dev *dev, uint16_t queue_id,
 	struct rte_eth_txq_info *qinfo);
+void i40e_recycle_rxq_info_get(struct rte_eth_dev *dev, uint16_t queue_id,
+	struct rte_eth_recycle_rxq_info *recycle_rxq_info);
 int i40e_rx_burst_mode_get(struct rte_eth_dev *dev, uint16_t queue_id,
 			   struct rte_eth_burst_mode *mode);
 int i40e_tx_burst_mode_get(struct rte_eth_dev *dev, uint16_t queue_id,
@@ -1498,6 +1456,7 @@ int i40e_pf_calc_configured_queues_num(struct i40e_pf *pf);
 int i40e_pf_reset_rss_reta(struct i40e_pf *pf);
 int i40e_pf_reset_rss_key(struct i40e_pf *pf);
 int i40e_pf_config_rss(struct i40e_pf *pf);
+int i40e_pf_set_source_prune(struct i40e_pf *pf, int on);
 int i40e_set_rss_key(struct i40e_vsi *vsi, uint8_t *key, uint8_t key_len);
 int i40e_set_rss_lut(struct i40e_vsi *vsi, uint8_t *lut, uint16_t lut_size);
 int i40e_vf_representor_init(struct rte_eth_dev *ethdev, void *init_params);
@@ -1559,7 +1518,7 @@ i40e_align_floor(int n)
 {
 	if (n == 0)
 		return 0;
-	return 1 << (sizeof(n) * CHAR_BIT - 1 - __builtin_clz(n));
+	return 1 << (sizeof(n) * CHAR_BIT - 1 - rte_clz32(n));
 }
 
 static inline uint16_t
@@ -1568,7 +1527,7 @@ i40e_calc_itr_interval(bool is_pf, bool is_multi_drv)
 	uint16_t interval = 0;
 
 	if (is_multi_drv) {
-		interval = I40E_QUEUE_ITR_INTERVAL_MAX;
+		interval = I40E_QUEUE_ITR_INTERVAL_DEFAULT;
 	} else {
 		if (is_pf)
 			interval = I40E_QUEUE_ITR_INTERVAL_DEFAULT;

@@ -751,7 +751,7 @@ cnxk_nix_tm_ops_get(struct rte_eth_dev *eth_dev __rte_unused, void *arg)
 
 int
 cnxk_nix_tm_set_queue_rate_limit(struct rte_eth_dev *eth_dev,
-				 uint16_t queue_idx, uint16_t tx_rate_mbps)
+				 uint16_t queue_idx, uint32_t tx_rate_mbps)
 {
 	struct cnxk_eth_dev *dev = cnxk_eth_pmd_priv(eth_dev);
 	uint64_t tx_rate = tx_rate_mbps * (uint64_t)1E6;
@@ -764,6 +764,9 @@ cnxk_nix_tm_set_queue_rate_limit(struct rte_eth_dev *eth_dev,
 
 	if (queue_idx >= eth_dev->data->nb_tx_queues)
 		goto exit;
+
+	if (roc_nix_tm_tree_type_get(nix) == ROC_NIX_TM_PFC)
+		return roc_nix_tm_pfc_rlimit_sq(nix, queue_idx, tx_rate);
 
 	if ((roc_nix_tm_tree_type_get(nix) != ROC_NIX_TM_RLIMIT) &&
 	    eth_dev->data->nb_tx_queues > 1) {

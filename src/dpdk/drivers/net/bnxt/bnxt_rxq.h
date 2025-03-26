@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(c) 2014-2021 Broadcom
+ * Copyright(c) 2014-2023 Broadcom
  * All rights reserved.
  */
 
@@ -40,7 +40,8 @@ struct bnxt_rx_queue {
 	struct bnxt_rx_ring_info	*rx_ring;
 	struct bnxt_cp_ring_info	*cp_ring;
 	struct rte_mbuf			fake_mbuf;
-	rte_atomic64_t		rx_mbuf_alloc_fail;
+	uint64_t			rx_mbuf_alloc_fail;
+	uint8_t				need_realloc;
 	const struct rte_memzone *mz;
 };
 
@@ -65,4 +66,5 @@ int bnxt_rx_queue_stop(struct rte_eth_dev *dev,
 void bnxt_rx_queue_release_mbufs(struct bnxt_rx_queue *rxq);
 int bnxt_need_agg_ring(struct rte_eth_dev *eth_dev);
 void bnxt_free_rxq_mem(struct bnxt_rx_queue *rxq);
+uint64_t bnxt_get_rx_port_offloads(struct bnxt *bp);
 #endif

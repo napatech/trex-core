@@ -364,14 +364,14 @@ esp_outb_tun_init(struct rte_ipsec_sa *sa, const struct rte_ipsec_sa_prm *prm)
 		struct rte_udp_hdr *udph = (struct rte_udp_hdr *)
 				&sa->hdr[prm->tun.hdr_len];
 		sa->hdr_len += sizeof(struct rte_udp_hdr);
-		udph->src_port = prm->ipsec_xform.udp.sport;
-		udph->dst_port = prm->ipsec_xform.udp.dport;
+		udph->src_port = rte_cpu_to_be_16(prm->ipsec_xform.udp.sport);
+		udph->dst_port = rte_cpu_to_be_16(prm->ipsec_xform.udp.dport);
 		udph->dgram_cksum = 0;
 	}
 
 	/* update l2_len and l3_len fields for outbound mbuf */
 	sa->tx_offload.val = rte_mbuf_tx_offload(sa->hdr_l3_off,
-		sa->hdr_len - sa->hdr_l3_off, 0, 0, 0, 0, 0);
+		prm->tun.hdr_len - sa->hdr_l3_off, 0, 0, 0, 0, 0);
 
 	esp_outb_init(sa, sa->hdr_len, prm->ipsec_xform.esn.value);
 }

@@ -60,6 +60,8 @@
 #include "rte_eth_ntacc.h"
 #include "filter_ntacc.h"
 
+#include "nt_compat.h"
+
 /**
 * Napatech version
 */
@@ -1427,8 +1429,6 @@ static int eth_dev_close(struct rte_eth_dev *dev)
   dev->data->dev_private = NULL;
   dev->data->mac_addrs = NULL;
 
-  rte_eth_dev_release_port(dev);
-
   deviceCount--;
   if (deviceCount == 0 && _libnt != NULL) {
     PMD_NTACC_LOG(DEBUG, "Closing dyn lib\n");
@@ -1497,6 +1497,12 @@ static int eth_link_update(struct rte_eth_dev *dev,
     break;
   case NT_LINK_SPEED_100G:
     dev->data->dev_link.link_speed = RTE_ETH_SPEED_NUM_100G;
+    break;
+  case NT_LINK_SPEED_200G:
+    dev->data->dev_link.link_speed = RTE_ETH_SPEED_NUM_200G;
+    break;
+  default:
+    _log_nt_errors(status, "Unsupported lonk speed", __func__);
     break;
   }
   rte_free(pInfo);
@@ -2646,8 +2652,13 @@ static int eth_promiscuous_disable(struct rte_eth_dev *dev)
 }
 
 
-static const uint32_t *_dev_supported_ptypes_get(struct rte_eth_dev *dev __rte_unused)
+static const uint32_t *_dev_supported_ptypes_get(struct rte_eth_dev *dev __rte_unused,
+                                                 size_t *no_of_elements)
 {
+  if (no_of_elements == NULL) {
+    return NULL;
+  }
+
   static const uint32_t ptypes[] = {
     RTE_PTYPE_INNER_L2_ETHER,
     RTE_PTYPE_L2_ETHER,
@@ -2673,6 +2684,9 @@ static const uint32_t *_dev_supported_ptypes_get(struct rte_eth_dev *dev __rte_u
     RTE_PTYPE_TUNNEL_IP,
     RTE_PTYPE_UNKNOWN
   };
+
+  *no_of_elements = sizeof ptypes / sizeof *ptypes - 1;
+
   return ptypes;
 }
 
@@ -2961,6 +2975,12 @@ static int rte_pmd_init_internals(struct rte_pci_device *dev,
       break;
     case NT_LINK_SPEED_100G:
       pmd_link.link_speed = RTE_ETH_SPEED_NUM_100G;
+      break;
+    case NT_LINK_SPEED_200G:
+      pmd_link.link_speed = RTE_ETH_SPEED_NUM_200G;
+      break;
+    default:
+      PMD_NTACC_LOG(ERR, "DPDK Port: %u - Unsupported link speed %u\n", eth_dev->data->port_id, pInfo->u.port_v7.data.speed);
       break;
     }
 

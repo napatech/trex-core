@@ -36,7 +36,7 @@ Newer release notes: link:release_notes.html[link]
 ** Add support for more than one DP core in software mode see link:trex_appendix_software_mode.html[software mode]
 ** Add support for Field Engine dependent variables link:trex_stateless.html#_tutorial_field_engine_dependent_variables[dependent_variables]
 * ASTF interactive - add support for topology link:trex_astf.html#_interactive_mode[interactive_mode]
-* ZMQ: enable hearbeat. This is good for situations that the client and server are remote (e.g. The server at the lab and client GUI at DC)  and a firewall betwean them drop the connection after a long time without keepalive. Another side feature is the ability to set the time-out of the connection for remote connection.
+* ZMQ: enable hearbeat. This is good for situations that the client and server are remote (e.g. The server at the lab and client GUI at DC)  and a firewall between them drop the connection after a long time without keepalive. Another side feature is the ability to set the time-out of the connection for remote connection.
 
 == Release 2.48 ==
 
@@ -78,7 +78,7 @@ trex>stop
 ------------------
  
 * An updated manual with the new features  link:trex_astf.html[astf]
-* ASTF API docomentation is here link:cp_astf_docs/api/client_code.html[python_astf_api] link:trex_astf.html#_tutorial_python_automation_v2_47_and_up[automation]
+* ASTF API documentation is here link:cp_astf_docs/api/client_code.html[python_astf_api] link:trex_astf.html#_tutorial_python_automation_v2_47_and_up[automation]
 * ASTF RPC spec for developers is here link:trex_rpc_server_spec.html#_rpc_commands_astf[rpc]
 * STL: add stream pinning to core see link:trex_stateless.html#_tutorial_core_pinning[core_pinning]
 * ASTF/STL Linux network namespace emulation stacks see link:trex_manual.html#_emulation_stacks[emulation]
@@ -134,7 +134,7 @@ trex>stop
 from trex.stl.api import *
 ----
 
-** For backward compatability old code still works:
+** For backward compatibility old code still works:
 +
 ----
 from trex_stl_lib.api import *
@@ -336,7 +336,7 @@ WARNING: For Mellanox CX-5/4 there is a need to upgrade the distro to CentOs 7.4
 == Release 2.30 ==
 
 * Advance Stateful (ASTF) with scalable TCP support 
-** Support all SFR profile with TCP flows 
+** Support all EMIX profile with TCP flows 
 ** Mellanox driver issue workaround see here link:https://trex-tgn.cisco.com/youtrack/issue/trex-481[trex-481]
 ** Hardening
 ** Add full simulation support using `./astf-sim --full`  see here link:trex_astf.html[ASTF mode] 
@@ -663,7 +663,7 @@ which was released on v2.16
 == Release 2.13 ==
 
 * Significantly improve performance and scale for stateful case with high active flows (70%-300% better)  see here link:trex_manual.html#_more_active_flows[More active flows]
-* Stateful with low active repeatable flows - an optimization was removed, for example `cap2/imix_fast_1g.yaml`. users that want to get this in high performance are adviced to move to Stateles mode. Removing this support improved the common case.
+* Stateful with low active repeatable flows - an optimization was removed, for example `cap2/imix_fast_1g.yaml`. users that want to get this in high performance are adviced to move to Stateless mode. Removing this support improved the common case.
 * Support NAT without IPv4.option and UDP flows- for ASA  link:https://trex-tgn.cisco.com/youtrack/issue/trex-274[trex-274]
 * Scapy server is restart automatically - for future Stateless GUI link:https://trex-tgn.cisco.com/youtrack/issue/trex-291[trex-291]
 * Add minimum ipg for remote pcap link:https://trex-tgn.cisco.com/youtrack/issue/trex-281[trex-281]
@@ -691,7 +691,7 @@ which was released on v2.16
 
 * Improve support for Mellanox ConnectX-4 cards (100/50/25GbE) 
 ** Only CentOs/RedHat 7.2 and up is supported due to OFED issues
-** Improve 64Byte Stateleess performance 
+** Improve 64Byte Stateless performance 
 * Cisco VIC is fully supported 
 * Stateless L2/L3 configuration mode for ports - link:trex_stateless.html#_port_layer_mode_configuration[Port Layer Mode Configuration]
 * Stateless neighboring protocols infra and first protocols support/Python API - link:trex_stateless.html#_neighboring_protocols[Neighboring Protocols]
@@ -799,7 +799,7 @@ See link:trex_manual.html#_configuration_yaml_parameter_of_cfg_option[here] and 
 * DPDK 16.07 
 * ASYNC ZMQ is compressed by default. It improves response time see link:http://trex-tgn.cisco.com/youtrack/issue/trex-232[trex-232] 
 ** You will need to update the GUI
-* Support Ubuntu 16.01 - Stateful serverr is Python 3.0 and Python 3.5 for ZMQ library 
+* Support Ubuntu 16.01 - Stateful server is Python 3.0 and Python 3.5 for ZMQ library 
 * XL710/X710 low latency was improved -  see link:http://trex-tgn.cisco.com/youtrack/issue/trex-214[trex-214] 
 * Support graceful shutdown command 
 * Console -  support L1 BPS  using `-m 10bpsl1` see link:http://trex-tgn.cisco.com/youtrack/issue/trex-230[trex-230] 
@@ -906,7 +906,7 @@ For XL710/X710 there is a need to upgrade the firmware to 5.04 (or later)
 ** Add tx/rx graphs 
 * Python API: add an API for reading events as warning/errors
 * HLTAPI support for per stream stats  
-* support VALN mode for per stream stats for 82599 using `--vlan` switch at server invocation
+* support VLAN mode for per stream stats for 82599 using `--vlan` switch at server invocation
 * A peek into TRex stateless GUI version for evaluation still without many features like packet builder, advance packet builder, per stream stats link:https://www.dropbox.com/s/vs9gojtdc5ewv05/setupCiscoTrex1.96-SNAPSHOT.exe?dl=0[TRex Stateless GUI Download]
 ** Only pcap file packet builder is supported in this version 
 
@@ -1103,7 +1103,7 @@ optional arguments:
   -s SPEEDUP, --speedup SPEEDUP
                         Factor to accelerate the injection. effectively means
                         IPG = IPG / SPEEDUP
-  --force               Set if you want to stop active ports before appyling
+  --force               Set if you want to stop active ports before applying
                         command.
 TRex >push -f cap2/dns.pcap  --port 0 -i 10  
 -------------------
@@ -1236,7 +1236,7 @@ TRex > start -f stl/profiles/udp_1pkt.py -a -m 1mbps
 == Release 1.78  ==
 
 * some clean up in tuple generator 
-* trex stateles console works with trex-mock
+* trex stateless console works with trex-mock
 
 === Fixed issues: ===
 

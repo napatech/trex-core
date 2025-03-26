@@ -194,7 +194,8 @@ sfc_efx_rx_desc_flags_to_packet_type(const unsigned int desc_flags)
 }
 
 static const uint32_t *
-sfc_efx_supported_ptypes_get(__rte_unused uint32_t tunnel_encaps)
+sfc_efx_supported_ptypes_get(__rte_unused uint32_t tunnel_encaps,
+			     size_t *no_of_elements)
 {
 	static const uint32_t ptypes[] = {
 		RTE_PTYPE_L2_ETHER,
@@ -202,9 +203,9 @@ sfc_efx_supported_ptypes_get(__rte_unused uint32_t tunnel_encaps)
 		RTE_PTYPE_L3_IPV6_EXT_UNKNOWN,
 		RTE_PTYPE_L4_TCP,
 		RTE_PTYPE_L4_UDP,
-		RTE_PTYPE_UNKNOWN
 	};
 
+	*no_of_elements = RTE_DIM(ptypes);
 	return ptypes;
 }
 
@@ -654,7 +655,8 @@ struct sfc_dp_rx sfc_efx_rx = {
 	},
 	.features		= SFC_DP_RX_FEAT_INTR,
 	.dev_offload_capa	= RTE_ETH_RX_OFFLOAD_CHECKSUM |
-				  RTE_ETH_RX_OFFLOAD_RSS_HASH,
+				  RTE_ETH_RX_OFFLOAD_RSS_HASH |
+				  RTE_ETH_RX_OFFLOAD_KEEP_CRC,
 	.queue_offload_capa	= RTE_ETH_RX_OFFLOAD_SCATTER,
 	.qsize_up_rings		= sfc_efx_rx_qsize_up_rings,
 	.qcreate		= sfc_efx_rx_qcreate,
@@ -938,6 +940,12 @@ sfc_rx_get_offload_mask(struct sfc_adapter *sa)
 	if (encp->enc_tunnel_encapsulations_supported == 0)
 		no_caps |= RTE_ETH_RX_OFFLOAD_OUTER_IPV4_CKSUM;
 
+	if (encp->enc_rx_include_fcs_supported == 0)
+		no_caps |= RTE_ETH_RX_OFFLOAD_KEEP_CRC;
+
+	if (encp->enc_rx_vlan_stripping_supported == 0)
+		no_caps |= RTE_ETH_RX_OFFLOAD_VLAN_STRIP;
+
 	return ~no_caps;
 }
 
@@ -1081,7 +1089,11 @@ sfc_rx_mb_pool_buf_size(struct sfc_adapter *sa, struct rte_mempool *mb_pool)
 		buf_size = EFX_P2ALIGN(uint32_t, buf_size, nic_align_end);
 	}
 
-	return buf_size;
+	/*
+	 * Buffer length field of a Rx descriptor may not be wide
+	 * enough to store a 16-bit data count taken from an mbuf.
+	 */
+	return MIN(buf_size, encp->enc_rx_dma_desc_size_max);
 }
 
 int
@@ -1105,6 +1117,7 @@ sfc_rx_qinit(struct sfc_adapter *sa, sfc_sw_index_t sw_index,
 	struct sfc_rxq *rxq;
 	struct sfc_dp_rx_qcreate_info info;
 	struct sfc_dp_rx_hw_limits hw_limits;
+	struct sfc_port *port = &sa->port;
 	uint16_t rx_free_thresh;
 	const char *error;
 
@@ -1186,8 +1199,11 @@ sfc_rx_qinit(struct sfc_adapter *sa, sfc_sw_index_t sw_index,
 		rxq_info->type_flags |= EFX_RXQ_FLAG_USER_FLAG;
 
 	if ((sa->negotiated_rx_metadata & RTE_ETH_RX_METADATA_USER_MARK) != 0 ||
-	    sfc_flow_tunnel_is_active(sa))
+	    sfc_ft_is_active(sa))
 		rxq_info->type_flags |= EFX_RXQ_FLAG_USER_MARK;
+
+	if (port->vlan_strip)
+		rxq_info->type_flags |= EFX_RXQ_FLAG_VLAN_STRIPPED_TCI;
 
 	rc = sfc_ev_qinit(sa, SFC_EVQ_TYPE_RX, sw_index,
 			  evq_entries, socket_id, &evq);
@@ -1221,6 +1237,12 @@ sfc_rx_qinit(struct sfc_adapter *sa, sfc_sw_index_t sw_index,
 	else
 		rxq_info->rxq_flags = 0;
 
+	if (rxq_info->type_flags & EFX_RXQ_FLAG_INGRESS_MPORT)
+		rxq_info->rxq_flags |= SFC_RXQ_FLAG_INGRESS_MPORT;
+
+	if (rxq_info->type_flags & EFX_RXQ_FLAG_VLAN_STRIPPED_TCI)
+		rxq_info->rxq_flags |= SFC_RXQ_FLAG_VLAN_STRIPPED_TCI;
+
 	rxq->buf_size = buf_size;
 
 	rc = sfc_dma_alloc(sa, "rxq", sw_index, EFX_NIC_DMA_ADDR_RX_RING,
@@ -1237,7 +1259,7 @@ sfc_rx_qinit(struct sfc_adapter *sa, sfc_sw_index_t sw_index,
 	info.batch_max = encp->enc_rx_batch_max;
 	info.prefix_size = encp->enc_rx_prefix_size;
 
-	if (sfc_flow_tunnel_is_active(sa))
+	if (sfc_ft_is_active(sa))
 		info.user_mark_mask = SFC_FT_USER_MARK_MASK;
 	else
 		info.user_mark_mask = UINT32_MAX;

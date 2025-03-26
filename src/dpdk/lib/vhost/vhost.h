@@ -7,13 +7,13 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
-#include <sys/types.h>
+#include <stdlib.h>
 #include <sys/queue.h>
 #include <unistd.h>
-#include <linux/vhost.h>
 #include <linux/virtio_net.h>
 #include <sys/socket.h>
 #include <linux/if.h>
+#include <sys/mman.h>
 
 #include <rte_log.h>
 #include <rte_ether.h>
@@ -37,6 +37,10 @@
 #define VIRTIO_DEV_FEATURES_FAILED ((uint32_t)1 << 4)
 /* Used to indicate that the virtio_net tx code should fill TX ol_flags */
 #define VIRTIO_DEV_LEGACY_OL_FLAGS ((uint32_t)1 << 5)
+/*  Used to indicate the application has requested statistics collection */
+#define VIRTIO_DEV_STATS_ENABLED ((uint32_t)1 << 6)
+/*  Used to indicate the application has requested iommu support */
+#define VIRTIO_DEV_SUPPORT_IOMMU ((uint32_t)1 << 7)
 
 /* Backend value set by guest. */
 #define VIRTIO_DEV_STOPPED -1
@@ -85,6 +89,23 @@
 	for (iter = val; iter < num; iter++)
 #endif
 
+struct virtio_net;
+struct vhost_virtqueue;
+
+typedef void (*vhost_iotlb_remove_notify)(uint64_t addr, uint64_t off, uint64_t size);
+
+typedef int (*vhost_iotlb_miss_cb)(struct virtio_net *dev, uint64_t iova, uint8_t perm);
+
+typedef int (*vhost_vring_inject_irq_cb)(struct virtio_net *dev, struct vhost_virtqueue *vq);
+/**
+ * Structure that contains backend-specific ops.
+ */
+struct vhost_backend_ops {
+	vhost_iotlb_remove_notify iotlb_remove_notify;
+	vhost_iotlb_miss_cb iotlb_miss;
+	vhost_vring_inject_irq_cb inject_irq;
+};
+
 /**
  * Structure contains buffer address, length and descriptor index
  * from vring to do scatter RX.
@@ -119,6 +140,28 @@ struct vring_used_elem_packed {
 	uint16_t flags;
 	uint32_t len;
 	uint32_t count;
+};
+
+/**
+ * Virtqueue statistics
+ */
+struct virtqueue_stats {
+	uint64_t packets;
+	uint64_t bytes;
+	uint64_t multicast;
+	uint64_t broadcast;
+	/* Size bins in array as RFC 2819, undersized [0], 64 [1], etc */
+	uint64_t size_bins[8];
+	uint64_t iotlb_hits;
+	uint64_t iotlb_misses;
+	uint64_t inflight_submitted;
+	uint64_t inflight_completed;
+	uint64_t mbuf_alloc_failed;
+	uint64_t guest_notifications_suppressed;
+	/* Counters below are atomic, and should be incremented as such. */
+	RTE_ATOMIC(uint64_t) guest_notifications;
+	RTE_ATOMIC(uint64_t) guest_notifications_offloaded;
+	RTE_ATOMIC(uint64_t) guest_notifications_error;
 };
 
 /**
@@ -180,6 +223,7 @@ struct async_inflight_info {
 	struct rte_mbuf *mbuf;
 	uint16_t descs; /* num of descs inflight */
 	uint16_t nr_buffers; /* num of buffers inflight for packed ring */
+	struct virtio_net_hdr nethdr;
 };
 
 struct vhost_async {
@@ -228,7 +272,7 @@ struct vhost_async {
 /**
  * Structure contains variables relevant to RX/TX virtqueues.
  */
-struct vhost_virtqueue {
+struct __rte_cache_aligned vhost_virtqueue {
 	union {
 		struct vring_desc	*desc;
 		struct vring_packed_desc   *desc_packed;
@@ -252,10 +296,11 @@ struct vhost_virtqueue {
 #define VIRTIO_UNINITIALIZED_EVENTFD	(-2)
 
 	bool			enabled;
-	bool			access_ok;
+	/* Protected by vq->access_lock */
+	bool			access_ok __rte_guarded_var;
 	bool			ready;
 
-	rte_spinlock_t		access_lock;
+	rte_rwlock_t		access_lock;
 
 
 	union {
@@ -280,16 +325,14 @@ struct vhost_virtqueue {
 	struct log_cache_entry	*log_cache;
 
 	rte_rwlock_t	iotlb_lock;
-	rte_rwlock_t	iotlb_pending_lock;
-	struct rte_mempool *iotlb_pool;
-	TAILQ_HEAD(, vhost_iotlb_entry) iotlb_list;
-	TAILQ_HEAD(, vhost_iotlb_entry) iotlb_pending_list;
-	int				iotlb_cache_nr;
 
 	/* Used to notify the guest (trigger interrupt) */
 	int			callfd;
 	/* Currently unused as polling mode is enabled */
 	int			kickfd;
+
+	/* Index of this vq in dev->virtqueue[] */
+	uint32_t		index;
 
 	/* inflight share memory info */
 	union {
@@ -299,13 +342,16 @@ struct vhost_virtqueue {
 	struct rte_vhost_resubmit_info *resubmit_inflight;
 	uint64_t		global_counter;
 
-	struct vhost_async	*async;
+	struct vhost_async	*async __rte_guarded_var;
 
 	int			notif_enable;
 #define VIRTIO_UNINITIALIZED_NOTIF	(-1)
 
 	struct vhost_vring_addr ring_addrs;
-} __rte_cache_aligned;
+	struct virtqueue_stats	stats;
+
+	RTE_ATOMIC(bool) irq_pending;
+};
 
 /* Virtio device status as per Virtio specification */
 #define VIRTIO_DEVICE_STATUS_RESET		0x00
@@ -397,12 +443,8 @@ struct vring_packed_desc_event {
 #define VIRTIO_NET_SUPPORTED_FEATURES ((1ULL << VIRTIO_NET_F_MRG_RXBUF) | \
 				(1ULL << VIRTIO_F_ANY_LAYOUT) | \
 				(1ULL << VIRTIO_NET_F_CTRL_VQ) | \
-				(1ULL << VIRTIO_NET_F_CTRL_RX) | \
-				(1ULL << VIRTIO_NET_F_GUEST_ANNOUNCE) | \
 				(1ULL << VIRTIO_NET_F_MQ)      | \
 				(1ULL << VIRTIO_F_VERSION_1)   | \
-				(1ULL << VHOST_F_LOG_ALL)      | \
-				(1ULL << VHOST_USER_F_PROTOCOL_FEATURES) | \
 				(1ULL << VIRTIO_NET_F_GSO) | \
 				(1ULL << VIRTIO_NET_F_HOST_TSO4) | \
 				(1ULL << VIRTIO_NET_F_HOST_TSO6) | \
@@ -416,10 +458,8 @@ struct vring_packed_desc_event {
 				(1ULL << VIRTIO_NET_F_GUEST_ECN) | \
 				(1ULL << VIRTIO_RING_F_INDIRECT_DESC) | \
 				(1ULL << VIRTIO_RING_F_EVENT_IDX) | \
-				(1ULL << VIRTIO_NET_F_MTU)  | \
 				(1ULL << VIRTIO_F_IN_ORDER) | \
-				(1ULL << VIRTIO_F_IOMMU_PLATFORM) | \
-				(1ULL << VIRTIO_F_RING_PACKED))
+				(1ULL << VIRTIO_F_IOMMU_PLATFORM))
 
 
 struct guest_page {
@@ -439,7 +479,7 @@ struct inflight_mem_info {
  * Device structure contains all configuration information relating
  * to the device.
  */
-struct virtio_net {
+struct __rte_cache_aligned virtio_net {
 	/* Frontend (QEMU) memory and memory region information */
 	struct rte_vhost_memory	*mem;
 	uint64_t		features;
@@ -448,13 +488,22 @@ struct virtio_net {
 	uint32_t		flags;
 	uint16_t		vhost_hlen;
 	/* to tell if we need broadcast rarp packet */
-	int16_t			broadcast_rarp;
+	RTE_ATOMIC(int16_t)	broadcast_rarp;
 	uint32_t		nr_vring;
 	int			async_copy;
 
 	int			extbuf;
 	int			linearbuf;
 	struct vhost_virtqueue	*virtqueue[VHOST_MAX_QUEUE_PAIRS * 2];
+
+	rte_rwlock_t	iotlb_pending_lock;
+	struct vhost_iotlb_entry *iotlb_pool;
+	TAILQ_HEAD(, vhost_iotlb_entry) iotlb_list;
+	TAILQ_HEAD(, vhost_iotlb_entry) iotlb_pending_list;
+	int				iotlb_cache_nr;
+	rte_spinlock_t	iotlb_free_lock;
+	SLIST_HEAD(, vhost_iotlb_entry) iotlb_free_list;
+
 	struct inflight_mem_info *inflight_info;
 #define IF_NAME_SZ (PATH_MAX > IFNAMSIZ ? PATH_MAX : IFNAMSIZ)
 	char			ifname[IF_NAME_SZ];
@@ -471,11 +520,15 @@ struct virtio_net {
 	uint32_t		max_guest_pages;
 	struct guest_page       *guest_pages;
 
-	int			slave_req_fd;
-	rte_spinlock_t		slave_req_lock;
+	int			backend_req_fd;
+	rte_spinlock_t		backend_req_lock;
 
 	int			postcopy_ufd;
 	int			postcopy_listening;
+	int			vduse_ctrl_fd;
+	int			vduse_dev_fd;
+
+	struct vhost_virtqueue	*cvq;
 
 	struct rte_vdpa_device *vdpa_dev;
 
@@ -483,7 +536,19 @@ struct virtio_net {
 	void			*extern_data;
 	/* pre and post vhost user message handlers for the device */
 	struct rte_vhost_user_extern_ops extern_ops;
-} __rte_cache_aligned;
+
+	struct vhost_backend_ops *backend_ops;
+};
+
+static inline void
+vq_assert_lock__(struct virtio_net *dev, struct vhost_virtqueue *vq, const char *func)
+	__rte_assert_exclusive_lock(&vq->access_lock)
+{
+	if (unlikely(!rte_rwlock_write_is_locked(&vq->access_lock)))
+		rte_panic("VHOST_CONFIG: (%s) %s() called without access lock taken.\n",
+			dev->ifname, func);
+}
+#define vq_assert_lock(dev, vq) vq_assert_lock__(dev, vq, __func__)
 
 static __rte_always_inline bool
 vq_is_packed(struct virtio_net *dev)
@@ -494,7 +559,8 @@ vq_is_packed(struct virtio_net *dev)
 static inline bool
 desc_is_avail(struct vring_packed_desc *desc, bool wrap_counter)
 {
-	uint16_t flags = __atomic_load_n(&desc->flags, __ATOMIC_ACQUIRE);
+	uint16_t flags = rte_atomic_load_explicit((unsigned short __rte_atomic *)&desc->flags,
+		rte_memory_order_acquire);
 
 	return wrap_counter == !!(flags & VRING_DESC_F_AVAIL) &&
 		wrap_counter != !!(flags & VRING_DESC_F_USED);
@@ -525,12 +591,15 @@ void __vhost_log_cache_write(struct virtio_net *dev,
 		uint64_t addr, uint64_t len);
 void __vhost_log_cache_write_iova(struct virtio_net *dev,
 		struct vhost_virtqueue *vq,
-		uint64_t iova, uint64_t len);
+		uint64_t iova, uint64_t len)
+	__rte_shared_locks_required(&vq->iotlb_lock);
 void __vhost_log_cache_sync(struct virtio_net *dev,
 		struct vhost_virtqueue *vq);
+
 void __vhost_log_write(struct virtio_net *dev, uint64_t addr, uint64_t len);
 void __vhost_log_write_iova(struct virtio_net *dev, struct vhost_virtqueue *vq,
-			    uint64_t iova, uint64_t len);
+			    uint64_t iova, uint64_t len)
+	__rte_shared_locks_required(&vq->iotlb_lock);
 
 static __rte_always_inline void
 vhost_log_write(struct virtio_net *dev, uint64_t addr, uint64_t len)
@@ -580,6 +649,7 @@ vhost_log_used_vring(struct virtio_net *dev, struct vhost_virtqueue *vq,
 static __rte_always_inline void
 vhost_log_cache_write_iova(struct virtio_net *dev, struct vhost_virtqueue *vq,
 			   uint64_t iova, uint64_t len)
+	__rte_shared_locks_required(&vq->iotlb_lock)
 {
 	if (likely(!(dev->features & (1ULL << VHOST_F_LOG_ALL))))
 		return;
@@ -593,6 +663,7 @@ vhost_log_cache_write_iova(struct virtio_net *dev, struct vhost_virtqueue *vq,
 static __rte_always_inline void
 vhost_log_write_iova(struct virtio_net *dev, struct vhost_virtqueue *vq,
 			   uint64_t iova, uint64_t len)
+	__rte_shared_locks_required(&vq->iotlb_lock)
 {
 	if (likely(!(dev->features & (1ULL << VHOST_F_LOG_ALL))))
 		return;
@@ -604,17 +675,15 @@ vhost_log_write_iova(struct virtio_net *dev, struct vhost_virtqueue *vq,
 }
 
 extern int vhost_config_log_level;
+#define RTE_LOGTYPE_VHOST_CONFIG vhost_config_log_level
 extern int vhost_data_log_level;
+#define RTE_LOGTYPE_VHOST_DATA vhost_data_log_level
 
-#define VHOST_LOG_CONFIG(level, fmt, args...)			\
-	rte_log(RTE_LOG_ ## level, vhost_config_log_level,	\
-		"VHOST_CONFIG: " fmt, ##args)
+#define VHOST_CONFIG_LOG(prefix, level, ...) \
+	RTE_LOG_LINE_PREFIX(level, VHOST_CONFIG, "(%s) ", prefix, __VA_ARGS__)
 
-#define VHOST_LOG_DATA(level, fmt, args...) \
-	(void)((RTE_LOG_ ## level <= RTE_LOG_DP_LEVEL) ?	\
-	 rte_log(RTE_LOG_ ## level,  vhost_data_log_level,	\
-		"VHOST_DATA : " fmt, ##args) :			\
-	 0)
+#define VHOST_DATA_LOG(prefix, level, ...) \
+	RTE_LOG_DP_LINE_PREFIX(level, VHOST_DATA, "(%s) ", prefix, __VA_ARGS__)
 
 #ifdef RTE_LIBRTE_VHOST_DEBUG
 #define VHOST_MAX_PRINT_BUFF 6072
@@ -633,7 +702,7 @@ extern int vhost_data_log_level;
 	} \
 	snprintf(packet + strnlen(packet, VHOST_MAX_PRINT_BUFF), VHOST_MAX_PRINT_BUFF - strnlen(packet, VHOST_MAX_PRINT_BUFF), "\n"); \
 	\
-	VHOST_LOG_DATA(DEBUG, "%s", packet); \
+	RTE_LOG_DP(DEBUG, VHOST_DATA, "(%s) %s", dev->ifname, packet); \
 } while (0)
 #else
 #define PRINT_PACKET(device, addr, size, header) do {} while (0)
@@ -755,17 +824,19 @@ hva_to_gpa(struct virtio_net *dev, uint64_t vva, uint64_t len)
 static __rte_always_inline struct virtio_net *
 get_device(int vid)
 {
-	struct virtio_net *dev = vhost_devices[vid];
+	struct virtio_net *dev = NULL;
+
+	if (likely(vid >= 0 && vid < RTE_MAX_VHOST_DEVICE))
+		dev = vhost_devices[vid];
 
 	if (unlikely(!dev)) {
-		VHOST_LOG_CONFIG(ERR,
-			"(%d) device not found.\n", vid);
+		VHOST_CONFIG_LOG("device", ERR, "(%d) device not found.", vid);
 	}
 
 	return dev;
 }
 
-int vhost_new_device(void);
+int vhost_new_device(struct vhost_backend_ops *ops);
 void cleanup_device(struct virtio_net *dev, int destroy);
 void reset_device(struct virtio_net *dev);
 void vhost_destroy_device(int);
@@ -780,7 +851,8 @@ int alloc_vring_queue(struct virtio_net *dev, uint32_t vring_idx);
 void vhost_attach_vdpa_device(int vid, struct rte_vdpa_device *dev);
 
 void vhost_set_ifname(int, const char *if_name, unsigned int if_len);
-void vhost_setup_virtio_net(int vid, bool enable, bool legacy_ol_flags);
+void vhost_setup_virtio_net(int vid, bool enable, bool legacy_ol_flags, bool stats_enabled,
+	bool support_iommu);
 void vhost_enable_extbuf(int vid);
 void vhost_enable_linearbuf(int vid);
 int vhost_enable_guest_notification(struct virtio_net *dev,
@@ -796,18 +868,25 @@ struct rte_vhost_device_ops const *vhost_driver_callback_get(const char *path);
 void vhost_backend_cleanup(struct virtio_net *dev);
 
 uint64_t __vhost_iova_to_vva(struct virtio_net *dev, struct vhost_virtqueue *vq,
-			uint64_t iova, uint64_t *len, uint8_t perm);
+			uint64_t iova, uint64_t *len, uint8_t perm)
+	__rte_shared_locks_required(&vq->iotlb_lock);
 void *vhost_alloc_copy_ind_table(struct virtio_net *dev,
 			struct vhost_virtqueue *vq,
-			uint64_t desc_addr, uint64_t desc_len);
-int vring_translate(struct virtio_net *dev, struct vhost_virtqueue *vq);
+			uint64_t desc_addr, uint64_t desc_len)
+	__rte_shared_locks_required(&vq->iotlb_lock);
+int vring_translate(struct virtio_net *dev, struct vhost_virtqueue *vq)
+	__rte_exclusive_locks_required(&vq->access_lock)
+	__rte_shared_locks_required(&vq->iotlb_lock);
 uint64_t translate_log_addr(struct virtio_net *dev, struct vhost_virtqueue *vq,
-		uint64_t log_addr);
-void vring_invalidate(struct virtio_net *dev, struct vhost_virtqueue *vq);
+		uint64_t log_addr)
+	__rte_shared_locks_required(&vq->iotlb_lock);
+void vring_invalidate(struct virtio_net *dev, struct vhost_virtqueue *vq)
+	__rte_exclusive_locks_required(&vq->access_lock);
 
 static __rte_always_inline uint64_t
 vhost_iova_to_vva(struct virtio_net *dev, struct vhost_virtqueue *vq,
 			uint64_t iova, uint64_t *len, uint8_t perm)
+	__rte_shared_locks_required(&vq->iotlb_lock)
 {
 	if (!(dev->features & (1ULL << VIRTIO_F_IOMMU_PLATFORM)))
 		return rte_vhost_va_from_guest_pa(dev->mem, iova, len);
@@ -833,10 +912,49 @@ vhost_need_event(uint16_t event_idx, uint16_t new_idx, uint16_t old)
 }
 
 static __rte_always_inline void
+vhost_vring_inject_irq(struct virtio_net *dev, struct vhost_virtqueue *vq)
+{
+	bool expected = false;
+
+	if (dev->notify_ops->guest_notify) {
+		if (rte_atomic_compare_exchange_strong_explicit(&vq->irq_pending, &expected, true,
+				  rte_memory_order_release, rte_memory_order_relaxed)) {
+			if (dev->notify_ops->guest_notify(dev->vid, vq->index)) {
+				if (dev->flags & VIRTIO_DEV_STATS_ENABLED)
+					rte_atomic_fetch_add_explicit(
+						&vq->stats.guest_notifications_offloaded,
+						1, rte_memory_order_relaxed);
+				return;
+			}
+
+			/* Offloading failed, fallback to direct IRQ injection */
+			rte_atomic_store_explicit(&vq->irq_pending, false,
+				rte_memory_order_release);
+		} else {
+			vq->stats.guest_notifications_suppressed++;
+			return;
+		}
+	}
+
+	if (dev->backend_ops->inject_irq(dev, vq)) {
+		if (dev->flags & VIRTIO_DEV_STATS_ENABLED)
+			rte_atomic_fetch_add_explicit(&vq->stats.guest_notifications_error,
+				1, rte_memory_order_relaxed);
+		return;
+	}
+
+	if (dev->flags & VIRTIO_DEV_STATS_ENABLED)
+		rte_atomic_fetch_add_explicit(&vq->stats.guest_notifications,
+			1, rte_memory_order_relaxed);
+	if (dev->notify_ops->guest_notified)
+		dev->notify_ops->guest_notified(dev->vid);
+}
+
+static __rte_always_inline void
 vhost_vring_call_split(struct virtio_net *dev, struct vhost_virtqueue *vq)
 {
 	/* Flush used->idx update before we read avail->flags. */
-	rte_atomic_thread_fence(__ATOMIC_SEQ_CST);
+	rte_atomic_thread_fence(rte_memory_order_seq_cst);
 
 	/* Don't kick guest if we don't reach index specified by guest. */
 	if (dev->features & (1ULL << VIRTIO_RING_F_EVENT_IDX)) {
@@ -847,26 +965,17 @@ vhost_vring_call_split(struct virtio_net *dev, struct vhost_virtqueue *vq)
 		vq->signalled_used = new;
 		vq->signalled_used_valid = true;
 
-		VHOST_LOG_DATA(DEBUG, "%s: used_event_idx=%d, old=%d, new=%d\n",
-			__func__,
-			vhost_used_event(vq),
-			old, new);
+		VHOST_DATA_LOG(dev->ifname, DEBUG,
+			"%s: used_event_idx=%d, old=%d, new=%d",
+			__func__, vhost_used_event(vq), old, new);
 
-		if ((vhost_need_event(vhost_used_event(vq), new, old) &&
-					(vq->callfd >= 0)) ||
-				unlikely(!signalled_used_valid)) {
-			eventfd_write(vq->callfd, (eventfd_t) 1);
-			if (dev->notify_ops->guest_notified)
-				dev->notify_ops->guest_notified(dev->vid);
-		}
+		if (vhost_need_event(vhost_used_event(vq), new, old) ||
+				unlikely(!signalled_used_valid))
+			vhost_vring_inject_irq(dev, vq);
 	} else {
 		/* Kick the guest if necessary. */
-		if (!(vq->avail->flags & VRING_AVAIL_F_NO_INTERRUPT)
-				&& (vq->callfd >= 0)) {
-			eventfd_write(vq->callfd, (eventfd_t)1);
-			if (dev->notify_ops->guest_notified)
-				dev->notify_ops->guest_notified(dev->vid);
-		}
+		if (!(vq->avail->flags & VRING_AVAIL_F_NO_INTERRUPT))
+			vhost_vring_inject_irq(dev, vq);
 	}
 }
 
@@ -877,7 +986,7 @@ vhost_vring_call_packed(struct virtio_net *dev, struct vhost_virtqueue *vq)
 	bool signalled_used_valid, kick = false;
 
 	/* Flush used desc update. */
-	rte_atomic_thread_fence(__ATOMIC_SEQ_CST);
+	rte_atomic_thread_fence(rte_memory_order_seq_cst);
 
 	if (!(dev->features & (1ULL << VIRTIO_RING_F_EVENT_IDX))) {
 		if (vq->driver_event->flags !=
@@ -903,7 +1012,7 @@ vhost_vring_call_packed(struct virtio_net *dev, struct vhost_virtqueue *vq)
 		goto kick;
 	}
 
-	rte_atomic_thread_fence(__ATOMIC_ACQUIRE);
+	rte_atomic_thread_fence(rte_memory_order_acquire);
 
 	off_wrap = vq->driver_event->off_wrap;
 	off = off_wrap & ~(1 << 15);
@@ -917,11 +1026,8 @@ vhost_vring_call_packed(struct virtio_net *dev, struct vhost_virtqueue *vq)
 	if (vhost_need_event(off, new, old))
 		kick = true;
 kick:
-	if (kick) {
-		eventfd_write(vq->callfd, (eventfd_t)1);
-		if (dev->notify_ops->guest_notified)
-			dev->notify_ops->guest_notified(dev->vid);
-	}
+	if (kick)
+		vhost_vring_inject_irq(dev, vq);
 }
 
 static __rte_always_inline void
@@ -941,7 +1047,7 @@ restore_mbuf(struct rte_mbuf *m)
 		/* start of buffer is after mbuf structure and priv data */
 
 		m->buf_addr = (char *)m + mbuf_size;
-		m->buf_iova = rte_mempool_virt2iova(m) + mbuf_size;
+		rte_mbuf_iova_set(m, rte_mempool_virt2iova(m) + mbuf_size);
 		m = m->next;
 	}
 }
@@ -957,5 +1063,7 @@ mbuf_is_consumed(struct rte_mbuf *m)
 
 	return true;
 }
+
+void mem_set_dump(struct virtio_net *dev, void *ptr, size_t size, bool enable, uint64_t alignment);
 
 #endif /* _VHOST_NET_CDEV_H_ */

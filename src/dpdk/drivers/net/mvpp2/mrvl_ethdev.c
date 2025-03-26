@@ -9,7 +9,7 @@
 #include <rte_kvargs.h>
 #include <rte_log.h>
 #include <rte_malloc.h>
-#include <rte_bus_vdev.h>
+#include <bus_vdev_driver.h>
 
 #include <fcntl.h>
 #include <linux/ethtool.h>
@@ -193,7 +193,7 @@ static struct {
 static inline int
 mrvl_reserve_bit(int *bitmap, int max)
 {
-	int n = sizeof(*bitmap) * 8 - __builtin_clz(*bitmap);
+	int n = sizeof(*bitmap) * 8 - rte_clz32(*bitmap);
 
 	if (n >= max)
 		return -1;
@@ -415,10 +415,10 @@ mrvl_set_tx_function(struct rte_eth_dev *dev)
 
 	/* Use a simple Tx queue (no offloads, no multi segs) if possible */
 	if (priv->multiseg) {
-		RTE_LOG(INFO, PMD, "Using multi-segment tx callback\n");
+		MRVL_LOG(INFO, "Using multi-segment tx callback");
 		dev->tx_pkt_burst = mrvl_tx_sg_pkt_burst;
 	} else {
-		RTE_LOG(INFO, PMD, "Using single-segment tx callback\n");
+		MRVL_LOG(INFO, "Using single-segment tx callback");
 		dev->tx_pkt_burst = mrvl_tx_pkt_burst;
 	}
 }
@@ -487,11 +487,6 @@ mrvl_dev_configure(struct rte_eth_dev *dev)
 	    dev->data->dev_conf.rxmode.mq_mode != RTE_ETH_MQ_RX_RSS) {
 		MRVL_LOG(INFO, "Unsupported rx multi queue mode %d",
 			dev->data->dev_conf.rxmode.mq_mode);
-		return -EINVAL;
-	}
-
-	if (dev->data->dev_conf.rxmode.split_hdr_size) {
-		MRVL_LOG(INFO, "Split headers not supported");
 		return -EINVAL;
 	}
 
@@ -858,7 +853,7 @@ mrvl_dev_start(struct rte_eth_dev *dev)
 	}
 
 	/*
-	 * In case there are some some stale uc/mc mac addresses flush them
+	 * In case there are some stale uc/mc mac addresses flush them
 	 * here. It cannot be done during mrvl_dev_close() as port information
 	 * is already gone at that point (due to pp2_ppio_deinit() in
 	 * mrvl_dev_stop()).
@@ -955,6 +950,9 @@ mrvl_dev_start(struct rte_eth_dev *dev)
 		if (ret)
 			goto out;
 	}
+
+	for (i = 0; i < dev->data->nb_rx_queues; i++)
+		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
 
 	mrvl_flow_init(dev);
 	mrvl_mtr_init(dev);
@@ -1081,6 +1079,13 @@ mrvl_flush_bpool(struct rte_eth_dev *dev)
 static int
 mrvl_dev_stop(struct rte_eth_dev *dev)
 {
+	uint16_t i;
+
+	for (i = 0; i < dev->data->nb_rx_queues; i++)
+		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
+	for (i = 0; i < dev->data->nb_tx_queues; i++)
+		dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
+
 	return mrvl_dev_set_link_down(dev);
 }
 
@@ -1626,13 +1631,14 @@ mrvl_xstats_get(struct rte_eth_dev *dev,
 {
 	struct mrvl_priv *priv = dev->data->dev_private;
 	struct pp2_ppio_statistics ppio_stats;
-	unsigned int i;
+	unsigned int i, count;
 
-	if (!stats)
-		return 0;
+	count = RTE_DIM(mrvl_xstats_tbl);
+	if (n < count)
+		return count;
 
 	pp2_ppio_get_statistics(priv->ppio, &ppio_stats, 0);
-	for (i = 0; i < n && i < RTE_DIM(mrvl_xstats_tbl); i++) {
+	for (i = 0; i < count; i++) {
 		uint64_t val;
 
 		if (mrvl_xstats_tbl[i].size == sizeof(uint32_t))
@@ -1648,7 +1654,7 @@ mrvl_xstats_get(struct rte_eth_dev *dev,
 		stats[i].value = val;
 	}
 
-	return n;
+	return count;
 }
 
 /**
@@ -1758,7 +1764,8 @@ mrvl_dev_infos_get(struct rte_eth_dev *dev,
  *   Const pointer to the table with supported packet types.
  */
 static const uint32_t *
-mrvl_dev_supported_ptypes_get(struct rte_eth_dev *dev __rte_unused)
+mrvl_dev_supported_ptypes_get(struct rte_eth_dev *dev __rte_unused,
+			      size_t *no_of_elements)
 {
 	static const uint32_t ptypes[] = {
 		RTE_PTYPE_L2_ETHER,
@@ -1771,9 +1778,10 @@ mrvl_dev_supported_ptypes_get(struct rte_eth_dev *dev __rte_unused)
 		RTE_PTYPE_L3_IPV6_EXT,
 		RTE_PTYPE_L2_ETHER_ARP,
 		RTE_PTYPE_L4_TCP,
-		RTE_PTYPE_L4_UDP
+		RTE_PTYPE_L4_UDP,
 	};
 
+	*no_of_elements = RTE_DIM(ptypes);
 	return ptypes;
 }
 
@@ -2970,8 +2978,7 @@ mrvl_tx_sg_pkt_burst(void *txq, struct rte_mbuf **tx_pkts,
 		 */
 		if (nb_segs > PP2_PPIO_DESC_NUM_FRAGS) {
 			total_descs -= nb_segs;
-			RTE_LOG(ERR, PMD,
-				"Too many segments. Packet won't be sent.\n");
+			MRVL_LOG(ERR, "Too many segments. Packet won't be sent.");
 			break;
 		}
 

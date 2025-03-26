@@ -17,9 +17,8 @@
 #define _RTE_ATOMIC_X86_64_H_
 
 #include <stdint.h>
+
 #include <rte_common.h>
-#include <rte_compat.h>
-#include <rte_atomic.h>
 
 /*------------------------- 64 bit atomic operations -------------------------*/
 
@@ -183,7 +182,6 @@ static inline void rte_atomic64_clear(rte_atomic64_t *v)
 
 /*------------------------ 128 bit atomic operations -------------------------*/
 
-__rte_experimental
 static inline int
 rte_atomic128_cmp_exchange(rte_int128_t *dst,
 			   rte_int128_t *exp,

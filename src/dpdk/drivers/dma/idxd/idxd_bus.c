@@ -8,9 +8,11 @@
 #include <sys/mman.h>
 #include <libgen.h>
 
-#include <rte_bus.h>
+#include <bus_driver.h>
+#include <dev_driver.h>
 #include <rte_devargs.h>
 #include <rte_eal.h>
+#include <rte_memory.h>
 #include <rte_log.h>
 #include <rte_dmadev_pmd.h>
 #include <rte_string_fns.h>
@@ -259,9 +261,15 @@ static int
 is_for_this_process_use(struct rte_dsa_device *dev, const char *name)
 {
 	char *runtime_dir = strdup(rte_eal_get_runtime_dir());
-	char *prefix = basename(runtime_dir);
-	int prefixlen = strlen(prefix);
 	int retval = 0;
+	int prefixlen;
+	char *prefix;
+
+	if (runtime_dir == NULL)
+		return retval;
+
+	prefix = basename(runtime_dir);
+	prefixlen = strlen(prefix);
 
 	if (strncmp(name, "dpdk_", 5) == 0)
 		retval = 1;
@@ -321,7 +329,7 @@ dsa_scan(void)
 
 	while ((wq = readdir(dev_dir)) != NULL) {
 		struct rte_dsa_device *dev;
-		int numa_node = -1;
+		int numa_node = SOCKET_ID_ANY;
 
 		if (strncmp(wq->d_name, "wq", 2) != 0)
 			continue;
@@ -333,6 +341,10 @@ dsa_scan(void)
 		IDXD_PMD_DEBUG("%s(): found %s/%s", __func__, path, wq->d_name);
 
 		dev = malloc(sizeof(*dev));
+		if (dev == NULL) {
+			closedir(dev_dir);
+			return -ENOMEM;
+		}
 		if (dsa_addr_parse(wq->d_name, &dev->addr) < 0) {
 			IDXD_PMD_ERR("Error parsing WQ name: %s", wq->d_name);
 			free(dev);

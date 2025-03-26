@@ -140,7 +140,6 @@ typedef struct cmdline_inst cmdline_parse_inst_t;
 /**
  * A context is identified by its name, and contains a list of
  * instruction
- *
  */
 typedef cmdline_parse_inst_t *cmdline_parse_ctx_t;
 
@@ -149,10 +148,20 @@ typedef cmdline_parse_inst_t *cmdline_parse_ctx_t;
  * argument buf must ends with "\n\0". The function returns
  * CMDLINE_PARSE_AMBIGUOUS, CMDLINE_PARSE_NOMATCH or
  * CMDLINE_PARSE_BAD_ARGS on error. Else it calls the associated
- * function (defined in the context) and returns 0
- * (CMDLINE_PARSE_SUCCESS).
+ * function (defined in the context) and returns the parsed line length (>= 0).
  */
 int cmdline_parse(struct cmdline *cl, const char *buf);
+
+/**
+ * Try to parse a buffer according to the specified context, but do not
+ * perform any function calls if parse is successful.
+ *
+ * The argument buf must ends with "\n\0".
+ * The function returns CMDLINE_PARSE_AMBIGUOUS, CMDLINE_PARSE_NOMATCH or
+ * CMDLINE_PARSE_BAD_ARGS on error and returns the parsed line length (>=0)
+ * on successful parse.
+ */
+int cmdline_parse_check(struct cmdline *cl, const char *buf);
 
 /**
  * complete() must be called with *state==0 (try to complete) or

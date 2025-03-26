@@ -26,6 +26,30 @@ ifdef::backend-docbook[]
 
 endif::backend-docbook[]
 
+
+
+== Release 3.06 ==
+
+* Fixed net_bonding breakage caused by the upgrade to DPDK 24.03.
+** Updated net_bonding API terminology in TRex configuration from "slave" to "member".
+* Add libarchive to the default package 
+
+
+== Release 3.05 ==
+
+* Upgrade to DPDK 24.03 for new Cloud drivers 
+** add mana driver 
+
+
+== Release 3.04 ==
+
+* Upgrade to DPDK 23.03 for new Cloud drivers 
+** iavf works now for i40evf 
+
+== Release 3.03 ==
+
+* minor bug fixes 
+
 == Release 3.02 ==
 * minor change, build issue with 3.01 for mlx5 driver 
 
@@ -426,7 +450,7 @@ Minor version
 * ASTF keep-alive packet is with ACK bit on
 * STL 
 ** fix Python exception in case of a huge latency packets drop 
-** Support Intel X722 NIC with new firware 
+** Support Intel X722 NIC with new firmware 
 
 == Release 2.60 ==
 

@@ -3,22 +3,29 @@
  */
 
 #include <errno.h>
-#include <net/if.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
+#ifndef RTE_EXEC_ENV_WINDOWS
+#include <net/if.h>
+#include <sys/uio.h>
+#endif
+
+#include <bus_driver.h>
 #include <rte_common.h>
 #include <rte_cycles.h>
-#include <rte_dev.h>
+#include <dev_driver.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
 #include <rte_mbuf.h>
+#include <rte_os_shim.h>
 #include <rte_pcapng.h>
+#include <rte_reciprocal.h>
 #include <rte_time.h>
 
 #include "pcapng_proto.h"
@@ -26,35 +33,85 @@
 /* conversion from DPDK speed to PCAPNG */
 #define PCAPNG_MBPS_SPEED 1000000ull
 
+/* upper bound for section, stats and interface blocks */
+#define PCAPNG_BLKSIZ	2048
+
 /* Format of the capture file handle */
 struct rte_pcapng {
 	int  outfd;		/* output file */
+	unsigned int ports;	/* number of interfaces added */
+	uint64_t offset_ns;	/* ns since 1/1/1970 when initialized */
+	uint64_t tsc_base;	/* TSC when started */
+
 	/* DPDK port id to interface index in file */
 	uint32_t port_index[RTE_MAX_ETHPORTS];
 };
 
-/* For converting TSC cycles to PCAPNG ns format */
-struct pcapng_time {
-	uint64_t ns;
-	uint64_t cycles;
-} pcapng_time;
+#ifdef RTE_EXEC_ENV_WINDOWS
+/*
+ * Windows does not have writev() call.
+ * Emulate this by copying to a new buffer.
+ * The copy is necessary since pcapng needs to be thread-safe
+ * and do atomic write operations.
+ */
 
-RTE_INIT(pcapng_init)
+#define IOV_MAX 128
+struct iovec {
+	void   *iov_base;
+	size_t  iov_len;
+};
+
+static ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 {
-	struct timespec ts;
+	size_t bytes = 0;
+	uint8_t *ptr;
+	void *tmp_buf;
+	ssize_t ret;
+	int i;
 
-	pcapng_time.cycles = rte_get_tsc_cycles();
-	clock_gettime(CLOCK_REALTIME, &ts);
-	pcapng_time.ns = rte_timespec_to_ns(&ts);
+	for (i = 0; i < iovcnt; i++)
+		bytes += iov[i].iov_len;
+
+	if (unlikely(bytes == 0))
+		return 0;
+
+	tmp_buf = malloc(bytes);
+	if (unlikely(tmp_buf == NULL)) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	ptr = tmp_buf;
+	for (i = 0; i < iovcnt; i++) {
+		rte_memcpy(ptr, iov[i].iov_base, iov[i].iov_len);
+		ptr += iov[i].iov_len;
+	}
+
+	ret = write(fd, tmp_buf, bytes);
+	free(tmp_buf);
+	return ret;
 }
 
-/* PCAPNG timestamps are in nanoseconds */
-static uint64_t pcapng_tsc_to_ns(uint64_t cycles)
-{
-	uint64_t delta;
+#define IF_NAMESIZE	16
+/* compatibility wrapper because name is optional */
+#define if_indextoname(ifindex, ifname) NULL
+#endif
 
-	delta = cycles - pcapng_time.cycles;
-	return pcapng_time.ns + (delta * NSEC_PER_SEC) / rte_get_tsc_hz();
+/* Convert from TSC (CPU cycles) to nanoseconds */
+static uint64_t
+pcapng_timestamp(const rte_pcapng_t *self, uint64_t cycles)
+{
+	uint64_t delta, rem, secs, ns;
+	const uint64_t hz = rte_get_tsc_hz();
+
+	delta = cycles - self->tsc_base;
+
+	/* Avoid numeric wraparound by computing seconds first */
+	secs = delta / hz;
+	rem = delta % hz;
+	ns = (rem * NS_PER_S) / hz;
+
+	return secs * NS_PER_S + ns + self->offset_ns;
 }
 
 /* length of option including padding */
@@ -86,9 +143,8 @@ pcapng_section_block(rte_pcapng_t *self,
 {
 	struct pcapng_section_header *hdr;
 	struct pcapng_option *opt;
-	void *buf;
+	uint8_t buf[PCAPNG_BLKSIZ];
 	uint32_t len;
-	ssize_t cc;
 
 	len = sizeof(*hdr);
 	if (hw)
@@ -104,8 +160,7 @@ pcapng_section_block(rte_pcapng_t *self,
 	len += pcapng_optlen(0);
 	len += sizeof(uint32_t);
 
-	buf = calloc(1, len);
-	if (!buf)
+	if (len > sizeof(buf))
 		return -1;
 
 	hdr = (struct pcapng_section_header *)buf;
@@ -139,15 +194,14 @@ pcapng_section_block(rte_pcapng_t *self,
 	/* clone block_length after option */
 	memcpy(opt, &hdr->block_length, sizeof(uint32_t));
 
-	cc = write(self->outfd, buf, len);
-	free(buf);
-
-	return cc;
+	return write(self->outfd, buf, len);
 }
 
 /* Write an interface block for a DPDK port */
-static int
-pcapng_add_interface(rte_pcapng_t *self, uint16_t port)
+int
+rte_pcapng_add_interface(rte_pcapng_t *self, uint16_t port,
+			 const char *ifname, const char *ifdescr,
+			 const char *filter)
 {
 	struct pcapng_interface_block *hdr;
 	struct rte_eth_dev_info dev_info;
@@ -157,8 +211,8 @@ pcapng_add_interface(rte_pcapng_t *self, uint16_t port)
 	struct pcapng_option *opt;
 	const uint8_t tsresol = 9;	/* nanosecond resolution */
 	uint32_t len;
-	void *buf;
-	char ifname[IF_NAMESIZE];
+	uint8_t buf[PCAPNG_BLKSIZ];
+	char ifname_buf[IF_NAMESIZE];
 	char ifhw[256];
 	uint64_t speed = 0;
 
@@ -166,8 +220,14 @@ pcapng_add_interface(rte_pcapng_t *self, uint16_t port)
 		return -1;
 
 	/* make something like an interface name */
-	if (if_indextoname(dev_info.if_index, ifname) == NULL)
-		snprintf(ifname, IF_NAMESIZE, "dpdk:%u", port);
+	if (ifname == NULL) {
+		/* Use kernel name if available */
+		ifname = if_indextoname(dev_info.if_index, ifname_buf);
+		if (ifname == NULL) {
+			snprintf(ifname_buf, IF_NAMESIZE, "dpdk:%u", port);
+			ifname = ifname_buf;
+		}
+	}
 
 	/* make a useful device hardware string */
 	dev = dev_info.device;
@@ -191,18 +251,21 @@ pcapng_add_interface(rte_pcapng_t *self, uint16_t port)
 	len += pcapng_optlen(sizeof(tsresol));	/* timestamp */
 	len += pcapng_optlen(strlen(ifname));	/* ifname */
 
+	if (ifdescr)
+		len += pcapng_optlen(strlen(ifdescr));
 	if (ea)
 		len += pcapng_optlen(RTE_ETHER_ADDR_LEN); /* macaddr */
 	if (speed != 0)
 		len += pcapng_optlen(sizeof(uint64_t));
+	if (filter)
+		len += pcapng_optlen(strlen(filter) + 1);
 	if (dev)
 		len += pcapng_optlen(strlen(ifhw));
 
 	len += pcapng_optlen(0);
 	len += sizeof(uint32_t);
 
-	buf = alloca(len);
-	if (!buf)
+	if (len > sizeof(buf))
 		return -1;
 
 	hdr = (struct pcapng_interface_block *)buf;
@@ -217,6 +280,9 @@ pcapng_add_interface(rte_pcapng_t *self, uint16_t port)
 				&tsresol, sizeof(tsresol));
 	opt = pcapng_add_option(opt, PCAPNG_IFB_NAME,
 				ifname, strlen(ifname));
+	if (ifdescr)
+		opt = pcapng_add_option(opt, PCAPNG_IFB_DESCRIPTION,
+					ifdescr, strlen(ifdescr));
 	if (ea)
 		opt = pcapng_add_option(opt, PCAPNG_IFB_MACADDR,
 					ea, RTE_ETHER_ADDR_LEN);
@@ -226,31 +292,28 @@ pcapng_add_interface(rte_pcapng_t *self, uint16_t port)
 	if (dev)
 		opt = pcapng_add_option(opt, PCAPNG_IFB_HARDWARE,
 					 ifhw, strlen(ifhw));
+	if (filter) {
+		size_t len;
+
+		len = strlen(filter) + 1;
+		opt->code = PCAPNG_IFB_FILTER;
+		opt->length = len;
+		/* Encoding is that the first octet indicates string vs BPF */
+		opt->data[0] = 0;
+		memcpy(opt->data + 1, filter, strlen(filter));
+
+		opt = (struct pcapng_option *)((uint8_t *)opt + pcapng_optlen(len));
+	}
+
 	opt = pcapng_add_option(opt, PCAPNG_OPT_END, NULL, 0);
 
 	/* clone block_length after optionsa */
 	memcpy(opt, &hdr->block_length, sizeof(uint32_t));
 
+	/* remember the file index */
+	self->port_index[port] = self->ports++;
+
 	return write(self->outfd, buf, len);
-}
-
-/*
- * Write the list of possible interfaces at the start
- * of the file.
- */
-static int
-pcapng_interfaces(rte_pcapng_t *self)
-{
-	uint16_t port_id;
-	uint16_t index = 0;
-
-	RTE_ETH_FOREACH_DEV(port_id) {
-		/* The list if ports in pcapng needs to be contiguous */
-		self->port_index[port_id] = index++;
-		if (pcapng_add_interface(self, port_id) < 0)
-			return -1;
-	}
-	return 0;
 }
 
 /*
@@ -258,15 +321,15 @@ pcapng_interfaces(rte_pcapng_t *self)
  */
 ssize_t
 rte_pcapng_write_stats(rte_pcapng_t *self, uint16_t port_id,
-		       const char *comment,
-		       uint64_t start_time, uint64_t end_time,
-		       uint64_t ifrecv, uint64_t ifdrop)
+		       uint64_t ifrecv, uint64_t ifdrop,
+		       const char *comment)
 {
 	struct pcapng_statistics *hdr;
 	struct pcapng_option *opt;
+	uint64_t start_time = self->offset_ns;
+	uint64_t sample_time;
 	uint32_t optlen, len;
-	uint8_t *buf;
-	uint64_t ns;
+	uint8_t buf[PCAPNG_BLKSIZ];
 
 	RTE_ETH_VALID_PORTID_OR_ERR_RET(port_id, -EINVAL);
 
@@ -276,18 +339,17 @@ rte_pcapng_write_stats(rte_pcapng_t *self, uint16_t port_id,
 		optlen += pcapng_optlen(sizeof(ifrecv));
 	if (ifdrop != UINT64_MAX)
 		optlen += pcapng_optlen(sizeof(ifdrop));
+
 	if (start_time != 0)
 		optlen += pcapng_optlen(sizeof(start_time));
-	if (end_time != 0)
-		optlen += pcapng_optlen(sizeof(end_time));
+
 	if (comment)
 		optlen += pcapng_optlen(strlen(comment));
 	if (optlen != 0)
 		optlen += pcapng_optlen(0);
 
 	len = sizeof(*hdr) + optlen + sizeof(uint32_t);
-	buf = alloca(len);
-	if (buf == NULL)
+	if (len > sizeof(buf))
 		return -1;
 
 	hdr = (struct pcapng_statistics *)buf;
@@ -299,9 +361,6 @@ rte_pcapng_write_stats(rte_pcapng_t *self, uint16_t port_id,
 	if (start_time != 0)
 		opt = pcapng_add_option(opt, PCAPNG_ISB_STARTTIME,
 					 &start_time, sizeof(start_time));
-	if (end_time != 0)
-		opt = pcapng_add_option(opt, PCAPNG_ISB_ENDTIME,
-					 &end_time, sizeof(end_time));
 	if (ifrecv != UINT64_MAX)
 		opt = pcapng_add_option(opt, PCAPNG_ISB_IFRECV,
 				&ifrecv, sizeof(ifrecv));
@@ -315,9 +374,9 @@ rte_pcapng_write_stats(rte_pcapng_t *self, uint16_t port_id,
 	hdr->block_length = len;
 	hdr->interface_id = self->port_index[port_id];
 
-	ns = pcapng_tsc_to_ns(rte_get_tsc_cycles());
-	hdr->timestamp_hi = ns >> 32;
-	hdr->timestamp_lo = (uint32_t)ns;
+	sample_time = pcapng_timestamp(self, rte_get_tsc_cycles());
+	hdr->timestamp_hi = sample_time >> 32;
+	hdr->timestamp_lo = (uint32_t)sample_time;
 
 	/* clone block_length after option */
 	memcpy(opt, &len, sizeof(uint32_t));
@@ -410,21 +469,21 @@ struct rte_mbuf *
 rte_pcapng_copy(uint16_t port_id, uint32_t queue,
 		const struct rte_mbuf *md,
 		struct rte_mempool *mp,
-		uint32_t length, uint64_t cycles,
-		enum rte_pcapng_direction direction)
+		uint32_t length,
+		enum rte_pcapng_direction direction,
+		const char *comment)
 {
 	struct pcapng_enhance_packet_block *epb;
 	uint32_t orig_len, data_len, padding, flags;
 	struct pcapng_option *opt;
-	const uint16_t optlen = pcapng_optlen(sizeof(flags)) + pcapng_optlen(sizeof(queue));
+	uint64_t timestamp;
+	uint16_t optlen;
 	struct rte_mbuf *mc;
-	uint64_t ns;
+	bool rss_hash;
 
 #ifdef RTE_LIBRTE_ETHDEV_DEBUG
 	RTE_ETH_VALID_PORTID_OR_ERR_RET(port_id, NULL);
 #endif
-	ns = pcapng_tsc_to_ns(cycles);
-
 	orig_len = rte_pktmbuf_pkt_len(md);
 
 	/* Take snapshot of the data */
@@ -451,6 +510,10 @@ rte_pcapng_copy(uint16_t port_id, uint32_t queue,
 			goto fail;
 	}
 
+	/* record HASH on incoming packets */
+	rss_hash = (direction == RTE_PCAPNG_DIRECTION_IN &&
+		    (md->ol_flags & RTE_MBUF_F_RX_RSS_HASH));
+
 	/* pad the packet to 32 bit boundary */
 	data_len = rte_pktmbuf_data_len(mc);
 	padding = RTE_ALIGN(data_len, sizeof(uint32_t)) - data_len;
@@ -461,6 +524,14 @@ rte_pcapng_copy(uint16_t port_id, uint32_t queue,
 			goto fail;
 		memset(tail, 0, padding);
 	}
+
+	optlen = pcapng_optlen(sizeof(flags));
+	optlen += pcapng_optlen(sizeof(queue));
+	if (rss_hash)
+		optlen += pcapng_optlen(sizeof(uint8_t) + sizeof(uint32_t));
+
+	if (comment)
+		optlen += pcapng_optlen(strlen(comment));
 
 	/* reserve trailing options and block length */
 	opt = (struct pcapng_option *)
@@ -485,6 +556,24 @@ rte_pcapng_copy(uint16_t port_id, uint32_t queue,
 	opt = pcapng_add_option(opt, PCAPNG_EPB_QUEUE,
 				&queue, sizeof(queue));
 
+	if (rss_hash) {
+		uint8_t hash_opt[5];
+
+		/* The algorithm could be something else if
+		 * using rte_flow_action_rss; but the current API does not
+		 * have a way for ethdev to report  this on a per-packet basis.
+		 */
+		hash_opt[0] = PCAPNG_HASH_TOEPLITZ;
+
+		memcpy(&hash_opt[1], &md->hash.rss, sizeof(uint32_t));
+		opt = pcapng_add_option(opt, PCAPNG_EPB_HASH,
+					&hash_opt, sizeof(hash_opt));
+	}
+
+	if (comment)
+		opt = pcapng_add_option(opt, PCAPNG_OPT_COMMENT, comment,
+					strlen(comment));
+
 	/* Note: END_OPT necessary here. Wireshark doesn't do it. */
 
 	/* Add PCAPNG packet header */
@@ -499,8 +588,10 @@ rte_pcapng_copy(uint16_t port_id, uint32_t queue,
 	/* Interface index is filled in later during write */
 	mc->port = port_id;
 
-	epb->timestamp_hi = ns >> 32;
-	epb->timestamp_lo = (uint32_t)ns;
+	/* Put timestamp in cycles here - adjust in packet write */
+	timestamp = rte_get_tsc_cycles();
+	epb->timestamp_hi = timestamp >> 32;
+	epb->timestamp_lo = (uint32_t)timestamp;
 	epb->capture_length = data_len;
 	epb->original_length = orig_len;
 
@@ -514,35 +605,19 @@ fail:
 	return NULL;
 }
 
-/* Count how many segments are in this array of mbufs */
-static unsigned int
-mbuf_burst_segs(struct rte_mbuf *pkts[], unsigned int n)
-{
-	unsigned int i, iovcnt;
-
-	for (iovcnt = 0, i = 0; i < n; i++) {
-		const struct rte_mbuf *m = pkts[i];
-
-		__rte_mbuf_sanity_check(m, 1);
-
-		iovcnt += m->nb_segs;
-	}
-	return iovcnt;
-}
-
 /* Write pre-formatted packets to file. */
 ssize_t
 rte_pcapng_write_packets(rte_pcapng_t *self,
 			 struct rte_mbuf *pkts[], uint16_t nb_pkts)
 {
-	int iovcnt = mbuf_burst_segs(pkts, nb_pkts);
-	struct iovec iov[iovcnt];
-	unsigned int i, cnt;
-	ssize_t ret;
+	struct iovec iov[IOV_MAX];
+	unsigned int i, cnt = 0;
+	ssize_t ret, total = 0;
 
-	for (i = cnt = 0; i < nb_pkts; i++) {
+	for (i = 0; i < nb_pkts; i++) {
 		struct rte_mbuf *m = pkts[i];
 		struct pcapng_enhance_packet_block *epb;
+		uint64_t cycles, timestamp;
 
 		/* sanity check that is really a pcapng mbuf */
 		epb = rte_pktmbuf_mtod(m, struct pcapng_enhance_packet_block *);
@@ -552,11 +627,38 @@ rte_pcapng_write_packets(rte_pcapng_t *self,
 			return -1;
 		}
 
+		/* check that this interface was added. */
+		epb->interface_id = self->port_index[m->port];
+		if (unlikely(epb->interface_id > RTE_MAX_ETHPORTS)) {
+			rte_errno = EINVAL;
+			return -1;
+		}
+
+		/* adjust timestamp recorded in packet */
+		cycles = (uint64_t)epb->timestamp_hi << 32;
+		cycles += epb->timestamp_lo;
+		timestamp = pcapng_timestamp(self, cycles);
+		epb->timestamp_hi = timestamp >> 32;
+		epb->timestamp_lo = (uint32_t)timestamp;
+
+		/*
+		 * Handle case of highly fragmented and large burst size
+		 * Note: this assumes that max segments per mbuf < IOV_MAX
+		 */
+		if (unlikely(cnt + m->nb_segs >= IOV_MAX)) {
+			ret = writev(self->outfd, iov, cnt);
+			if (unlikely(ret < 0)) {
+				rte_errno = errno;
+				return -1;
+			}
+			total += ret;
+			cnt = 0;
+		}
+
 		/*
 		 * The DPDK port is recorded during pcapng_copy.
 		 * Map that to PCAPNG interface in file.
 		 */
-		epb->interface_id = self->port_index[m->port];
 		do {
 			iov[cnt].iov_base = rte_pktmbuf_mtod(m, void *);
 			iov[cnt].iov_len = rte_pktmbuf_data_len(m);
@@ -564,10 +666,12 @@ rte_pcapng_write_packets(rte_pcapng_t *self,
 		} while ((m = m->next));
 	}
 
-	ret = writev(self->outfd, iov, iovcnt);
-	if (unlikely(ret < 0))
+	ret = writev(self->outfd, iov, cnt);
+	if (unlikely(ret < 0)) {
 		rte_errno = errno;
-	return ret;
+		return -1;
+	}
+	return total + ret;
 }
 
 /* Create new pcapng writer handle */
@@ -576,7 +680,10 @@ rte_pcapng_fdopen(int fd,
 		  const char *osname, const char *hardware,
 		  const char *appname, const char *comment)
 {
+	unsigned int i;
 	rte_pcapng_t *self;
+	struct timespec ts;
+	uint64_t cycles;
 
 	self = malloc(sizeof(*self));
 	if (!self) {
@@ -585,11 +692,18 @@ rte_pcapng_fdopen(int fd,
 	}
 
 	self->outfd = fd;
+	self->ports = 0;
+
+	/* record start time in ns since 1/1/1970 */
+	cycles = rte_get_tsc_cycles();
+	clock_gettime(CLOCK_REALTIME, &ts);
+	self->tsc_base = (cycles + rte_get_tsc_cycles()) / 2;
+	self->offset_ns = rte_timespec_to_ns(&ts);
+
+	for (i = 0; i < RTE_MAX_ETHPORTS; i++)
+		self->port_index[i] = UINT32_MAX;
 
 	if (pcapng_section_block(self, osname, hardware, appname, comment) < 0)
-		goto fail;
-
-	if (pcapng_interfaces(self) < 0)
 		goto fail;
 
 	return self;
