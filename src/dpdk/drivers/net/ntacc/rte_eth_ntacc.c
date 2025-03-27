@@ -1247,8 +1247,8 @@ static int eth_dev_info(struct rte_eth_dev *dev, struct rte_eth_dev_info *dev_in
   if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_10G) {
     dev_info->speed_capa |= RTE_ETH_LINK_SPEED_10G;
   }
-  if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_10G) {
-    dev_info->speed_capa |= RTE_ETH_LINK_SPEED_10G;
+  if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_40G) {
+    dev_info->speed_capa |= RTE_ETH_LINK_SPEED_40G;
   }
   if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_25G) {
     dev_info->speed_capa |= RTE_ETH_LINK_SPEED_25G;
