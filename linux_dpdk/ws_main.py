@@ -58,6 +58,10 @@ gcc_flags = ['-Wall',
              '-Wno-literal-suffix',
              '-Wno-sign-compare',
              '-Wno-strict-aliasing',
+             '-Wno-class-memaccess',
+             '-Wno-address',
+             '-Wno-array-bounds',
+             '-Wno-maybe-uninitialized',
              '-Wno-address-of-packed-member']
 
 

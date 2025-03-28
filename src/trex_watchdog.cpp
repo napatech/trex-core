@@ -35,6 +35,7 @@ limitations under the License.
 #include <string.h>
 #include <iostream>
 #include  <stdexcept>
+#include <memory>
 
 
 void abort_gracefully(const std::string &on_stdout,

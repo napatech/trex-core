@@ -85,14 +85,14 @@ struct supportedDriver_s supportedDriver = {3, 11, 0};
 #define PCI_DEVICE_ID_NT40A01  0x0185
 #define PCI_DEVICE_ID_NT100E3  0x0155
 #define PCI_DEVICE_ID_NT200A02 0x01C5
+#define PCI_DEVICE_ID_NT100A01 0x01E5
+#define PCI_DEVICE_ID_NT50B01  0x01D5
+#define PCI_DEVICE_ID_NT400D11 0x0215
+#define PCI_DEVICE_ID_NT40A11  0x0225
+#define PCI_DEVICE_ID_NT400D13 0x0295
 
 #define PCI_VENDOR_ID_INTEL          0x8086
 #define PCIE_DEVICE_ID_PF_DSC_1_X    0x09C4
-
-// for backward  compatible 
-#ifndef NT_LINK_SPEED_25G
-#define NT_LINK_SPEED_25G 25
-#endif
 
 static void *_libnt;
 
@@ -1129,25 +1129,31 @@ static int eth_dev_info(struct rte_eth_dev *dev, struct rte_eth_dev_info *dev_in
 
   // Update speed capabilities for the port
   dev_info->speed_capa = 0;
-  if (pInfo->u.port_v7.data.capabilities.speed & NT_LINK_SPEED_10M) {
+  if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_10M) {
     dev_info->speed_capa |= ETH_LINK_SPEED_10M;
   }
-  if (pInfo->u.port_v7.data.capabilities.speed & NT_LINK_SPEED_100M) {
+  if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_100M) {
     dev_info->speed_capa |= ETH_LINK_SPEED_100M;
   }
-  if (pInfo->u.port_v7.data.capabilities.speed & NT_LINK_SPEED_1G) {
+  if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_1G) {
     dev_info->speed_capa |= ETH_LINK_SPEED_1G;
   }
-  if (pInfo->u.port_v7.data.capabilities.speed & NT_LINK_SPEED_10G) {
+  if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_10G) {
     dev_info->speed_capa |= ETH_LINK_SPEED_10G;
   }
-  if (pInfo->u.port_v7.data.capabilities.speed & NT_LINK_SPEED_40G) {
+  if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_40G) {
     dev_info->speed_capa |= ETH_LINK_SPEED_40G;
   }
-  if (pInfo->u.port_v7.data.capabilities.speed & NT_LINK_SPEED_100G) {
+  if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_25G) {
+    dev_info->speed_capa |= ETH_LINK_SPEED_25G;
+  }
+  if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_100G) {
     dev_info->speed_capa |= ETH_LINK_SPEED_100G;
   }
-  if (pInfo->u.port_v7.data.capabilities.speed & NT_LINK_SPEED_50G) {
+  if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_200G) {
+    dev_info->speed_capa |= ETH_LINK_SPEED_200G;
+  }
+  if (pInfo->u.port_v8.data.capabilities.speed & NT_LINK_SPEED_50G) {
     dev_info->speed_capa |= ETH_LINK_SPEED_50G;
   }
   rte_free(pInfo);
@@ -1373,6 +1379,12 @@ static int eth_link_update(struct rte_eth_dev *dev,
     break;
   case NT_LINK_SPEED_100G:
     dev->data->dev_link.link_speed = ETH_SPEED_NUM_100G;
+    break;
+  case NT_LINK_SPEED_200G:
+    dev->data->dev_link.link_speed = ETH_SPEED_NUM_200G;
+    break;
+  default:
+    _log_nt_errors(status, "Unsupported link speed", __func__, __LINE__);
     break;
   }
   rte_free(pInfo);
@@ -2883,8 +2895,8 @@ static int rte_pmd_init_internals(struct rte_pci_device *dev,
   PMD_NTACC_LOG(INFO, "Found: "PCI_PRI_FMT": Ports %u, Offset %u, Adapter %u\n", dev->addr.domain, dev->addr.bus, dev->addr.devid, dev->addr.function, nbPortsOnAdapter, offset, adapterNo);
 
   for (localPort = 0; localPort < nbPortsOnAdapter; localPort++) {
-    pInfo->cmd = NT_INFO_CMD_READ_PORT_V7;
-    pInfo->u.port_v7.portNo = (uint8_t)localPort + offset;
+    pInfo->cmd = NT_INFO_CMD_READ_PORT_V8;
+    pInfo->u.port_v8.portNo = (uint8_t)localPort + offset;
     if ((status = (*_NT_InfoRead)(hInfo, pInfo)) != 0) {
       _log_nt_errors(status, "NT_InfoRead failed", __func__, __LINE__);
       iRet = status;
@@ -2903,7 +2915,7 @@ static int rte_pmd_init_internals(struct rte_pci_device *dev,
     PMD_NTACC_LOG(INFO, "Port: %u - %s\n", offset + localPort, name);
 
 		// Check if adapter is supported
-		if ((status = _readProperty(pInfo->u.port_v7.data.adapterNo, NT_4GENERATION, &value)) != 0) {
+		if ((status = _readProperty(pInfo->u.port_v8.data.adapterNo, NT_4GENERATION, &value)) != 0) {
 			iRet = status;
 			goto error;
 		}
@@ -2955,18 +2967,18 @@ static int rte_pmd_init_internals(struct rte_pci_device *dev,
     snprintf(internals->tagName, 9, "port%d", localPort + offset);
     PMD_NTACC_LOG(INFO, "Tagname: %s - %u\n", internals->tagName, localPort + offset);
 
-    internals->adapterNo = pInfo->u.port_v7.data.adapterNo;
+    internals->adapterNo = pInfo->u.port_v8.data.adapterNo;
     internals->port = offset + localPort;
     internals->local_port = localPort;
     internals->local_port_offset = offset;
     internals->symHashMode = SYM_HASH_DIS_PER_PORT;
-    internals->fpgaid.value = pInfo->u.port_v7.data.adapterInfo.fpgaid.value;
+    internals->fpgaid.value = pInfo->u.port_v8.data.adapterInfo.fpgaid.value;
     
     // Check timestamp format
-    if (pInfo->u.port_v7.data.adapterInfo.timestampType == NT_TIMESTAMP_TYPE_NATIVE_UNIX) {
+    if (pInfo->u.port_v8.data.adapterInfo.timestampType == NT_TIMESTAMP_TYPE_NATIVE_UNIX) {
       internals->tsMultiplier = 10;
     }
-    else if (pInfo->u.port_v7.data.adapterInfo.timestampType == NT_TIMESTAMP_TYPE_UNIX_NANOTIME) {
+    else if (pInfo->u.port_v8.data.adapterInfo.timestampType == NT_TIMESTAMP_TYPE_UNIX_NANOTIME) {
       internals->tsMultiplier = 1;
     }
     else {
@@ -2983,11 +2995,11 @@ static int rte_pmd_init_internals(struct rte_pci_device *dev,
       internals->txq[i].port = internals->port;
       internals->txq[i].local_port = localPort;
       internals->txq[i].enabled = 0;
-      internals->txq[i].minTxPktSize = pInfo->u.port_v7.data.capabilities.minTxPktSize;
-      internals->txq[i].maxTxPktSize = pInfo->u.port_v7.data.capabilities.maxTxPktSize;
+      internals->txq[i].minTxPktSize = pInfo->u.port_v8.data.capabilities.minTxPktSize;
+      internals->txq[i].maxTxPktSize = pInfo->u.port_v8.data.capabilities.maxTxPktSize;
     }
 
-    switch (pInfo->u.port_v7.data.speed) {
+    switch (pInfo->u.port_v8.data.speed) {
     case NT_LINK_SPEED_UNKNOWN:
       pmd_link.link_speed = ETH_SPEED_NUM_1G;
       break;
@@ -3015,9 +3027,15 @@ static int rte_pmd_init_internals(struct rte_pci_device *dev,
     case NT_LINK_SPEED_100G:
       pmd_link.link_speed = ETH_SPEED_NUM_100G;
       break;
+    case NT_LINK_SPEED_200G:
+      pmd_link.link_speed = ETH_SPEED_NUM_200G;
+      break;
+    default:
+      PMD_NTACC_LOG(ERR, "DPDK Port: %u - Unsupported link speed %u\n", eth_dev->data->port_id, pInfo->u.port_v8.data.speed);
+      break;
     }
 
-    memcpy(&eth_addr[internals->port].addr_bytes, &pInfo->u.port_v7.data.macAddress, sizeof(eth_addr[internals->port].addr_bytes));
+    memcpy(&eth_addr[internals->port].addr_bytes, &pInfo->u.port_v8.data.macAddress, sizeof(eth_addr[internals->port].addr_bytes));
 
     pmd_link.link_duplex = ETH_LINK_FULL_DUPLEX;
     pmd_link.link_status = 0;
@@ -3058,8 +3076,8 @@ static int rte_pmd_init_internals(struct rte_pci_device *dev,
 
     eth_dev->dev_ops = &ops;
 
-    if (pInfo->u.port_v7.data.adapterInfo.fpgaid.s.product == 7000 ||
-        pInfo->u.port_v7.data.adapterInfo.fpgaid.s.product == 7001) {
+    if (pInfo->u.port_v8.data.adapterInfo.fpgaid.s.product == 7000 ||
+        pInfo->u.port_v8.data.adapterInfo.fpgaid.s.product == 7001) {
       // Intel PAC adapters cannot use direct ring
       internals->mode2Tx = 1; // Use old tx mode
       internals->mode2Rx = 1; // Use old rx mode
@@ -3068,7 +3086,7 @@ static int rte_pmd_init_internals(struct rte_pci_device *dev,
     else {
       // Check the capability of the adapter/port
       // Do we have the key matcher
-      if ((status = _readProperty(pInfo->u.port_v7.data.adapterNo, KEY_MATCH, &value)) != 0) {
+      if ((status = _readProperty(pInfo->u.port_v8.data.adapterNo, KEY_MATCH, &value)) != 0) {
         iRet = status;
         goto error;
       }
@@ -3079,7 +3097,7 @@ static int rte_pmd_init_internals(struct rte_pci_device *dev,
         internals->keyMatcher = 1;
 
       // Do we have 4GA zero copy
-      if ((status = _readProperty(pInfo->u.port_v7.data.adapterNo, ZERO_COPY_TX, &value)) != 0) {
+      if ((status = _readProperty(pInfo->u.port_v8.data.adapterNo, ZERO_COPY_TX, &value)) != 0) {
         iRet = status;
         goto error;
       }
@@ -3090,7 +3108,7 @@ static int rte_pmd_init_internals(struct rte_pci_device *dev,
         internals->mode2Tx = 0; // Yes - use direct ring tx mode
 
       // Is the RX segement emulation enabled?
-      if ((status = _readProperty(pInfo->u.port_v7.data.adapterNo, RX_SEGMENT_SIZE, &value)) != 0) {
+      if ((status = _readProperty(pInfo->u.port_v8.data.adapterNo, RX_SEGMENT_SIZE, &value)) != 0) {
         iRet = status;
         goto error;
       }
@@ -3102,7 +3120,7 @@ static int rte_pmd_init_internals(struct rte_pci_device *dev,
         internals->mode2Rx = 0;
 
       // Is the TX segement emulation enabled?
-      if ((status = _readProperty(pInfo->u.port_v7.data.adapterNo, TX_SEGMENT_SIZE, &value)) != 0) {
+      if ((status = _readProperty(pInfo->u.port_v8.data.adapterNo, TX_SEGMENT_SIZE, &value)) != 0) {
         iRet = status;
         goto error;
       }
@@ -3438,7 +3456,10 @@ static int rte_pmd_ntacc_dev_probe(struct rte_pci_driver *drv __rte_unused, stru
   case PCI_DEVICE_ID_NT40E3:
   case PCI_DEVICE_ID_NT40A01:
   case PCI_DEVICE_ID_NT200A02:
-    break;
+  case PCI_DEVICE_ID_NT400D11:
+  case PCI_DEVICE_ID_NT40A11:
+  case PCI_DEVICE_ID_NT400D13:
+  break;
   case PCI_DEVICE_ID_NT200A01:
   case PCI_DEVICE_ID_NT80E3:
   case PCI_DEVICE_ID_NT100E3:
@@ -3531,7 +3552,22 @@ static const struct rte_pci_id ntacc_pci_id_map[] = {
     RTE_PCI_DEVICE(PCI_VENDOR_ID_NAPATECH,PCI_DEVICE_ID_NT100E3)
   },
   {
-    RTE_PCI_DEVICE(PCI_VENDOR_ID_INTEL,PCIE_DEVICE_ID_PF_DSC_1_X) // Intel AFU adapter
+    RTE_PCI_DEVICE(PCI_VENDOR_ID_NAPATECH,PCI_DEVICE_ID_NT100A01)
+  },
+  {
+    RTE_PCI_DEVICE(PCI_VENDOR_ID_NAPATECH,PCI_DEVICE_ID_NT50B01)
+  },
+  {
+    RTE_PCI_DEVICE(PCI_VENDOR_ID_INTEL,PCIE_DEVICE_ID_PF_DSC_1_X)
+  },
+  {
+    RTE_PCI_DEVICE(PCI_VENDOR_ID_NAPATECH,PCI_DEVICE_ID_NT400D11)
+  },
+  {
+    RTE_PCI_DEVICE(PCI_VENDOR_ID_NAPATECH,PCI_DEVICE_ID_NT40A11)
+  },
+  {
+    RTE_PCI_DEVICE(PCI_VENDOR_ID_NAPATECH,PCI_DEVICE_ID_NT400D13)
   },
 	{
 		.vendor_id = 0
