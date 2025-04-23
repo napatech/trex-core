@@ -5,6 +5,8 @@
 #ifndef _OSDEP_RTE_GENERIC_H
 #define _OSDEP_RTE_GENERIC_H
 
+#include <stdlib.h>
+
 #include <rte_common.h>
 #include <rte_cycles.h>
 #include <rte_spinlock.h>
@@ -14,8 +16,11 @@
 #include <rte_byteorder.h>
 #include <rte_memcpy.h>
 
+extern int ifpga_rawdev_logtype;
+#define RTE_LOGTYPE_IFPGA_RAWDEV ifpga_rawdev_logtype
+
 #define dev_printf(level, fmt, args...) \
-	RTE_LOG(level, PMD, "osdep_rte: " fmt, ## args)
+	RTE_LOG(level, IFPGA_RAWDEV, "osdep_rte: " fmt, ## args)
 
 #define osdep_panic(...) rte_panic(...)
 
@@ -38,6 +43,9 @@
 
 #define min(a, b) RTE_MIN(a, b)
 #define max(a, b) RTE_MAX(a, b)
+
+#define min_t(type, x, y) RTE_MIN_T(x, y, type)
+#define max_t(type, x, y) RTE_MAX_T(x, y, type)
 
 #define spinlock_t rte_spinlock_t
 #define spinlock_init(x) rte_spinlock_init(x)

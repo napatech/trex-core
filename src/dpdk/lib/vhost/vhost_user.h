@@ -6,7 +6,6 @@
 #define _VHOST_NET_USER_H
 
 #include <stdint.h>
-#include <linux/vhost.h>
 
 #include "rte_vhost.h"
 
@@ -14,14 +13,23 @@
 
 #define VHOST_MEMORY_MAX_NREGIONS 8
 
+#define VHOST_USER_NET_SUPPORTED_FEATURES \
+	(VIRTIO_NET_SUPPORTED_FEATURES | \
+	 (1ULL << VIRTIO_F_RING_PACKED) | \
+	 (1ULL << VIRTIO_NET_F_MTU) | \
+	 (1ULL << VHOST_F_LOG_ALL) | \
+	 (1ULL << VHOST_USER_F_PROTOCOL_FEATURES) | \
+	 (1ULL << VIRTIO_NET_F_CTRL_RX) | \
+	 (1ULL << VIRTIO_NET_F_GUEST_ANNOUNCE))
+
 #define VHOST_USER_PROTOCOL_FEATURES	((1ULL << VHOST_USER_PROTOCOL_F_MQ) | \
 					 (1ULL << VHOST_USER_PROTOCOL_F_LOG_SHMFD) |\
 					 (1ULL << VHOST_USER_PROTOCOL_F_RARP) | \
 					 (1ULL << VHOST_USER_PROTOCOL_F_REPLY_ACK) | \
 					 (1ULL << VHOST_USER_PROTOCOL_F_NET_MTU) | \
-					 (1ULL << VHOST_USER_PROTOCOL_F_SLAVE_REQ) | \
+					 (1ULL << VHOST_USER_PROTOCOL_F_BACKEND_REQ) | \
 					 (1ULL << VHOST_USER_PROTOCOL_F_CRYPTO_SESSION) | \
-					 (1ULL << VHOST_USER_PROTOCOL_F_SLAVE_SEND_FD) | \
+					 (1ULL << VHOST_USER_PROTOCOL_F_BACKEND_SEND_FD) | \
 					 (1ULL << VHOST_USER_PROTOCOL_F_HOST_NOTIFIER) | \
 					 (1ULL << VHOST_USER_PROTOCOL_F_PAGEFAULT) | \
 					 (1ULL << VHOST_USER_PROTOCOL_F_STATUS))
@@ -48,8 +56,10 @@ typedef enum VhostUserRequest {
 	VHOST_USER_SET_VRING_ENABLE = 18,
 	VHOST_USER_SEND_RARP = 19,
 	VHOST_USER_NET_SET_MTU = 20,
-	VHOST_USER_SET_SLAVE_REQ_FD = 21,
+	VHOST_USER_SET_BACKEND_REQ_FD = 21,
 	VHOST_USER_IOTLB_MSG = 22,
+	VHOST_USER_GET_CONFIG = 24,
+	VHOST_USER_SET_CONFIG = 25,
 	VHOST_USER_CRYPTO_CREATE_SESS = 26,
 	VHOST_USER_CRYPTO_CLOSE_SESS = 27,
 	VHOST_USER_POSTCOPY_ADVISE = 28,
@@ -59,16 +69,14 @@ typedef enum VhostUserRequest {
 	VHOST_USER_SET_INFLIGHT_FD = 32,
 	VHOST_USER_SET_STATUS = 39,
 	VHOST_USER_GET_STATUS = 40,
-	VHOST_USER_MAX = 41
 } VhostUserRequest;
 
-typedef enum VhostUserSlaveRequest {
-	VHOST_USER_SLAVE_NONE = 0,
-	VHOST_USER_SLAVE_IOTLB_MSG = 1,
-	VHOST_USER_SLAVE_CONFIG_CHANGE_MSG = 2,
-	VHOST_USER_SLAVE_VRING_HOST_NOTIFIER_MSG = 3,
-	VHOST_USER_SLAVE_MAX
-} VhostUserSlaveRequest;
+typedef enum VhostUserBackendRequest {
+	VHOST_USER_BACKEND_NONE = 0,
+	VHOST_USER_BACKEND_IOTLB_MSG = 1,
+	VHOST_USER_BACKEND_CONFIG_CHANGE_MSG = 2,
+	VHOST_USER_BACKEND_VRING_HOST_NOTIFIER_MSG = 3,
+} VhostUserBackendRequest;
 
 typedef struct VhostUserMemoryRegion {
 	uint64_t guest_phys_addr;
@@ -125,10 +133,20 @@ typedef struct VhostUserInflight {
 	uint16_t queue_size;
 } VhostUserInflight;
 
+#define VHOST_USER_MAX_CONFIG_SIZE		256
+
+/** Get/set config msg payload */
+struct vhost_user_config {
+	uint32_t offset;
+	uint32_t size;
+	uint32_t flags;
+	uint8_t region[VHOST_USER_MAX_CONFIG_SIZE];
+};
+
 typedef struct VhostUserMsg {
 	union {
-		uint32_t master; /* a VhostUserRequest value */
-		uint32_t slave;  /* a VhostUserSlaveRequest value*/
+		uint32_t frontend; /* a VhostUserRequest value */
+		uint32_t backend;  /* a VhostUserBackendRequest value*/
 	} request;
 
 #define VHOST_USER_VERSION_MASK     0x3
@@ -148,6 +166,7 @@ typedef struct VhostUserMsg {
 		VhostUserCryptoSessionParam crypto_session;
 		VhostUserVringArea area;
 		VhostUserInflight inflight;
+		struct vhost_user_config cfg;
 	} payload;
 	/* Nothing should be added after the payload */
 } __rte_packed VhostUserMsg;
@@ -169,11 +188,11 @@ struct __rte_packed vhu_msg_context {
 
 /* vhost_user.c */
 int vhost_user_msg_handler(int vid, int fd);
-int vhost_user_iotlb_miss(struct virtio_net *dev, uint64_t iova, uint8_t perm);
 
 /* socket.c */
 int read_fd_message(char *ifname, int sockfd, char *buf, int buflen, int *fds, int max_fds,
 		int *fd_num);
 int send_fd_message(char *ifname, int sockfd, char *buf, int buflen, int *fds, int fd_num);
+int vhost_user_new_device(void);
 
 #endif

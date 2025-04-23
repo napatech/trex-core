@@ -2,8 +2,12 @@
  * Copyright(c) 2018-2021 HiSilicon Limited.
  */
 
-#ifndef _HNS3_FDIR_H_
-#define _HNS3_FDIR_H_
+#ifndef HNS3_FDIR_H
+#define HNS3_FDIR_H
+
+#include <stdint.h>
+
+#include <rte_flow.h>
 
 struct hns3_fd_key_cfg {
 	uint8_t key_sel;
@@ -167,6 +171,13 @@ struct hns3_fdir_rule_ele {
 TAILQ_HEAD(hns3_fdir_rule_list, hns3_fdir_rule_ele);
 
 /*
+ * On 'strict' mode, hardware bases on VLAN number to exactly match the
+ * input flow.
+ */
+#define HNS3_FDIR_VLAN_STRICT_MATCH	1
+#define HNS3_FDIR_VLAN_NOSTRICT_MATCH	0
+
+/*
  *  A structure used to define fields of a FDIR related info.
  */
 struct hns3_fdir_info {
@@ -174,9 +185,11 @@ struct hns3_fdir_info {
 	struct hns3_fdir_rule_ele **hash_map;
 	struct rte_hash *hash_handle;
 	struct hns3_fd_cfg fd_cfg;
+	uint8_t vlan_match_mode;
 };
 
 struct hns3_adapter;
+struct hns3_hw;
 
 int hns3_init_fd_config(struct hns3_adapter *hns);
 int hns3_fdir_filter_init(struct hns3_adapter *hns);
@@ -184,7 +197,7 @@ void hns3_fdir_filter_uninit(struct hns3_adapter *hns);
 int hns3_fdir_filter_program(struct hns3_adapter *hns,
 			     struct hns3_fdir_rule *rule, bool del);
 int hns3_clear_all_fdir_filter(struct hns3_adapter *hns);
-int hns3_get_count(struct hns3_hw *hw, uint32_t id, uint64_t *value);
+int hns3_fd_get_count(struct hns3_hw *hw, uint32_t id, uint64_t *value);
 int hns3_restore_all_fdir_filter(struct hns3_adapter *hns);
 
-#endif /* _HNS3_FDIR_H_ */
+#endif /* HNS3_FDIR_H */

@@ -7,6 +7,7 @@
 
 #include <string.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 #ifdef RTE_LIB_EAL
 #include "osdep_rte/osdep_generic.h"
@@ -79,15 +80,38 @@ struct uuid {
 #define time_before(a, b)	time_after(b, a)
 #define opae_memset(a, b, c)    memset((a), (b), (c))
 
-#define opae_readq_poll_timeout(addr, val, cond, invl, timeout)\
-({									     \
-	int wait = 0;							     \
-	for (; wait <= timeout; wait += invl) {			     \
-		(val) = opae_readq(addr);				     \
-		if (cond)                  \
-			break;						     \
-		udelay(invl);						     \
-	}								     \
-	(cond) ? 0 : -ETIMEDOUT;	  \
+#define readx_poll_timeout(op, val, cond, invl, timeout, args...) \
+__extension__ ({                                                      \
+	unsigned long __wait = 0;                                     \
+	unsigned long __invl = (invl);                                \
+	unsigned long __timeout = (timeout);                          \
+	for (; __wait <= __timeout; __wait += __invl) {               \
+		(val) = op(args);                                         \
+		if (cond)                                                 \
+			break;                                                \
+		udelay(__invl);                                           \
+	}                                                             \
+	(cond) ? 0 : -ETIMEDOUT;                                      \
 })
+
+#define opae_readq_poll_timeout(addr, val, cond, invl, timeout) \
+	readx_poll_timeout(opae_readq, val, cond, invl, timeout, addr)
+
+#define opae_readl_poll_timeout(addr, val, cond, invl, timeout) \
+	readx_poll_timeout(opae_readl, val, cond, invl, timeout, addr)
+
+#define opae_readw_poll_timeout(addr, val, cond, invl, timeout) \
+	readx_poll_timeout(opae_readw, val, cond, invl, timeout, addr)
+
+#define opae_readb_poll_timeout(addr, val, cond, invl, timeout) \
+	readx_poll_timeout(opae_readb, val, cond, invl, timeout, addr)
+
+#define opae_max10_read_poll_timeout(dev, addr, value, cond, invl, timeout) \
+__extension__ ({ \
+	int __ret, __tmp; \
+	__tmp = readx_poll_timeout(max10_sys_read, __ret, __ret || (cond), \
+			invl, timeout, (dev), (addr), &(value)); \
+	__ret?:__tmp; \
+})
+
 #endif

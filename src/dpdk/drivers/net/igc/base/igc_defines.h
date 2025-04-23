@@ -188,6 +188,15 @@
 #define IGC_RCTL_BSEX		0x02000000 /* Buffer size extension */
 #define IGC_RCTL_SECRC	0x04000000 /* Strip Ethernet CRC */
 
+#define IGC_DTXMXPKTSZ_TSN     0x19 /* 1600 bytes of max TX DMA packet size */
+#define IGC_TXPBSIZE_TSN       0x04145145 /* 5k bytes buffer for each queue */
+
+/* Transmit Scheduling */
+#define IGC_TQAVCTRL_TRANSMIT_MODE_TSN 0x00000001
+#define IGC_TQAVCTRL_ENHANCED_QAV      0x00000008
+
+#define IGC_TXQCTL_QUEUE_MODE_LAUNCHT  0x00000001
+
 /* Use byte values for the following shift parameters
  * Usage:
  *     psrctl |= (((ROUNDUP(value0, 128) >> IGC_PSRCTL_BSIZE0_SHIFT) &
@@ -795,6 +804,17 @@
 
 #define TSYNC_INTERRUPTS	TSINTR_TXTS
 
+/* Split Replication Receive Control */
+#define IGC_SRRCTL_TIMESTAMP           0x40000000
+#define IGC_SRRCTL_TIMER1SEL(timer)    (((timer) & 0x3) << 14)
+#define IGC_SRRCTL_TIMER0SEL(timer)    (((timer) & 0x3) << 17)
+
+/* Sample RX tstamp in PHY sop */
+#define IGC_TSYNCRXCTL_RXSYNSIG         0x00000400
+
+/* Sample TX tstamp in PHY sop */
+#define IGC_TSYNCTXCTL_TXSYNSIG         0x00000020
+
 /* TSAUXC Configuration Bits */
 #define TSAUXC_EN_TT0	(1 << 0)  /* Enable target time 0. */
 #define TSAUXC_EN_TT1	(1 << 1)  /* Enable target time 1. */
@@ -1351,6 +1371,7 @@
 #define IGP04IGC_E_PHY_ID	0x02A80391
 #define M88_VENDOR		0x0141
 #define I225_I_PHY_ID		0x67C9DC00
+#define I226_LM_PHY_ID          0x67C9DC10
 
 /* M88E1000 Specific Registers */
 #define M88IGC_PHY_SPEC_CTRL		0x10  /* PHY Specific Control Reg */

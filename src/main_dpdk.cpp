@@ -211,6 +211,7 @@ enum {
        OPT_STL_MODE,
        OPT_MLX4_SO,
        OPT_MLX5_SO,
+       OPT_MANA_SO,
        OPT_NTACC_SO,
        OPT_ASTF_SERVR_ONLY,
        OPT_ASTF_CLIENT_MASK,
@@ -225,6 +226,7 @@ enum {
        OPT_BNXT_SO,
        OPT_DISABLE_IEEE_1588,
        OPT_LATENCY_DIAG,
+       OPT_DEFER_START_QUEUES,
 
        /* no more pass this */
        OPT_MAX
@@ -295,6 +297,7 @@ static CSimpleOpt::SOption parser_options[] =
         { OPT_TSO_OFFLOAD_DISABLE,  "--tso-disable", SO_NONE   },
         { OPT_LRO_OFFLOAD_DISABLE,  "--lro-disable", SO_NONE   },
         { OPT_ACTIVE_FLOW,            "--active-flows",   SO_REQ_SEP  },
+        { OPT_MANA_SO,                "--mana-so", SO_NONE    },
         { OPT_NTACC_SO,               "--ntacc-so", SO_NONE    },
         { OPT_MLX5_SO,                "--mlx5-so", SO_NONE    },
         { OPT_MLX4_SO,                "--mlx4-so", SO_NONE    },
@@ -324,6 +327,7 @@ static CSimpleOpt::SOption parser_options[] =
         { OPT_BNXT_SO,                "--bnxt-so",         SO_NONE},
         { OPT_DISABLE_IEEE_1588,      "--disable-ieee-1588", SO_NONE},
         { OPT_LATENCY_DIAG,           "--latency-diag", SO_NONE},
+        { OPT_DEFER_START_QUEUES,     "--defer-start-queues", SO_NONE},
 
         SO_END_OF_OPTIONS
     };
@@ -430,6 +434,7 @@ static int COLD_FUNC  usage() {
     printf("                              Uses PTP (IEEE 1588v2) Protocol to have the packets timestamped at NIC \n");
     printf(" --latency-diag             : STL flow latency counts all duplicated packets with more CPU load consumption.\n");
     printf("                              To see the duplicated packets, please use -v 7.\n");
+    printf(" --defer-start-queues       : Start queues separately after device started when it is supported.\n");
 
     printf("\n");
     printf(" Examples: ");
@@ -735,6 +740,10 @@ COLD_FUNC static int parse_options(int argc, char *argv[], bool first_time ) {
                 po->preview.set_rt_prio_mode(true);
                 break;
 
+            case OPT_MANA_SO:
+                po->preview.set_mana_so_mode(true);
+                break;
+
             case OPT_NTACC_SO:
                 po->preview.set_ntacc_so_mode(true);
                 break;
@@ -967,6 +976,9 @@ COLD_FUNC static int parse_options(int argc, char *argv[], bool first_time ) {
                 break;
             case OPT_LATENCY_DIAG:
                 po->preview.set_latency_diag(true);
+                break;
+            case OPT_DEFER_START_QUEUES:
+                po->preview.set_defer_start_queues(true);
                 break;
 
             default:
@@ -3844,6 +3856,10 @@ COLD_FUNC int  CGlobalTRex::device_start(void){
             _if->disable_flow_control();
         }
 
+        if (CGlobalInfo::m_options.preview.get_defer_start_queues()) {
+            _if->start_queues();
+        }
+
         _if->get_port_attr()->add_mac((char *)CGlobalInfo::m_options.get_src_mac_addr(i));
 
         fflush(stdout);
@@ -4319,10 +4335,15 @@ COLD_FUNC int  CGlobalTRex::device_prob_init(void){
         }
     }
 
-    /*update mtu based on the dev info*/
-    m_port_cfg.m_port_conf.rxmode.mtu = dev_info.max_rx_pktlen - trex_dev_get_overhead_len(dev_info.max_rx_pktlen, 
-                                                                                      dev_info.max_mtu);
+    /* update default mtu based on the dev info */
+    uint32_t overhead_len = trex_dev_get_overhead_len(dev_info.max_rx_pktlen, dev_info.max_mtu);
+    m_port_cfg.m_port_conf.rxmode.mtu = dev_info.max_rx_pktlen - overhead_len;
+
     m_port_cfg.update_var();
+
+    if (global_platform_cfg_info.m_port_mtu) {
+        m_port_cfg.m_port_conf.rxmode.mtu = global_platform_cfg_info.m_port_mtu;
+    }
 
     if (m_port_cfg.m_port_conf.rxmode.mtu > dev_info.max_rx_pktlen ) {
         printf("WARNING: reduce max packet len from %d to %d \n",
@@ -4398,9 +4419,8 @@ COLD_FUNC int  CGlobalTRex::device_prob_init(void){
         }
     }
 
-
     return (0);
-    }
+}
 
 COLD_FUNC int  CGlobalTRex::cores_prob_init(){
     m_max_cores = rte_lcore_count();
@@ -5797,13 +5817,7 @@ COLD_FUNC void CPhyEthIF::configure_rss(){
 
 COLD_FUNC void CPhyEthIF::conf_multi_rx() {
     const struct rte_eth_dev_info *dev_info = m_port_attr->get_dev_info();
-    uint8_t hash_key_size;
-
-     if ( dev_info->hash_key_size==0 ) {
-          hash_key_size = 40; /* for mlx5 */
-        } else {
-          hash_key_size = dev_info->hash_key_size;
-     }
+    uint8_t hash_key_size = dev_info->hash_key_size;
 
     struct rte_eth_rss_conf *lp_rss = 
         &g_trex.m_port_cfg.m_port_conf.rx_adv_conf.rss_conf;
@@ -5931,6 +5945,11 @@ COLD_FUNC void CPhyEthIF::_conf_queues(uint16_t tx_qs,
     check_offloads(dev_info, &eth_cfg);
     configure(rx_qs, tx_qs, &eth_cfg);
 
+    if (CGlobalInfo::m_options.preview.get_defer_start_queues()) {
+        cfg.m_rx_conf.rx_deferred_start = true;
+        cfg.m_tx_conf.tx_deferred_start = true;
+    }
+
     /* configure tx que */
     for (uint16_t qid = 0; qid < tx_qs; qid++) {
         tx_queue_setup(qid, tx_descs , socket_id, 
@@ -6012,6 +6031,55 @@ COLD_FUNC void CPhyEthIF::conf_queues(void){
                 rss_mode,
                 in_astf_mode);
 
+}
+
+COLD_FUNC void CPhyEthIF::start_queues(void) {
+    struct rte_eth_dev_info dev_info;
+    rte_eth_dev_info_get(m_repid, &dev_info);
+
+    for (int queue_id = dev_info.nb_rx_queues-1; queue_id >= 0; queue_id--) {
+        struct rte_eth_rxq_info rxq_info;
+        int ret = rte_eth_rx_queue_info_get(m_repid, queue_id, &rxq_info);
+        if (ret == 0) {
+            if (rxq_info.conf.rx_deferred_start) {
+                ret = rte_eth_dev_rx_queue_start(m_repid, queue_id);
+                if (ret == 0 && isVerbose(6)) {
+                    printf("Port %d RX queue %d deferred start done\n", m_repid, queue_id);
+                }
+            } else {
+                ret = -ENOTSUP;
+            }
+        }
+        if (ret == -ENOTSUP) {
+            printf("Port %d RX queue %d deferred start not supported\n", m_repid, queue_id);
+            continue;
+        }
+        if (ret < 0) {
+            rte_exit(EXIT_FAILURE, "Port %d RX queue %d deferred start failed (%d)\n", m_repid, queue_id, ret);
+        }
+    }
+
+    for (int queue_id = dev_info.nb_tx_queues-1; queue_id >= 0; queue_id--) {
+        struct rte_eth_txq_info txq_info;
+        int ret = rte_eth_tx_queue_info_get(m_repid, queue_id, &txq_info);
+        if (ret == 0) {
+            if (txq_info.conf.tx_deferred_start) {
+                ret = rte_eth_dev_tx_queue_start(m_repid, queue_id);
+                if (ret == 0 && isVerbose(6)) {
+                    printf("Port %d TX queue %d deferred start done\n", m_repid, queue_id);
+                }
+            } else {
+                ret = -ENOTSUP;
+            }
+        }
+        if (ret == -ENOTSUP) {
+            printf("Port %d TX queue %d deferred start not supported\n", m_repid, queue_id);
+            continue;
+        }
+        if (ret < 0) {
+            rte_exit(EXIT_FAILURE, "Port %d TX queue %d deferred start failed (%d)\n", m_repid, queue_id, ret);
+        }
+    }
 }
 
 /**
@@ -6413,7 +6481,7 @@ COLD_FUNC void check_pdev_vdev_dummy() {
                 split_str_by_delimiter(iface, ',', vdev_opts);
                 list_vdevs[if_index] = vdev_opts[0].substr(vdev_opts[0].find("=")+1);
 
-                std::string match_str = "slave=";
+                std::string match_str = "member=";
                 for (auto vdev_opt : vdev_opts) {
                     if ( vdev_opt.find(match_str.c_str()) != std::string::npos ) {
                         found_devs_in_vdev = true;
@@ -6575,6 +6643,13 @@ COLD_FUNC int  update_dpdk_args(void){
         SET_ARGS(bnxt_so_str.c_str());
     }
 #endif
+
+    if ( lpp->get_mana_so_mode() ){
+       std::string &mana_so_str = get_mana_so_string();
+       mana_so_str = "libmana-64" + std::string(g_image_postfix) + ".so";
+       SET_ARGS("-d");
+       SET_ARGS(mana_so_str.c_str());
+    }
 
     if ( lpp->get_ntacc_so_mode() ){
         std::string &ntacc_so_str = get_ntacc_so_string();

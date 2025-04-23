@@ -2,7 +2,9 @@
  * Copyright(C) 2020 Marvell International Ltd.
  */
 
+#include <stdlib.h>
 #include <fnmatch.h>
+#include <pthread.h>
 #include <sys/queue.h>
 #include <regex.h>
 
@@ -47,12 +49,6 @@ eal_trace_init(void)
 		goto fail;
 	}
 
-	if (!STAILQ_EMPTY(&trace.args))
-		trace.status = true;
-
-	if (!rte_trace_is_enabled())
-		return 0;
-
 	rte_spinlock_init(&trace.lock);
 
 	/* Is duplicate trace name registered */
@@ -71,13 +67,9 @@ eal_trace_init(void)
 	if (trace_metadata_create() < 0)
 		goto fail;
 
-	/* Create trace directory */
-	if (trace_mkdir())
-		goto free_meta;
-
 	/* Save current epoch timestamp for future use */
 	if (trace_epoch_time_save() < 0)
-		goto fail;
+		goto free_meta;
 
 	/* Apply global configurations */
 	STAILQ_FOREACH(arg, &trace.args, next)
@@ -97,8 +89,6 @@ fail:
 void
 eal_trace_fini(void)
 {
-	if (!rte_trace_is_enabled())
-		return;
 	trace_mem_free();
 	trace_metadata_destroy();
 	eal_trace_args_free();
@@ -107,27 +97,24 @@ eal_trace_fini(void)
 bool
 rte_trace_is_enabled(void)
 {
-	return trace.status;
+	return rte_atomic_load_explicit(&trace.status, rte_memory_order_acquire) != 0;
 }
 
 static void
-trace_mode_set(rte_trace_point_t *trace, enum rte_trace_mode mode)
+trace_mode_set(rte_trace_point_t *t, enum rte_trace_mode mode)
 {
 	if (mode == RTE_TRACE_MODE_OVERWRITE)
-		__atomic_and_fetch(trace, ~__RTE_TRACE_FIELD_ENABLE_DISCARD,
-			__ATOMIC_RELEASE);
+		rte_atomic_fetch_and_explicit(t, ~__RTE_TRACE_FIELD_ENABLE_DISCARD,
+			rte_memory_order_release);
 	else
-		__atomic_or_fetch(trace, __RTE_TRACE_FIELD_ENABLE_DISCARD,
-			__ATOMIC_RELEASE);
+		rte_atomic_fetch_or_explicit(t, __RTE_TRACE_FIELD_ENABLE_DISCARD,
+			rte_memory_order_release);
 }
 
 void
 rte_trace_mode_set(enum rte_trace_mode mode)
 {
 	struct trace_point *tp;
-
-	if (!rte_trace_is_enabled())
-		return;
 
 	STAILQ_FOREACH(tp, &tp_list, next)
 		trace_mode_set(tp->handle, mode);
@@ -148,36 +135,44 @@ trace_point_is_invalid(rte_trace_point_t *t)
 }
 
 bool
-rte_trace_point_is_enabled(rte_trace_point_t *trace)
+rte_trace_point_is_enabled(rte_trace_point_t *t)
 {
 	uint64_t val;
 
-	if (trace_point_is_invalid(trace))
+	if (trace_point_is_invalid(t))
 		return false;
 
-	val = __atomic_load_n(trace, __ATOMIC_ACQUIRE);
+	val = rte_atomic_load_explicit(t, rte_memory_order_acquire);
 	return (val & __RTE_TRACE_FIELD_ENABLE_MASK) != 0;
 }
 
 int
-rte_trace_point_enable(rte_trace_point_t *trace)
+rte_trace_point_enable(rte_trace_point_t *t)
 {
-	if (trace_point_is_invalid(trace))
+	uint64_t prev;
+
+	if (trace_point_is_invalid(t))
 		return -ERANGE;
 
-	__atomic_or_fetch(trace, __RTE_TRACE_FIELD_ENABLE_MASK,
-		__ATOMIC_RELEASE);
+	prev = rte_atomic_fetch_or_explicit(t, __RTE_TRACE_FIELD_ENABLE_MASK,
+		rte_memory_order_release);
+	if ((prev & __RTE_TRACE_FIELD_ENABLE_MASK) == 0)
+		rte_atomic_fetch_add_explicit(&trace.status, 1, rte_memory_order_release);
 	return 0;
 }
 
 int
-rte_trace_point_disable(rte_trace_point_t *trace)
+rte_trace_point_disable(rte_trace_point_t *t)
 {
-	if (trace_point_is_invalid(trace))
+	uint64_t prev;
+
+	if (trace_point_is_invalid(t))
 		return -ERANGE;
 
-	__atomic_and_fetch(trace, ~__RTE_TRACE_FIELD_ENABLE_MASK,
-		__ATOMIC_RELEASE);
+	prev = rte_atomic_fetch_and_explicit(t, ~__RTE_TRACE_FIELD_ENABLE_MASK,
+		rte_memory_order_release);
+	if ((prev & __RTE_TRACE_FIELD_ENABLE_MASK) != 0)
+		rte_atomic_fetch_sub_explicit(&trace.status, 1, rte_memory_order_release);
 	return 0;
 }
 
@@ -188,15 +183,18 @@ rte_trace_pattern(const char *pattern, bool enable)
 	int rc = 0, found = 0;
 
 	STAILQ_FOREACH(tp, &tp_list, next) {
-		if (fnmatch(pattern, tp->name, 0) == 0) {
-			if (enable)
-				rc = rte_trace_point_enable(tp->handle);
-			else
-				rc = rte_trace_point_disable(tp->handle);
-			found = 1;
+		if (fnmatch(pattern, tp->name, 0) != 0)
+			continue;
+
+		if (enable)
+			rc = rte_trace_point_enable(tp->handle);
+		else
+			rc = rte_trace_point_disable(tp->handle);
+		if (rc < 0) {
+			found = 0;
+			break;
 		}
-		if (rc < 0)
-			return rc;
+		found = 1;
 	}
 
 	return rc | found;
@@ -213,15 +211,18 @@ rte_trace_regexp(const char *regex, bool enable)
 		return -EINVAL;
 
 	STAILQ_FOREACH(tp, &tp_list, next) {
-		if (regexec(&r, tp->name, 0, NULL, 0) == 0) {
-			if (enable)
-				rc = rte_trace_point_enable(tp->handle);
-			else
-				rc = rte_trace_point_disable(tp->handle);
-			found = 1;
+		if (regexec(&r, tp->name, 0, NULL, 0) != 0)
+			continue;
+
+		if (enable)
+			rc = rte_trace_point_enable(tp->handle);
+		else
+			rc = rte_trace_point_disable(tp->handle);
+		if (rc < 0) {
+			found = 0;
+			break;
 		}
-		if (rc < 0)
-			return rc;
+		found = 1;
 	}
 	regfree(&r);
 
@@ -237,7 +238,7 @@ rte_trace_point_lookup(const char *name)
 		return NULL;
 
 	STAILQ_FOREACH(tp, &tp_list, next)
-		if (strncmp(tp->name, name, TRACE_POINT_NAME_SIZE) == 0)
+		if (strcmp(tp->name, name) == 0)
 			return tp->handle;
 
 	return NULL;
@@ -261,10 +262,9 @@ trace_lcore_mem_dump(FILE *f)
 	struct __rte_trace_header *header;
 	uint32_t count;
 
-	if (trace->nb_trace_mem_list == 0)
-		return;
-
 	rte_spinlock_lock(&trace->lock);
+	if (trace->nb_trace_mem_list == 0)
+		goto out;
 	fprintf(f, "nb_trace_mem_list = %d\n", trace->nb_trace_mem_list);
 	fprintf(f, "\nTrace mem info\n--------------\n");
 	for (count = 0; count < trace->nb_trace_mem_list; count++) {
@@ -275,6 +275,7 @@ trace_lcore_mem_dump(FILE *f)
 		header->stream_header.lcore_id,
 		header->stream_header.thread_name);
 	}
+out:
 	rte_spinlock_unlock(&trace->lock);
 }
 
@@ -298,6 +299,19 @@ rte_trace_dump(FILE *f)
 	fprintf(f, "\nTrace point info\n----------------\n");
 	STAILQ_FOREACH(tp, tp_list, next)
 		trace_point_dump(f, tp);
+}
+
+static void
+thread_get_name(rte_thread_t id, char *name, size_t len)
+{
+#if defined(RTE_EXEC_ENV_LINUX) && defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 12)
+	pthread_getname_np((pthread_t)id.opaque_id, name, len);
+#endif
+#endif
+	RTE_SET_USED(id);
+	RTE_SET_USED(name);
+	RTE_SET_USED(len);
 }
 
 void
@@ -358,7 +372,7 @@ found:
 	/* Store the thread name */
 	char *name = header->stream_header.thread_name;
 	memset(name, 0, __RTE_TRACE_EMIT_STRING_LEN_MAX);
-	rte_thread_getname(pthread_self(), name,
+	thread_get_name(rte_thread_self(), name,
 		__RTE_TRACE_EMIT_STRING_LEN_MAX);
 
 	trace->lcore_meta[count].mem = header;
@@ -412,9 +426,6 @@ trace_mem_free(void)
 {
 	struct trace *trace = trace_obj_get();
 	uint32_t count;
-
-	if (!rte_trace_is_enabled())
-		return;
 
 	rte_spinlock_lock(&trace->lock);
 	for (count = 0; count < trace->nb_trace_mem_list; count++) {
@@ -497,10 +508,7 @@ __rte_trace_point_register(rte_trace_point_t *handle, const char *name,
 	}
 
 	/* Initialize the trace point */
-	if (rte_strscpy(tp->name, name, TRACE_POINT_NAME_SIZE) < 0) {
-		trace_err("name is too long");
-		goto free;
-	}
+	tp->name = name;
 
 	/* Copy the accumulated fields description and clear it for the next
 	 * trace point.
@@ -511,18 +519,18 @@ __rte_trace_point_register(rte_trace_point_t *handle, const char *name,
 	/* Form the trace handle */
 	*handle = sz;
 	*handle |= trace.nb_trace_points << __RTE_TRACE_FIELD_ID_SHIFT;
+	trace_mode_set(handle, trace.mode);
 
 	trace.nb_trace_points++;
 	tp->handle = handle;
 
 	/* Add the trace point at tail */
 	STAILQ_INSERT_TAIL(&tp_list, tp, next);
-	__atomic_thread_fence(__ATOMIC_RELEASE);
+	rte_atomic_thread_fence(rte_memory_order_release);
 
 	/* All Good !!! */
 	return 0;
-free:
-	free(tp);
+
 fail:
 	if (trace.register_errno == 0)
 		trace.register_errno = rte_errno;

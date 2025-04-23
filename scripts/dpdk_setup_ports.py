@@ -40,9 +40,11 @@ march = os.uname()[4]
 # 32  : no errors - mlx5 share object should be loaded
 # 48  : no errors - both mlx4/mlx5 share object should be loaded
 # 64  : no errors - napatech 3GD should be running
+# 80  : no errors - mana shared object shoould be loaded
 MLX4_EXIT_CODE = 16
 MLX5_EXIT_CODE = 32
 NTACC_EXIT_CODE = 64
+MANA_EXIT_CODE = 80
 class VFIOBindErr(Exception): pass
 class PCIgenericBindErr(Exception): pass
 
@@ -508,7 +510,7 @@ Other network devices
     def check_ofed_version (self):
         ofed_info='/usr/bin/ofed_info'
 
-        ofed_ver_re = re.compile('.*[-](\d)[.](\d)[-].*')
+        ofed_ver_re = re.compile('.*[-](\d)(\d)?[.](\d)(\d)?[-].*')
 
         ofed_ver = 52
         ofed_ver_show = '5.2'
@@ -529,7 +531,12 @@ Other network devices
         if len(lines)>1:
             m= ofed_ver_re.match(str(lines[0]))
             if m:
-                ver=int(m.group(1))*10+int(m.group(2))
+                if (m.lastindex == 4):
+                    ver=int(m.group(1))*1000+int(m.group(2))*100+int(m.group(3))*10+int(m.group(4))
+                    ofed_ver = 2304
+                    ofed_ver_show = '23.04'
+                else:
+                    ver=int(m.group(1))*10+int(m.group(3))
                 if ver < ofed_ver:
                   print("Installed OFED version is '%s', should be at least '%s' and up." % (lines[0],ofed_ver_show))
                   sys.exit(-1);
@@ -724,7 +731,7 @@ Other network devices
             pass # should we fail here?
 
     def is_hugepage_file_exits(self,socket_id):
-        t = ['2048','1048576']
+        t = ['1048576', '2048']
         for obj in t:
             if map_driver.args.ignore_numa:
                 filename = '/sys/kernel/mm/hugepages/hugepages-{}kB/nr_hugepages'.format(obj)
@@ -962,6 +969,7 @@ Other network devices
 
 
         Broadcom_cnt=0;
+        Mana_cnt=0
         # check how many mellanox cards we have
         Mellanox_cnt=0;
         mlx5_present=0;
@@ -988,6 +996,8 @@ Other network devices
                     mlx4_present = MLX4_EXIT_CODE
             if 'Broadcom' in self.m_devices[key]['Vendor_str']:
                 Broadcom_cnt += 1
+            if 'Microsoft' in self.m_devices[key]['Vendor_str']:
+                Mana_cnt += 1
 
         if not (pa() and pa().dump_interfaces):
             if (Mellanox_cnt > 0) and ((Mellanox_cnt + dummy_cnt) != len(if_list)):
@@ -1098,6 +1108,8 @@ Other network devices
                         raise DpdkSetup('Unable to bind interfaces to driver igb_uio.')
         elif Mellanox_cnt:
             return mlx5_present + mlx4_present
+        elif Mana_cnt:
+            return MANA_EXIT_CODE
         elif Napatech_cnt:
             return NTACC_EXIT_CODE
 

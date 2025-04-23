@@ -30,8 +30,12 @@ sources = files(
         'hns3_tm.c',
         'hns3_ptp.c',
         'hns3_common.c',
-        'hns3_ethdev_dump.c',
+        'hns3_dump.c',
 )
+
+require_iova_in_mbuf = false
+
+annotate_locks = false
 
 deps += ['hash']
 

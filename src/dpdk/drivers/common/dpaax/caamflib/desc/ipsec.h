@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0)
  *
  * Copyright 2008-2016 Freescale Semiconductor Inc.
- * Copyright 2016,2019-2020 NXP
+ * Copyright 2016,2019-2022 NXP
  *
  */
 
@@ -334,9 +334,7 @@ struct ipsec_encap_gcm {
  * @seq_num: IPsec sequence number
  * @spi: IPsec SPI (Security Parameters Index)
  * @ip_hdr_len: optional IP Header length (in bytes)
- *  reserved - 16b
- *  Opt. IP Hdr Len - 16b
- * @ip_hdr: optional IP Header content (only for IPsec legacy mode)
+ *  IP header must follow directly after ipsec_encap_pdb
  */
 struct ipsec_encap_pdb {
 	uint32_t options;
@@ -350,7 +348,6 @@ struct ipsec_encap_pdb {
 	};
 	uint32_t spi;
 	uint32_t ip_hdr_len;
-	uint8_t ip_hdr[0];
 };
 
 static inline unsigned int
@@ -710,6 +707,11 @@ static inline void __gen_auth_key(struct program *program,
 	case OP_PCL_IPSEC_HMAC_SHA2_512_256:
 		dkp_protid = OP_PCLID_DKP_SHA512;
 		break;
+	case OP_PCL_IPSEC_HMAC_SHA2_224_96:
+	case OP_PCL_IPSEC_HMAC_SHA2_224_112:
+	case OP_PCL_IPSEC_HMAC_SHA2_224_224:
+		dkp_protid = OP_PCLID_DKP_SHA224;
+		break;
 	default:
 		KEY(program, KEY2, authdata->key_enc_flags, authdata->key,
 		    authdata->keylen, INLINE_KEY(authdata));
@@ -771,17 +773,17 @@ cnstr_shdsc_ipsec_encap(uint32_t *descbuf, bool ps, bool swap,
 		PROGRAM_SET_36BIT_ADDR(p);
 	phdr = SHR_HDR(p, share, hdr, 0);
 	__rta_copy_ipsec_encap_pdb(p, pdb, cipherdata->algtype);
-	COPY_DATA(p, pdb->ip_hdr, pdb->ip_hdr_len);
+
+	/* IP header if any follows the encap_pdb */
+	if (pdb->ip_hdr_len > 0) {
+		void *ip_hdr = pdb + 1;
+		COPY_DATA(p, ip_hdr, pdb->ip_hdr_len);
+	}
 	SET_LABEL(p, hdr);
 	pkeyjmp = JUMP(p, keyjmp, LOCAL_JUMP, ALL_TRUE, BOTH|SHRD);
-	if (authdata->keylen) {
-		if (rta_sec_era < RTA_SEC_ERA_6)
-			KEY(p, MDHA_SPLIT_KEY, authdata->key_enc_flags,
-			    authdata->key, authdata->keylen,
-			    INLINE_KEY(authdata));
-		else
-			__gen_auth_key(p, authdata);
-	}
+	if (authdata->keylen)
+		__gen_auth_key(p, authdata);
+
 	if (cipherdata->keylen)
 		KEY(p, KEY1, cipherdata->key_enc_flags, cipherdata->key,
 		    cipherdata->keylen, INLINE_KEY(cipherdata));
@@ -841,14 +843,9 @@ cnstr_shdsc_ipsec_decap(uint32_t *descbuf, bool ps, bool swap,
 	__rta_copy_ipsec_decap_pdb(p, pdb, cipherdata->algtype);
 	SET_LABEL(p, hdr);
 	pkeyjmp = JUMP(p, keyjmp, LOCAL_JUMP, ALL_TRUE, BOTH|SHRD);
-	if (authdata->keylen) {
-		if (rta_sec_era < RTA_SEC_ERA_6)
-			KEY(p, MDHA_SPLIT_KEY, authdata->key_enc_flags,
-			    authdata->key, authdata->keylen,
-			    INLINE_KEY(authdata));
-		else
-			__gen_auth_key(p, authdata);
-	}
+	if (authdata->keylen)
+		__gen_auth_key(p, authdata);
+
 	if (cipherdata->keylen)
 		KEY(p, KEY1, cipherdata->key_enc_flags, cipherdata->key,
 		    cipherdata->keylen, INLINE_KEY(cipherdata));
@@ -918,7 +915,13 @@ cnstr_shdsc_ipsec_encap_des_aes_xcbc(uint32_t *descbuf,
 	PROGRAM_CNTXT_INIT(p, descbuf, 0);
 	phdr = SHR_HDR(p, share, hdr, 0);
 	__rta_copy_ipsec_encap_pdb(p, pdb, cipherdata->algtype);
-	COPY_DATA(p, pdb->ip_hdr, pdb->ip_hdr_len);
+
+	/* IP header if any follows the encap_pdb */
+	if (pdb->ip_hdr_len > 0) {
+		void *ip_hdr = pdb + 1;
+		COPY_DATA(p, ip_hdr, pdb->ip_hdr_len);
+	}
+
 	SET_LABEL(p, hdr);
 	pkeyjump = JUMP(p, keyjump, LOCAL_JUMP, ALL_TRUE, SHRD | SELF);
 	/*
@@ -1248,12 +1251,6 @@ cnstr_shdsc_ipsec_new_encap(uint32_t *descbuf, bool ps,
 	LABEL(l2copy);
 	REFERENCE(pl2copy);
 
-	if (rta_sec_era < RTA_SEC_ERA_8) {
-		pr_err("IPsec new mode encap: available only for Era %d or above\n",
-		       USER_SEC_ERA(RTA_SEC_ERA_8));
-		return -ENOTSUP;
-	}
-
 	PROGRAM_CNTXT_INIT(p, descbuf, 0);
 	if (swap)
 		PROGRAM_SET_BSWAP(p);
@@ -1363,12 +1360,6 @@ cnstr_shdsc_ipsec_new_decap(uint32_t *descbuf, bool ps,
 	LABEL(hdr);
 	REFERENCE(phdr);
 
-	if (rta_sec_era < RTA_SEC_ERA_8) {
-		pr_err("IPsec new mode decap: available only for Era %d or above\n",
-		       USER_SEC_ERA(RTA_SEC_ERA_8));
-		return -ENOTSUP;
-	}
-
 	PROGRAM_CNTXT_INIT(p, descbuf, 0);
 	if (swap)
 		PROGRAM_SET_BSWAP(p);
@@ -1402,7 +1393,7 @@ cnstr_shdsc_ipsec_new_decap(uint32_t *descbuf, bool ps,
  * layers to determine whether keys can be inlined or not. To be used as first
  * parameter of rta_inline_query().
  */
-#define IPSEC_AUTH_VAR_BASE_DESC_LEN	(27 * CAAM_CMD_SZ)
+#define IPSEC_AUTH_VAR_BASE_DESC_LEN	(31 * CAAM_CMD_SZ)
 
 /**
  * IPSEC_AUTH_VAR_AES_DEC_BASE_DESC_LEN - IPsec AES decap shared descriptor

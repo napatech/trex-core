@@ -154,6 +154,7 @@ To test it you can run `sudo dmidecode -t memory | grep CHANNEL` and check CHANN
 | Amazon ENA | paravirtualized    | + | - | Amazon Cloud
 | MS Failsafe | paravirtualized    | + | - | Azure with DPDK mlx5 support 
 | memif | shared memory rings | + | - | see link:https://doc.dpdk.org/guides/nics/memif.html[memif] support multi core for STL. ASTF only one core
+| MANA | paravirtualized    | - | - | Microsoft Azure
 |=================
 
 [NOTE]
@@ -289,7 +290,7 @@ Supported Linux versions:
 
 NOTE: Additional OS versions may be supported by compiling the necessary drivers.
 
-To check whether a kernel is 64-bit, verify that the ouput of the following command is `x86_64`.
+To check whether a kernel is 64-bit, verify that the output of the following command is `x86_64`.
 
 [source,bash]
 ----
@@ -486,7 +487,7 @@ Run the following:
 | --ip | List of IPs to use for each interface. If --ip and --dest-macs are not specified, the script assumes loopback connections (0&#8596;1, 2&#8596;3 etc.). | --ip 1.2.3.4 5.6.7.8
 |--def-gw | List of default gateways to use for each interface. When using the --ip option, also use the --def_gw option. | --def-gw 3.4.5.6 7.8.9.10
 | --ci | Cores include: White list of cores to use. Include enough cores for each NUMA. | --ci 0 2 4 5 6
-| --ce | Cores exclude: Black list of cores to exclude. When excluding cores, ensure that enough remain for each NUMA. | --ci 10 11 12
+| --ce | Cores exclude: Black list of cores to exclude. When excluding cores, ensure that enough remain for each NUMA. | --ce 10 11 12
 | --no-ht | No HyperThreading: Use only one thread of each core specified in the configuration file. |
 | --prefix | (Advanced option) Prefix to be used in TRex configuration in case of parallel instances. | --prefix first_instance
 | --zmq-pub-port | (Advanced option) ZMQ Publisher port to be used in TRex configuration in case of parallel instances. | --zmq-pub-port 4000
@@ -823,11 +824,11 @@ Configuration example:
 [source,bash]
 ----
     ...
-    interfaces: [ '--vdev=net_bonding0,mode=0,slave=d8:00.0,slave=d8:00.1', 'dummy' ]
+    interfaces: [ '--vdev=net_bonding0,mode=0,member=d8:00.0,member=d8:00.1', 'dummy' ]
     ...
 ----
 
-The bonded device inherits attributes from the first slave device. All slave devices should have same speed and duplex.
+The bonded device inherits attributes from the first member device. All member devices should have same speed and duplex.
 
 NOTE: When mode 4 is used, more settle time could be needed. Use -w command line option to give enough time for it.
 
@@ -959,7 +960,7 @@ anchor:trex_load_bal[]
 If you want simple VLAN support, this is probably *not* the feature to use. This feature is used for load balancing. To configure VLAN support, see the ``vlan'' field in the xref:trex_config_yaml_config_file[Platform YAML] section.
 
 
-The VLAN Trunk TRex feature attempts to solve the router port bandwidth limitation when the traffic profile is asymmetric (example: Asymmetric SFR profile).
+The VLAN Trunk TRex feature attempts to solve the router port bandwidth limitation when the traffic profile is asymmetric (example: Asymmetric EMIX profile).
 
 This feature converts asymmetric traffic to symmetric, from the port perspective, using router sub-interfaces. This requires TRex to send the traffic on two VLANs, as described below.
 
@@ -985,7 +986,7 @@ For a full file example, see the TRex source in: scripts/cap2/ipv4_load_balance.
 
 *Problem definition:*::
 
-Scenario: TRex with two ports and an SFR traffic profile.
+Scenario: TRex with two ports and an EMIX traffic profile.
 
 .Without VLAN/sub interfaces, all client emulated traffic is sent on port 0, and all server emulated traffic (example: HTTP response) on port 1.
 [source,python]
@@ -1004,7 +1005,7 @@ TRex port 0 ( server VLAN1) <->  | DUT  | <-> TRex port 1 ( client-VLAN1)
 In this case, traffic on vlan0 is sent as before, while for traffic on vlan1, the order is reversed (client traffic sent on port1 and server traffic on port0).
 TRex divides the flows evenly between the vlans. This results in an equal amount of traffic on each port.
 
-*Router configuation:*::
+*Router configuration:*::
 [source,python]
 ----
         !
@@ -1191,7 +1192,7 @@ asr1k(config)#ipv6 route 5000::/64 3001::2
 <2> Add pbr
 <3> Enable IPv6 routing
 <4> MAC address setting. Should be TRex MAC.
-<5> PBR configuraion
+<5> PBR configuration
 
 
 === Client clustering configuration
@@ -1435,7 +1436,7 @@ For example, in this case 16.0.0.1->48.0.0.1 ICMP will be the flow for latency. 
 ==== Clustering example
 
 In this example we have one DUT with four 10gb interfaces and one TRex with two 40Gb/sec interfaces and we want to convert the traffic from 2 TRex interfaces to 4 DUT Interfaces.
-The folowing figure shows the topology
+The following figure shows the topology
 
 .Cluster example
 image:images/cluster_topo1.png[title="Loopback example"]
@@ -1532,14 +1533,14 @@ groups:
 <1> *All* the IPs from client pools and default pool should be maped in this file, it is possible to have wider range  in cluster file
 
 
-The following diagram shows how new flow src_ip/dest_ip/next-hop/vlan is choosen with cluster file
+The following diagram shows how new flow src_ip/dest_ip/next-hop/vlan is chosen with cluster file
 
 .Cluster example
 image:images/new_flow_generation.png[title="Loopback example"]
 
 [NOTE]
 =====================================================================
-Latency stream will check only 12.1.1.1/4050 path (one DUT intertface)  there is no way to check latency on all the ports in current version
+Latency stream will check only 12.1.1.1/4050 path (one DUT interface)  there is no way to check latency on all the ports in current version
 =====================================================================
 
 [NOTE]
@@ -1550,7 +1551,7 @@ DUT should have a static route to move packets from client to server and vice ve
 
 An example of one flow generation
 
-1. next hop resolotion. TRex resolve all the next hop option e.g. 11.10.0.1/4050 11.11.0.1/4051
+1. next hop resolution. TRex resolve all the next hop option e.g. 11.10.0.1/4050 11.11.0.1/4051
 2. Choose template by CPS, 50% probability for each. take template #1
 3. SRC_IP=12.1.1.2, DEST_IP=13.1.1.2
 4. Allocate src_port for 12.1.1.2 ==>src_port=1025 for the first flow of client=12.1.1.2
@@ -1688,7 +1689,7 @@ groups:
 
 
 ----
-<1> We added more clusters beacuse more IPs will be generated (+mask)
+<1> We added more clusters because more IPs will be generated (+mask)
 
 
 
@@ -1729,7 +1730,7 @@ This mode can provide better connections-per-second performance than mode 1. But
 [bash]>sudo ./t-rex-64 -f cap2/http_simple.yaml -c 4  -l 1000 -d 100000 -m 30  --learn-mode 1
 ----
 
-*SFR traffic without bundling/ALG support*
+*EMIX traffic without bundling/ALG support*
 
 [source,bash]
 ----
@@ -1827,7 +1828,7 @@ to the command line options, where <sample> is the sample rate. The number of fl
 
 [NOTE]
 ============
-This feature changes the TTL of the sampled flows to 255 and expects to receive packets with TTL 254 or 255 (one routing hop). If you have more than one hop in your setup, use `--hops` to change it to a higher value. More than one hop is possible if there are number of routers betwean TRex client side and TRex server side.
+This feature changes the TTL of the sampled flows to 255 and expects to receive packets with TTL 254 or 255 (one routing hop). If you have more than one hop in your setup, use `--hops` to change it to a higher value. More than one hop is possible if there are number of routers between TRex client side and TRex server side.
 ============
 
 This feature ensures that:
@@ -2425,6 +2426,9 @@ link:trex_appendix_software_mode.html[software mode]
 
 anchor:azure[]
 link:trex_appendix_azure.html[Azure DPDK support]
+
+anchor:mana_support[]
+link:trex_appendix_mana.html[Mana support]
 
 
 

@@ -2,7 +2,7 @@
  * Copyright(c) 2021 Intel Corporation
  */
 
-#include <rte_bus_pci.h>
+#include <bus_pci_driver.h>
 #include <rte_devargs.h>
 #include <rte_dmadev_pmd.h>
 #include <rte_malloc.h>
@@ -38,13 +38,13 @@ idxd_pci_dev_command(struct idxd_dmadev *idxd, enum rte_idxd_cmds command)
 			IDXD_PMD_ERR("Timeout waiting for command response from HW");
 			rte_spinlock_unlock(&idxd->u.pci->lk);
 			err_code &= CMDSTATUS_ERR_MASK;
-			return -err_code;
+			return err_code;
 		}
 	} while (err_code & CMDSTATUS_ACTIVE_MASK);
 	rte_spinlock_unlock(&idxd->u.pci->lk);
 
 	err_code &= CMDSTATUS_ERR_MASK;
-	return -err_code;
+	return err_code;
 }
 
 static uint32_t *
@@ -115,19 +115,38 @@ idxd_pci_dev_close(struct rte_dma_dev *dev)
 {
 	struct idxd_dmadev *idxd = dev->fp_obj->dev_private;
 	uint8_t err_code;
+	int is_last_wq;
 
-	/* disable the device */
-	err_code = idxd_pci_dev_command(idxd, idxd_disable_dev);
-	if (err_code) {
-		IDXD_PMD_ERR("Error disabling device: code %#x", err_code);
-		return err_code;
+	if (idxd_is_wq_enabled(idxd)) {
+		/* disable the wq */
+		err_code = idxd_pci_dev_command(idxd, idxd_disable_wq);
+		if (err_code) {
+			IDXD_PMD_ERR("Error disabling wq: code %#x", err_code);
+			return err_code;
+		}
+		IDXD_PMD_DEBUG("IDXD WQ disabled OK");
 	}
-	IDXD_PMD_DEBUG("IDXD Device disabled OK");
 
 	/* free device memory */
 	IDXD_PMD_DEBUG("Freeing device driver memory");
-	rte_free(idxd->batch_idx_ring);
+	rte_free(idxd->batch_comp_ring);
 	rte_free(idxd->desc_ring);
+
+	/* if this is the last WQ on the device, disable the device and free
+	 * the PCI struct
+	 */
+	/* NOTE: review for potential ordering optimization */
+	is_last_wq = (__atomic_fetch_sub(&idxd->u.pci->ref_count, 1, __ATOMIC_SEQ_CST) == 1);
+	if (is_last_wq) {
+		/* disable the device */
+		err_code = idxd_pci_dev_command(idxd, idxd_disable_dev);
+		if (err_code) {
+			IDXD_PMD_ERR("Error disabling device: code %#x", err_code);
+			return err_code;
+		}
+		IDXD_PMD_DEBUG("IDXD device disabled OK");
+		rte_free(idxd->u.pci);
+	}
 
 	return 0;
 }
@@ -159,12 +178,13 @@ init_pci_device(struct rte_pci_device *dev, struct idxd_dmadev *idxd,
 	uint8_t lg2_max_batch, lg2_max_copy_size;
 	unsigned int i, err_code;
 
-	pci = malloc(sizeof(*pci));
+	pci = rte_malloc(NULL, sizeof(*pci), 0);
 	if (pci == NULL) {
 		IDXD_PMD_ERR("%s: Can't allocate memory", __func__);
 		err_code = -1;
 		goto err;
 	}
+	memset(pci, 0, sizeof(*pci));
 	rte_spinlock_init(&pci->lk);
 
 	/* assign the bar registers, and then configure device */
@@ -175,6 +195,14 @@ init_pci_device(struct rte_pci_device *dev, struct idxd_dmadev *idxd,
 	pci->wq_regs_base = RTE_PTR_ADD(pci->regs, wq_offset * 0x100);
 	pci->portals = dev->mem_resource[2].addr;
 	pci->wq_cfg_sz = (pci->regs->wqcap >> 24) & 0x0F;
+
+	/* reset */
+	idxd->u.pci = pci;
+	err_code = idxd_pci_dev_command(idxd, idxd_reset_device);
+	if (err_code) {
+		IDXD_PMD_ERR("Error reset device: code %#x", err_code);
+		goto err;
+	}
 
 	/* sanity check device status */
 	if (pci->regs->gensts & GENSTS_DEV_STATE_MASK) {
@@ -289,6 +317,37 @@ idxd_dmadev_probe_pci(struct rte_pci_driver *drv, struct rte_pci_device *dev)
 	IDXD_PMD_INFO("Init %s on NUMA node %d", name, dev->device.numa_node);
 	dev->device.driver = &drv->driver;
 
+	if (rte_eal_process_type() != RTE_PROC_PRIMARY) {
+		char qname[32];
+		int max_qid;
+
+		/* look up queue 0 to get the PCI structure */
+		snprintf(qname, sizeof(qname), "%s-q0", name);
+		IDXD_PMD_INFO("Looking up %s\n", qname);
+		ret = idxd_dmadev_create(qname, &dev->device, NULL, &idxd_pci_ops);
+		if (ret != 0) {
+			IDXD_PMD_ERR("Failed to create dmadev %s", name);
+			return ret;
+		}
+		qid = rte_dma_get_dev_id_by_name(qname);
+		max_qid = __atomic_load_n(
+			&((struct idxd_dmadev *)rte_dma_fp_objs[qid].dev_private)->u.pci->ref_count,
+			__ATOMIC_SEQ_CST);
+
+		/* we have queue 0 done, now configure the rest of the queues */
+		for (qid = 1; qid < max_qid; qid++) {
+			/* add the queue number to each device name */
+			snprintf(qname, sizeof(qname), "%s-q%d", name, qid);
+			IDXD_PMD_INFO("Looking up %s\n", qname);
+			ret = idxd_dmadev_create(qname, &dev->device, NULL, &idxd_pci_ops);
+			if (ret != 0) {
+				IDXD_PMD_ERR("Failed to create dmadev %s", name);
+				return ret;
+			}
+		}
+		return 0;
+	}
+
 	if (dev->device.devargs && dev->device.devargs->args[0] != '\0') {
 		/* if the number of devargs grows beyond just 1, use rte_kvargs */
 		if (sscanf(dev->device.devargs->args,
@@ -330,6 +389,7 @@ idxd_dmadev_probe_pci(struct rte_pci_driver *drv, struct rte_pci_device *dev)
 				free(idxd.u.pci);
 			return ret;
 		}
+		__atomic_fetch_add(&idxd.u.pci->ref_count, 1, __ATOMIC_SEQ_CST);
 	}
 
 	return 0;
@@ -359,10 +419,10 @@ idxd_dmadev_remove_pci(struct rte_pci_device *dev)
 	IDXD_PMD_INFO("Closing %s on NUMA node %d", name, dev->device.numa_node);
 
 	RTE_DMA_FOREACH_DEV(i) {
-		struct rte_dma_info *info = {0};
-		rte_dma_info_get(i, info);
-		if (strncmp(name, info->dev_name, strlen(name)) == 0)
-			idxd_dmadev_destroy(info->dev_name);
+		struct rte_dma_info info;
+		rte_dma_info_get(i, &info);
+		if (strncmp(name, info.dev_name, strlen(name)) == 0)
+			idxd_dmadev_destroy(info.dev_name);
 	}
 
 	return 0;

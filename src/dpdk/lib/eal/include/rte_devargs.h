@@ -21,8 +21,10 @@ extern "C" {
 #endif
 
 #include <stdio.h>
-#include <rte_compat.h>
-#include <rte_bus.h>
+
+#include <rte_dev.h>
+
+struct rte_bus;
 
 /**
  * Bus type key in global devargs syntax.
@@ -76,7 +78,6 @@ struct rte_devargs {
 	enum rte_dev_policy policy;
 	/** Name of the device. */
 	char name[RTE_DEV_NAME_MAX_LEN];
-	RTE_STD_C11
 	union {
 		const char *args; /**< legacy name. */
 		const char *drv_str; /**< driver-related part of device string. */
@@ -167,7 +168,6 @@ __rte_format_printf(2, 0);
  * @param da
  *   The devargs structure holding the device information.
  */
-__rte_experimental
 void
 rte_devargs_reset(struct rte_devargs *da);
 

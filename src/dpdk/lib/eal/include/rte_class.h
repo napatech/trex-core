@@ -75,7 +75,6 @@ typedef int (*rte_class_cmp_t)(const struct rte_class *cls, const void *data);
  * @return
  *	 A pointer to a rte_class structure or NULL in case no class matches
  */
-__rte_experimental
 struct rte_class *
 rte_class_find(const struct rte_class *start, rte_class_cmp_t cmp,
 	       const void *data);
@@ -83,7 +82,6 @@ rte_class_find(const struct rte_class *start, rte_class_cmp_t cmp,
 /**
  * Find the registered class for a given name.
  */
-__rte_experimental
 struct rte_class *
 rte_class_find_by_name(const char *name);
 
@@ -94,7 +92,6 @@ rte_class_find_by_name(const char *name);
  *   A pointer to a rte_class structure describing the class
  *   to be registered.
  */
-__rte_experimental
 void rte_class_register(struct rte_class *cls);
 
 /**
@@ -104,7 +101,6 @@ void rte_class_register(struct rte_class *cls);
  *   A pointer to a rte_class structure describing the class
  *   to be unregistered.
  */
-__rte_experimental
 void rte_class_unregister(struct rte_class *cls);
 
 /**

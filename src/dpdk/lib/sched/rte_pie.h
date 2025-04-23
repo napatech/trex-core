@@ -12,7 +12,7 @@ extern "C" {
 /**
  * @file
  * Proportional Integral controller Enhanced (PIE)
- **/
+ */
 
 #include <stdint.h>
 
@@ -31,7 +31,6 @@ extern "C" {
 
 /**
  * PIE configuration parameters passed by user
- *
  */
 struct rte_pie_params {
 	uint16_t qdelay_ref;           /**< Latency Target (milliseconds) */
@@ -42,7 +41,6 @@ struct rte_pie_params {
 
 /**
  * PIE configuration parameters
- *
  */
 struct rte_pie_config {
 	uint64_t qdelay_ref;           /**< Latency Target (in CPU cycles.) */
@@ -79,7 +77,6 @@ struct rte_pie {
  * @retval !0 error
  */
 int
-__rte_experimental
 rte_pie_rt_data_init(struct rte_pie *pie);
 
 /**
@@ -96,7 +93,6 @@ rte_pie_rt_data_init(struct rte_pie *pie);
  * @retval !0 error
  */
 int
-__rte_experimental
 rte_pie_config_init(struct rte_pie_config *pie_cfg,
 	const uint16_t qdelay_ref,
 	const uint16_t dp_update_interval,
@@ -117,7 +113,6 @@ rte_pie_config_init(struct rte_pie_config *pie_cfg,
  * @retval !0 drop the packet
  */
 static int
-__rte_experimental
 rte_pie_enqueue_empty(const struct rte_pie_config *pie_cfg,
 	struct rte_pie *pie,
 	uint32_t pkt_len)
@@ -149,7 +144,6 @@ rte_pie_enqueue_empty(const struct rte_pie_config *pie_cfg,
  * @param time [in] current time (measured in cpu cycles)
  */
 static void
-__rte_experimental
 _calc_drop_probability(const struct rte_pie_config *pie_cfg,
 	struct rte_pie *pie, uint64_t time)
 {
@@ -213,12 +207,10 @@ _calc_drop_probability(const struct rte_pie_config *pie_cfg,
  * @retval 1 drop the packet
  */
 static inline int
-__rte_experimental
 _rte_pie_drop(const struct rte_pie_config *pie_cfg,
 	struct rte_pie *pie)
 {
-	uint64_t rand_value;
-	double qdelay = pie_cfg->qdelay_ref * 0.5;
+	uint64_t qdelay = pie_cfg->qdelay_ref / 2;
 
 	/* PIE is active but the queue is not congested: return 0 */
 	if (((pie->qdelay_old < qdelay) && (pie->drop_prob < 0.2)) ||
@@ -240,9 +232,7 @@ _rte_pie_drop(const struct rte_pie_config *pie_cfg,
 	if (pie->accu_prob >= 8.5)
 		return 1;
 
-	rand_value = rte_rand()/RTE_RAND_MAX;
-
-	if ((double)rand_value < pie->drop_prob) {
+	if (rte_drand() < pie->drop_prob) {
 		pie->accu_prob = 0;
 		return 1;
 	}
@@ -265,7 +255,6 @@ _rte_pie_drop(const struct rte_pie_config *pie_cfg,
  * @retval 2 drop the packet based on mark probability criterion
  */
 static inline int
-__rte_experimental
 rte_pie_enqueue_nonempty(const struct rte_pie_config *pie_cfg,
 	struct rte_pie *pie,
 	uint32_t pkt_len,
@@ -333,7 +322,6 @@ rte_pie_enqueue_nonempty(const struct rte_pie_config *pie_cfg,
  * @retval 1 drop the packet based on drop probability criteria
  */
 static inline int
-__rte_experimental
 rte_pie_enqueue(const struct rte_pie_config *pie_cfg,
 	struct rte_pie *pie,
 	const unsigned int qlen,
@@ -358,7 +346,6 @@ rte_pie_enqueue(const struct rte_pie_config *pie_cfg,
  * @param time [in] current time stamp in cpu cycles
  */
 static inline void
-__rte_experimental
 rte_pie_dequeue(struct rte_pie *pie,
 	uint32_t pkt_len,
 	uint64_t time)

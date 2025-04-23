@@ -6,12 +6,14 @@ if is_windows
 endif
 
 drivers = [
-        'acc100',
+        'acc',
         'fpga_5gnr_fec',
         'fpga_lte_fec',
         'la12xx',
         'null',
         'turbo_sw',
 ]
+
+std_deps = [ 'bbdev' ]
 
 log_prefix = 'pmd.bb'

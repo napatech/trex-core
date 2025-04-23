@@ -9,10 +9,13 @@
 #include <rte_malloc.h>
 #include <rte_errno.h>
 #include <rte_tailq.h>
+#include <rte_ring_elem.h>
 
+#include "member.h"
 #include "rte_member.h"
 #include "rte_member_ht.h"
 #include "rte_member_vbf.h"
+#include "rte_member_sketch.h"
 
 TAILQ_HEAD(rte_member_list, rte_tailq_entry);
 static struct rte_tailq_elem rte_member_tailq = {
@@ -72,6 +75,9 @@ rte_member_free(struct rte_member_setsum *setsum)
 	case RTE_MEMBER_TYPE_VBF:
 		rte_member_free_vbf(setsum);
 		break;
+	case RTE_MEMBER_TYPE_SKETCH:
+		rte_member_free_sketch(setsum);
+		break;
 	default:
 		break;
 	}
@@ -86,6 +92,8 @@ rte_member_create(const struct rte_member_parameters *params)
 	struct rte_member_list *member_list;
 	struct rte_member_setsum *setsum;
 	int ret;
+	char ring_name[RTE_RING_NAMESIZE];
+	struct rte_ring *sketch_key_ring = NULL;
 
 	if (params == NULL) {
 		rte_errno = EINVAL;
@@ -95,9 +103,19 @@ rte_member_create(const struct rte_member_parameters *params)
 	if (params->key_len == 0 ||
 			params->prim_hash_seed == params->sec_hash_seed) {
 		rte_errno = EINVAL;
-		RTE_MEMBER_LOG(ERR, "Create setsummary with "
-					"invalid parameters\n");
+		MEMBER_LOG(ERR, "Create setsummary with "
+					"invalid parameters");
 		return NULL;
+	}
+
+	if (params->type == RTE_MEMBER_TYPE_SKETCH) {
+		snprintf(ring_name, sizeof(ring_name), "SK_%s", params->name);
+		sketch_key_ring = rte_ring_create_elem(ring_name, sizeof(uint32_t),
+				rte_align32pow2(params->top_k), params->socket_id, 0);
+		if (sketch_key_ring == NULL) {
+			MEMBER_LOG(ERR, "Sketch Ring Memory allocation failed");
+			return NULL;
+		}
 	}
 
 	member_list = RTE_TAILQ_CAST(rte_member_tailq.head, rte_member_list);
@@ -118,7 +136,7 @@ rte_member_create(const struct rte_member_parameters *params)
 	}
 	te = rte_zmalloc("MEMBER_TAILQ_ENTRY", sizeof(*te), 0);
 	if (te == NULL) {
-		RTE_MEMBER_LOG(ERR, "tailq entry allocation failed\n");
+		MEMBER_LOG(ERR, "tailq entry allocation failed");
 		goto error_unlock_exit;
 	}
 
@@ -127,7 +145,7 @@ rte_member_create(const struct rte_member_parameters *params)
 			sizeof(struct rte_member_setsum), RTE_CACHE_LINE_SIZE,
 			params->socket_id);
 	if (setsum == NULL) {
-		RTE_MEMBER_LOG(ERR, "Create setsummary failed\n");
+		MEMBER_LOG(ERR, "Create setsummary failed");
 		goto error_unlock_exit;
 	}
 	strlcpy(setsum->name, params->name, sizeof(setsum->name));
@@ -145,14 +163,17 @@ rte_member_create(const struct rte_member_parameters *params)
 	case RTE_MEMBER_TYPE_VBF:
 		ret = rte_member_create_vbf(setsum, params);
 		break;
+	case RTE_MEMBER_TYPE_SKETCH:
+		ret = rte_member_create_sketch(setsum, params, sketch_key_ring);
+		break;
 	default:
 		goto error_unlock_exit;
 	}
 	if (ret < 0)
 		goto error_unlock_exit;
 
-	RTE_MEMBER_LOG(DEBUG, "Creating a setsummary table with "
-			"mode %u\n", setsum->type);
+	MEMBER_LOG(DEBUG, "Creating a setsummary table with "
+			"mode %u", setsum->type);
 
 	te->data = (void *)setsum;
 	TAILQ_INSERT_TAIL(member_list, te, next);
@@ -162,6 +183,7 @@ rte_member_create(const struct rte_member_parameters *params)
 error_unlock_exit:
 	rte_free(te);
 	rte_free(setsum);
+	rte_ring_free(sketch_key_ring);
 	rte_mcfg_tailq_write_unlock();
 	return NULL;
 }
@@ -178,6 +200,23 @@ rte_member_add(const struct rte_member_setsum *setsum, const void *key,
 		return rte_member_add_ht(setsum, key, set_id);
 	case RTE_MEMBER_TYPE_VBF:
 		return rte_member_add_vbf(setsum, key, set_id);
+	case RTE_MEMBER_TYPE_SKETCH:
+		return rte_member_add_sketch(setsum, key, set_id);
+	default:
+		return -EINVAL;
+	}
+}
+
+int
+rte_member_add_byte_count(const struct rte_member_setsum *setsum,
+			  const void *key, uint32_t byte_count)
+{
+	if (setsum == NULL || key == NULL || byte_count == 0)
+		return -EINVAL;
+
+	switch (setsum->type) {
+	case RTE_MEMBER_TYPE_SKETCH:
+		return rte_member_add_sketch_byte_count(setsum, key, byte_count);
 	default:
 		return -EINVAL;
 	}
@@ -195,6 +234,8 @@ rte_member_lookup(const struct rte_member_setsum *setsum, const void *key,
 		return rte_member_lookup_ht(setsum, key, set_id);
 	case RTE_MEMBER_TYPE_VBF:
 		return rte_member_lookup_vbf(setsum, key, set_id);
+	case RTE_MEMBER_TYPE_SKETCH:
+		return rte_member_lookup_sketch(setsum, key, set_id);
 	default:
 		return -EINVAL;
 	}
@@ -262,6 +303,36 @@ rte_member_lookup_multi_bulk(const struct rte_member_setsum *setsum,
 }
 
 int
+rte_member_query_count(const struct rte_member_setsum *setsum,
+		       const void *key, uint64_t *output)
+{
+	if (setsum == NULL || key == NULL || output == NULL)
+		return -EINVAL;
+
+	switch (setsum->type) {
+	case RTE_MEMBER_TYPE_SKETCH:
+		return rte_member_query_sketch(setsum, key, output);
+	default:
+		return -EINVAL;
+	}
+}
+
+int
+rte_member_report_heavyhitter(const struct rte_member_setsum *setsum,
+				void **key, uint64_t *count)
+{
+	if (setsum == NULL || key == NULL || count == NULL)
+		return -EINVAL;
+
+	switch (setsum->type) {
+	case RTE_MEMBER_TYPE_SKETCH:
+		return rte_member_report_heavyhitter_sketch(setsum, key, count);
+	default:
+		return -EINVAL;
+	}
+}
+
+int
 rte_member_delete(const struct rte_member_setsum *setsum, const void *key,
 			member_set_t set_id)
 {
@@ -272,6 +343,8 @@ rte_member_delete(const struct rte_member_setsum *setsum, const void *key,
 	case RTE_MEMBER_TYPE_HT:
 		return rte_member_delete_ht(setsum, key, set_id);
 	/* current vBF implementation does not support delete function */
+	case RTE_MEMBER_TYPE_SKETCH:
+		return rte_member_delete_sketch(setsum, key);
 	case RTE_MEMBER_TYPE_VBF:
 	default:
 		return -EINVAL;
@@ -289,6 +362,9 @@ rte_member_reset(const struct rte_member_setsum *setsum)
 		return;
 	case RTE_MEMBER_TYPE_VBF:
 		rte_member_reset_vbf(setsum);
+		return;
+	case RTE_MEMBER_TYPE_SKETCH:
+		rte_member_reset_sketch(setsum);
 		return;
 	default:
 		return;

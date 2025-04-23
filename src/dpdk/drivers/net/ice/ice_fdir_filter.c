@@ -106,7 +106,7 @@
 	ICE_INSET_IPV6_SRC | ICE_INSET_IPV6_DST | \
 	ICE_INSET_NAT_T_ESP_SPI)
 
-static struct ice_pattern_match_item ice_fdir_pattern_list[] = {
+static struct ice_pattern_match_item ice_fdir_supported_pattern[] = {
 	{pattern_raw,					ICE_INSET_NONE,			ICE_INSET_NONE,			ICE_INSET_NONE},
 	{pattern_ethertype,				ICE_FDIR_INSET_ETH,		ICE_INSET_NONE,			ICE_INSET_NONE},
 	{pattern_eth_ipv4,				ICE_FDIR_INSET_ETH_IPV4,	ICE_INSET_NONE,			ICE_INSET_NONE},
@@ -136,8 +136,6 @@ static struct ice_pattern_match_item ice_fdir_pattern_list[] = {
 	{pattern_eth_ipv6_gtpu,				ICE_FDIR_INSET_IPV6_GTPU,	ICE_FDIR_INSET_IPV6_GTPU,	ICE_INSET_NONE},
 	{pattern_eth_ipv6_gtpu_eh,			ICE_FDIR_INSET_IPV6_GTPU_EH,	ICE_FDIR_INSET_IPV6_GTPU_EH,	ICE_INSET_NONE},
 };
-
-static struct ice_flow_parser ice_fdir_parser;
 
 static int
 ice_fdir_is_tunnel_profile(enum ice_fdir_tunnel_type tunnel_type);
@@ -1147,33 +1145,17 @@ static int
 ice_fdir_init(struct ice_adapter *ad)
 {
 	struct ice_pf *pf = &ad->pf;
-	struct ice_flow_parser *parser;
-	int ret;
 
-	if (ad->hw.dcf_enabled)
-		return 0;
-
-	ret = ice_fdir_setup(pf);
-	if (ret)
-		return ret;
-
-	parser = &ice_fdir_parser;
-
-	return ice_register_parser(parser, ad);
+	return ice_fdir_setup(pf);
 }
 
 static void
 ice_fdir_uninit(struct ice_adapter *ad)
 {
-	struct ice_flow_parser *parser;
 	struct ice_pf *pf = &ad->pf;
 
 	if (ad->hw.dcf_enabled)
 		return;
-
-	parser = &ice_fdir_parser;
-
-	ice_unregister_parser(parser, ad);
 
 	ice_fdir_teardown(pf);
 }
@@ -1826,7 +1808,6 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 	struct ice_fdir_v4 *p_v4 = NULL;
 	struct ice_fdir_v6 *p_v6 = NULL;
 	struct ice_parser_result rslt;
-	struct ice_parser *psr;
 	uint8_t item_num = 0;
 
 	for (item = pattern; item->type != RTE_FLOW_ITEM_TYPE_END; item++) {
@@ -1861,6 +1842,9 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 
 		switch (item_type) {
 		case RTE_FLOW_ITEM_TYPE_RAW: {
+			if (ad->psr == NULL)
+				return -rte_errno;
+
 			raw_spec = item->spec;
 			raw_mask = item->mask;
 
@@ -1868,13 +1852,13 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 				break;
 
 			/* convert raw spec & mask from byte string to int */
-			unsigned char *tmp_spec =
+			unsigned char *spec_pattern =
 				(uint8_t *)(uintptr_t)raw_spec->pattern;
-			unsigned char *tmp_mask =
+			unsigned char *mask_pattern =
 				(uint8_t *)(uintptr_t)raw_mask->pattern;
-			uint16_t udp_port = 0;
+			uint8_t *tmp_spec, *tmp_mask;
 			uint16_t tmp_val = 0;
-			uint8_t pkt_len = 0;
+			uint16_t pkt_len = 0;
 			uint8_t tmp = 0;
 			int i, j;
 
@@ -1883,8 +1867,18 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 				pkt_len)
 				return -rte_errno;
 
+			tmp_spec = rte_zmalloc(NULL, pkt_len / 2, 0);
+			if (!tmp_spec)
+				return -rte_errno;
+
+			tmp_mask = rte_zmalloc(NULL, pkt_len / 2, 0);
+			if (!tmp_mask) {
+				rte_free(tmp_spec);
+				return -rte_errno;
+			}
+
 			for (i = 0, j = 0; i < pkt_len; i += 2, j++) {
-				tmp = tmp_spec[i];
+				tmp = spec_pattern[i];
 				if (tmp >= 'a' && tmp <= 'f')
 					tmp_val = tmp - 'a' + 10;
 				if (tmp >= 'A' && tmp <= 'F')
@@ -1893,7 +1887,7 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 					tmp_val = tmp - '0';
 
 				tmp_val *= 16;
-				tmp = tmp_spec[i + 1];
+				tmp = spec_pattern[i + 1];
 				if (tmp >= 'a' && tmp <= 'f')
 					tmp_spec[j] = tmp_val + tmp - 'a' + 10;
 				if (tmp >= 'A' && tmp <= 'F')
@@ -1901,7 +1895,7 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 				if (tmp >= '0' && tmp <= '9')
 					tmp_spec[j] = tmp_val + tmp - '0';
 
-				tmp = tmp_mask[i];
+				tmp = mask_pattern[i];
 				if (tmp >= 'a' && tmp <= 'f')
 					tmp_val = tmp - 'a' + 10;
 				if (tmp >= 'A' && tmp <= 'F')
@@ -1910,7 +1904,7 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 					tmp_val = tmp - '0';
 
 				tmp_val *= 16;
-				tmp = tmp_mask[i + 1];
+				tmp = mask_pattern[i + 1];
 				if (tmp >= 'a' && tmp <= 'f')
 					tmp_mask[j] = tmp_val + tmp - 'a' + 10;
 				if (tmp >= 'A' && tmp <= 'F')
@@ -1921,15 +1915,8 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 
 			pkt_len /= 2;
 
-			if (ice_parser_create(&ad->hw, &psr))
+			if (ice_parser_run(ad->psr, tmp_spec, pkt_len, &rslt))
 				return -rte_errno;
-			if (ice_get_open_tunnel_port(&ad->hw, TNL_VXLAN,
-						     &udp_port))
-				ice_parser_vxlan_tunnel_set(psr, udp_port,
-							    true);
-			if (ice_parser_run(psr, tmp_spec, pkt_len, &rslt))
-				return -rte_errno;
-			ice_parser_destroy(psr);
 
 			if (!tmp_mask)
 				return -rte_errno;
@@ -1953,6 +1940,8 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 
 			filter->parser_ena = true;
 
+			rte_free(tmp_spec);
+			rte_free(tmp_mask);
 			break;
 		}
 
@@ -1964,17 +1953,17 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 			if (!(eth_spec && eth_mask))
 				break;
 
-			if (!rte_is_zero_ether_addr(&eth_mask->dst))
+			if (!rte_is_zero_ether_addr(&eth_mask->hdr.dst_addr))
 				*input_set |= ICE_INSET_DMAC;
-			if (!rte_is_zero_ether_addr(&eth_mask->src))
+			if (!rte_is_zero_ether_addr(&eth_mask->hdr.src_addr))
 				*input_set |= ICE_INSET_SMAC;
 
 			next_type = (item + 1)->type;
 			/* Ignore this field except for ICE_FLTR_PTYPE_NON_IP_L2 */
-			if (eth_mask->type == RTE_BE16(0xffff) &&
+			if (eth_mask->hdr.ether_type == RTE_BE16(0xffff) &&
 			    next_type == RTE_FLOW_ITEM_TYPE_END) {
 				*input_set |= ICE_INSET_ETHERTYPE;
-				ether_type = rte_be_to_cpu_16(eth_spec->type);
+				ether_type = rte_be_to_cpu_16(eth_spec->hdr.ether_type);
 
 				if (ether_type == RTE_ETHER_TYPE_IPV4 ||
 				    ether_type == RTE_ETHER_TYPE_IPV6) {
@@ -1990,11 +1979,11 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 				     &filter->input.ext_data_outer :
 				     &filter->input.ext_data;
 			rte_memcpy(&p_ext_data->src_mac,
-				   &eth_spec->src, RTE_ETHER_ADDR_LEN);
+				   &eth_spec->hdr.src_addr, RTE_ETHER_ADDR_LEN);
 			rte_memcpy(&p_ext_data->dst_mac,
-				   &eth_spec->dst, RTE_ETHER_ADDR_LEN);
+				   &eth_spec->hdr.dst_addr, RTE_ETHER_ADDR_LEN);
 			rte_memcpy(&p_ext_data->ether_type,
-				   &eth_spec->type, sizeof(eth_spec->type));
+				   &eth_spec->hdr.ether_type, sizeof(eth_spec->hdr.ether_type));
 			break;
 		case RTE_FLOW_ITEM_TYPE_IPV4:
 			flow_type = ICE_FLTR_PTYPE_NONF_IPV4_OTHER;
@@ -2334,9 +2323,9 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 			if (!(gtp_spec && gtp_mask))
 				break;
 
-			if (gtp_mask->v_pt_rsv_flags ||
-			    gtp_mask->msg_type ||
-			    gtp_mask->msg_len) {
+			if (gtp_mask->hdr.gtp_hdr_info ||
+			    gtp_mask->hdr.msg_type ||
+			    gtp_mask->hdr.plen) {
 				rte_flow_error_set(error, EINVAL,
 						   RTE_FLOW_ERROR_TYPE_ITEM,
 						   item,
@@ -2344,10 +2333,10 @@ ice_fdir_parse_pattern(__rte_unused struct ice_adapter *ad,
 				return -rte_errno;
 			}
 
-			if (gtp_mask->teid == UINT32_MAX)
+			if (gtp_mask->hdr.teid == UINT32_MAX)
 				input_set_o |= ICE_INSET_GTPU_TEID;
 
-			filter->input.gtpu_data.teid = gtp_spec->teid;
+			filter->input.gtpu_data.teid = gtp_spec->hdr.teid;
 			break;
 		case RTE_FLOW_ITEM_TYPE_GTP_PSC:
 			tunnel_type = ICE_FDIR_TUNNEL_TYPE_GTPU_EH;
@@ -2460,7 +2449,7 @@ ice_fdir_parse(struct ice_adapter *ad,
 	item = ice_search_pattern_match_item(ad, pattern, array, array_len,
 					     error);
 
-	if (!ad->devargs.pipe_mode_support && priority >= 1)
+	if (priority >= 1)
 		return -rte_errno;
 
 	if (!item)
@@ -2503,10 +2492,10 @@ error:
 	return ret;
 }
 
-static struct ice_flow_parser ice_fdir_parser = {
+struct ice_flow_parser ice_fdir_parser = {
 	.engine = &ice_fdir_engine,
-	.array = ice_fdir_pattern_list,
-	.array_len = RTE_DIM(ice_fdir_pattern_list),
+	.array = ice_fdir_supported_pattern,
+	.array_len = RTE_DIM(ice_fdir_supported_pattern),
 	.parse_pattern_action = ice_fdir_parse,
 	.stage = ICE_FLOW_STAGE_DISTRIBUTOR,
 };

@@ -20,6 +20,10 @@
 #include <rte_errno.h>
 #include <rte_memcpy.h>
 
+#include "mbuf_log.h"
+
+RTE_LOG_REGISTER_DEFAULT(mbuf_logtype, INFO);
+
 /*
  * pktmbuf pool constructor, given as a callback function to
  * rte_mempool_create(), or called directly if using
@@ -89,7 +93,7 @@ rte_pktmbuf_init(struct rte_mempool *mp,
 	/* start of buffer is after mbuf structure and priv data */
 	m->priv_size = priv_size;
 	m->buf_addr = (char *)m + mbuf_size;
-	m->buf_iova = rte_mempool_virt2iova(m) + mbuf_size;
+	rte_mbuf_iova_set(m, rte_mempool_virt2iova(m) + mbuf_size);
 	m->buf_len = (uint16_t)buf_len;
 
 	/* keep some headroom between start of buffer and data */
@@ -190,8 +194,8 @@ __rte_pktmbuf_init_extmem(struct rte_mempool *mp,
 	RTE_ASSERT(ctx->off + ext_mem->elt_size <= ext_mem->buf_len);
 
 	m->buf_addr = RTE_PTR_ADD(ext_mem->buf_ptr, ctx->off);
-	m->buf_iova = ext_mem->buf_iova == RTE_BAD_IOVA ?
-		      RTE_BAD_IOVA : (ext_mem->buf_iova + ctx->off);
+	rte_mbuf_iova_set(m, ext_mem->buf_iova == RTE_BAD_IOVA ? RTE_BAD_IOVA :
+								 (ext_mem->buf_iova + ctx->off));
 
 	ctx->off += ext_mem->elt_size;
 	if (ctx->off + ext_mem->elt_size > ext_mem->buf_len) {
@@ -230,7 +234,7 @@ rte_pktmbuf_pool_create_by_ops(const char *name, unsigned int n,
 	int ret;
 
 	if (RTE_ALIGN(priv_size, RTE_MBUF_PRIV_ALIGN) != priv_size) {
-		RTE_LOG(ERR, MBUF, "mbuf priv_size=%u is not aligned\n",
+		MBUF_LOG(ERR, "mbuf priv_size=%u is not aligned",
 			priv_size);
 		rte_errno = EINVAL;
 		return NULL;
@@ -250,7 +254,7 @@ rte_pktmbuf_pool_create_by_ops(const char *name, unsigned int n,
 		mp_ops_name = rte_mbuf_best_mempool_ops();
 	ret = rte_mempool_set_ops_byname(mp, mp_ops_name, NULL);
 	if (ret != 0) {
-		RTE_LOG(ERR, MBUF, "error setting mempool handler\n");
+		MBUF_LOG(ERR, "error setting mempool handler");
 		rte_mempool_free(mp);
 		rte_errno = -ret;
 		return NULL;
@@ -296,7 +300,7 @@ rte_pktmbuf_pool_create_extbuf(const char *name, unsigned int n,
 	int ret;
 
 	if (RTE_ALIGN(priv_size, RTE_MBUF_PRIV_ALIGN) != priv_size) {
-		RTE_LOG(ERR, MBUF, "mbuf priv_size=%u is not aligned\n",
+		MBUF_LOG(ERR, "mbuf priv_size=%u is not aligned",
 			priv_size);
 		rte_errno = EINVAL;
 		return NULL;
@@ -306,12 +310,12 @@ rte_pktmbuf_pool_create_extbuf(const char *name, unsigned int n,
 		const struct rte_pktmbuf_extmem *extm = ext_mem + i;
 
 		if (!extm->elt_size || !extm->buf_len || !extm->buf_ptr) {
-			RTE_LOG(ERR, MBUF, "invalid extmem descriptor\n");
+			MBUF_LOG(ERR, "invalid extmem descriptor");
 			rte_errno = EINVAL;
 			return NULL;
 		}
 		if (data_room_size > extm->elt_size) {
-			RTE_LOG(ERR, MBUF, "ext elt_size=%u is too small\n",
+			MBUF_LOG(ERR, "ext elt_size=%u is too small",
 				priv_size);
 			rte_errno = EINVAL;
 			return NULL;
@@ -320,7 +324,7 @@ rte_pktmbuf_pool_create_extbuf(const char *name, unsigned int n,
 	}
 	/* Check whether enough external memory provided. */
 	if (n_elts < n) {
-		RTE_LOG(ERR, MBUF, "not enough extmem\n");
+		MBUF_LOG(ERR, "not enough extmem");
 		rte_errno = ENOMEM;
 		return NULL;
 	}
@@ -341,7 +345,7 @@ rte_pktmbuf_pool_create_extbuf(const char *name, unsigned int n,
 	mp_ops_name = rte_mbuf_best_mempool_ops();
 	ret = rte_mempool_set_ops_byname(mp, mp_ops_name, NULL);
 	if (ret != 0) {
-		RTE_LOG(ERR, MBUF, "error setting mempool handler\n");
+		MBUF_LOG(ERR, "error setting mempool handler");
 		rte_mempool_free(mp);
 		rte_errno = -ret;
 		return NULL;
@@ -391,7 +395,7 @@ int rte_mbuf_check(const struct rte_mbuf *m, int is_header,
 		*reason = "bad mbuf pool";
 		return -1;
 	}
-	if (m->buf_iova == 0) {
+	if (RTE_IOVA_IN_MBUF && rte_mbuf_iova_get(m) == 0) {
 		*reason = "bad IO addr";
 		return -1;
 	}
@@ -672,10 +676,13 @@ rte_pktmbuf_dump(FILE *f, const struct rte_mbuf *m, unsigned dump_len)
 
 	__rte_mbuf_sanity_check(m, 1);
 
-	fprintf(f, "dump mbuf at %p, iova=%#"PRIx64", buf_len=%u\n",
-		m, m->buf_iova, m->buf_len);
+	fprintf(f, "dump mbuf at %p, iova=%#" PRIx64 ", buf_len=%u\n", m, rte_mbuf_iova_get(m),
+		m->buf_len);
 	fprintf(f, "  pkt_len=%u, ol_flags=%#"PRIx64", nb_segs=%u, port=%u",
 		m->pkt_len, m->ol_flags, m->nb_segs, m->port);
+
+	if (m->ol_flags & (RTE_MBUF_F_RX_QINQ | RTE_MBUF_F_TX_QINQ))
+		fprintf(f, ", vlan_tci_outer=%u", m->vlan_tci_outer);
 
 	if (m->ol_flags & (RTE_MBUF_F_RX_VLAN | RTE_MBUF_F_TX_VLAN))
 		fprintf(f, ", vlan_tci=%u", m->vlan_tci);

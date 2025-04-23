@@ -29,6 +29,7 @@ static const char * const mlx5_txpp_stat_names[] = {
 	"tx_pp_clock_queue_errors", /* Clock Queue errors. */
 	"tx_pp_timestamp_past_errors", /* Timestamp in the past. */
 	"tx_pp_timestamp_future_errors", /* Timestamp in the distant future. */
+	"tx_pp_timestamp_order_errors", /* Timestamp not in ascending order. */
 	"tx_pp_jitter", /* Timestamp jitter (one Clock Queue completion). */
 	"tx_pp_wander", /* Timestamp wander (half of Clock Queue CQEs). */
 	"tx_pp_sync_lost", /* Scheduling synchronization lost. */
@@ -741,11 +742,8 @@ mlx5_txpp_interrupt_handler(void *cb_arg)
 static void
 mlx5_txpp_stop_service(struct mlx5_dev_ctx_shared *sh)
 {
-	if (!rte_intr_fd_get(sh->txpp.intr_handle))
-		return;
-	mlx5_intr_callback_unregister(sh->txpp.intr_handle,
-				      mlx5_txpp_interrupt_handler, sh);
-	rte_intr_instance_free(sh->txpp.intr_handle);
+	mlx5_os_interrupt_handler_destroy(sh->txpp.intr_handle,
+					  mlx5_txpp_interrupt_handler, sh);
 }
 
 /* Attach interrupt handler and fires first request to Rearm Queue. */
@@ -761,6 +759,7 @@ mlx5_txpp_start_service(struct mlx5_dev_ctx_shared *sh)
 	sh->txpp.err_clock_queue = 0;
 	sh->txpp.err_ts_past = 0;
 	sh->txpp.err_ts_future = 0;
+	sh->txpp.err_ts_order = 0;
 	/* Attach interrupt handler to process Rearm Queue completions. */
 	fd = mlx5_os_get_devx_channel_fd(sh->txpp.echan);
 	ret = mlx5_os_set_nonblock_channel_fd(fd);
@@ -769,23 +768,12 @@ mlx5_txpp_start_service(struct mlx5_dev_ctx_shared *sh)
 		rte_errno = errno;
 		return -rte_errno;
 	}
-	sh->txpp.intr_handle =
-			rte_intr_instance_alloc(RTE_INTR_INSTANCE_F_SHARED);
-	if (sh->txpp.intr_handle == NULL) {
-		DRV_LOG(ERR, "Fail to allocate intr_handle");
-		return -ENOMEM;
-	}
 	fd = mlx5_os_get_devx_channel_fd(sh->txpp.echan);
-	if (rte_intr_fd_set(sh->txpp.intr_handle, fd))
-		return -rte_errno;
-
-	if (rte_intr_type_set(sh->txpp.intr_handle, RTE_INTR_HANDLE_EXT))
-		return -rte_errno;
-
-	if (rte_intr_callback_register(sh->txpp.intr_handle,
-				       mlx5_txpp_interrupt_handler, sh)) {
-		rte_intr_fd_set(sh->txpp.intr_handle, 0);
-		DRV_LOG(ERR, "Failed to register CQE interrupt %d.", rte_errno);
+	sh->txpp.intr_handle = mlx5_os_interrupt_handler_create
+		(RTE_INTR_INSTANCE_F_SHARED, false,
+		 fd, mlx5_txpp_interrupt_handler, sh);
+	if (!sh->txpp.intr_handle) {
+		DRV_LOG(ERR, "Fail to allocate intr_handle");
 		return -rte_errno;
 	}
 	/* Subscribe CQ event to the event channel controlled by the driver. */
@@ -983,6 +971,8 @@ mlx5_txpp_read_clock(struct rte_eth_dev *dev, uint64_t *timestamp)
 {
 	struct mlx5_priv *priv = dev->data->dev_private;
 	struct mlx5_dev_ctx_shared *sh = priv->sh;
+	struct mlx5_proc_priv *ppriv;
+	uint64_t ts;
 	int ret;
 
 	if (sh->txpp.refcnt) {
@@ -993,7 +983,6 @@ mlx5_txpp_read_clock(struct rte_eth_dev *dev, uint64_t *timestamp)
 			rte_int128_t u128;
 			struct mlx5_cqe_ts cts;
 		} to;
-		uint64_t ts;
 
 		mlx5_atomic_read_cqe((rte_int128_t *)&cqe->timestamp, &to.u128);
 		if (to.cts.op_own >> 4) {
@@ -1004,6 +993,18 @@ mlx5_txpp_read_clock(struct rte_eth_dev *dev, uint64_t *timestamp)
 			return -EIO;
 		}
 		ts = rte_be_to_cpu_64(to.cts.timestamp);
+		ts = mlx5_txpp_convert_rx_ts(sh, ts);
+		*timestamp = ts;
+		return 0;
+	}
+	/* Check and try to map HCA PIC BAR to allow reading real time. */
+	ppriv = dev->process_private;
+	if (ppriv && !ppriv->hca_bar &&
+	    sh->dev_cap.rt_timestamp && mlx5_dev_is_pci(dev->device))
+		mlx5_txpp_map_hca_bar(dev);
+	/* Check if we can read timestamp directly from hardware. */
+	if (ppriv && ppriv->hca_bar) {
+		ts = MLX5_GET64(initial_seg, ppriv->hca_bar, real_time);
 		ts = mlx5_txpp_convert_rx_ts(sh, ts);
 		*timestamp = ts;
 		return 0;
@@ -1035,6 +1036,7 @@ int mlx5_txpp_xstats_reset(struct rte_eth_dev *dev)
 	__atomic_store_n(&sh->txpp.err_clock_queue, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&sh->txpp.err_ts_past, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&sh->txpp.err_ts_future, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&sh->txpp.err_ts_order, 0, __ATOMIC_RELAXED);
 	return 0;
 }
 
@@ -1064,11 +1066,9 @@ int mlx5_txpp_xstats_get_names(struct rte_eth_dev *dev __rte_unused,
 
 	if (n >= n_used + n_txpp && xstats_names) {
 		for (i = 0; i < n_txpp; ++i) {
-			strncpy(xstats_names[i + n_used].name,
+			strlcpy(xstats_names[i + n_used].name,
 				mlx5_txpp_stat_names[i],
 				RTE_ETH_XSTATS_NAME_SIZE);
-			xstats_names[i + n_used].name
-					[RTE_ETH_XSTATS_NAME_SIZE - 1] = 0;
 		}
 	}
 	return n_used + n_txpp;
@@ -1224,9 +1224,12 @@ mlx5_txpp_xstats_get(struct rte_eth_dev *dev,
 		stats[n_used + 4].value =
 				__atomic_load_n(&sh->txpp.err_ts_future,
 						__ATOMIC_RELAXED);
-		stats[n_used + 5].value = mlx5_txpp_xstats_jitter(&sh->txpp);
-		stats[n_used + 6].value = mlx5_txpp_xstats_wander(&sh->txpp);
-		stats[n_used + 7].value = sh->txpp.sync_lost;
+		stats[n_used + 5].value =
+				__atomic_load_n(&sh->txpp.err_ts_order,
+						__ATOMIC_RELAXED);
+		stats[n_used + 6].value = mlx5_txpp_xstats_jitter(&sh->txpp);
+		stats[n_used + 7].value = mlx5_txpp_xstats_wander(&sh->txpp);
+		stats[n_used + 8].value = sh->txpp.sync_lost;
 	}
 	return n_used + n_txpp;
 }

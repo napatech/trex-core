@@ -15,8 +15,8 @@
 #include <rte_string_fns.h>
 #include <rte_cycles.h>
 #include <rte_kvargs.h>
-#include <rte_dev.h>
-#include <rte_fslmc.h>
+#include <dev_driver.h>
+#include <bus_fslmc_driver.h>
 #include <rte_flow_driver.h>
 #include "rte_dpaa2_mempool.h"
 
@@ -77,6 +77,9 @@ bool dpaa2_enable_err_queue;
 
 #define MAX_NB_RX_DESC		11264
 int total_nb_rx_desc;
+
+int dpaa2_valid_dev;
+struct rte_mempool *dpaa2_tx_sg_pool;
 
 struct rte_dpaa2_xstats_name_off {
 	char name[RTE_ETH_XSTATS_NAME_SIZE];
@@ -1078,7 +1081,7 @@ dpaa2_dev_rx_queue_count(void *rx_queue)
 }
 
 static const uint32_t *
-dpaa2_supported_ptypes_get(struct rte_eth_dev *dev)
+dpaa2_supported_ptypes_get(struct rte_eth_dev *dev, size_t *no_of_elements)
 {
 	static const uint32_t ptypes[] = {
 		/*todo -= add more types */
@@ -1091,13 +1094,14 @@ dpaa2_supported_ptypes_get(struct rte_eth_dev *dev)
 		RTE_PTYPE_L4_UDP,
 		RTE_PTYPE_L4_SCTP,
 		RTE_PTYPE_L4_ICMP,
-		RTE_PTYPE_UNKNOWN
 	};
 
 	if (dev->rx_pkt_burst == dpaa2_dev_prefetch_rx ||
 		dev->rx_pkt_burst == dpaa2_dev_rx ||
-		dev->rx_pkt_burst == dpaa2_dev_loopback_rx)
+		dev->rx_pkt_burst == dpaa2_dev_loopback_rx) {
+		*no_of_elements = RTE_DIM(ptypes);
 		return ptypes;
+	}
 	return NULL;
 }
 
@@ -1275,6 +1279,11 @@ dpaa2_dev_start(struct rte_eth_dev *dev)
 	if (priv->en_ordered)
 		dev->tx_pkt_burst = dpaa2_dev_tx_ordered;
 
+	for (i = 0; i < dev->data->nb_rx_queues; i++)
+		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
+	for (i = 0; i < dev->data->nb_tx_queues; i++)
+		dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
+
 	return 0;
 }
 
@@ -1292,6 +1301,7 @@ dpaa2_dev_stop(struct rte_eth_dev *dev)
 	struct rte_device *rdev = dev->device;
 	struct rte_intr_handle *intr_handle;
 	struct rte_dpaa2_device *dpaa2_dev;
+	uint16_t i;
 
 	dpaa2_dev = container_of(rdev, struct rte_dpaa2_device, device);
 	intr_handle = dpaa2_dev->intr_handle;
@@ -1325,6 +1335,11 @@ dpaa2_dev_stop(struct rte_eth_dev *dev)
 	/* clear the recorded link status */
 	memset(&link, 0, sizeof(link));
 	rte_eth_linkstatus_set(dev, &link);
+
+	for (i = 0; i < dev->data->nb_rx_queues; i++)
+		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
+	for (i = 0; i < dev->data->nb_tx_queues; i++)
+		dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
 
 	return 0;
 }
@@ -2837,7 +2852,7 @@ dpaa2_dev_init(struct rte_eth_dev *eth_dev)
 			return ret;
 		}
 	}
-	RTE_LOG(INFO, PMD, "%s: netdev created, connected to %s\n",
+	DPAA2_PMD_INFO("%s: netdev created, connected to %s",
 		eth_dev->data->name, dpaa2_dev->ep_name);
 
 	return 0;
@@ -2907,7 +2922,20 @@ rte_dpaa2_probe(struct rte_dpaa2_driver *dpaa2_drv,
 	/* Invoke PMD device initialization function */
 	diag = dpaa2_dev_init(eth_dev);
 	if (diag == 0) {
+		if (!dpaa2_tx_sg_pool) {
+			dpaa2_tx_sg_pool =
+				rte_pktmbuf_pool_create("dpaa2_mbuf_tx_sg_pool",
+				DPAA2_POOL_SIZE,
+				DPAA2_POOL_CACHE_SIZE, 0,
+				DPAA2_MAX_SGS * sizeof(struct qbman_sge),
+				rte_socket_id());
+			if (dpaa2_tx_sg_pool == NULL) {
+				DPAA2_PMD_ERR("SG pool creation failed\n");
+				return -ENOMEM;
+			}
+		}
 		rte_eth_dev_probing_finish(eth_dev);
+		dpaa2_valid_dev++;
 		return 0;
 	}
 
@@ -2923,6 +2951,9 @@ rte_dpaa2_remove(struct rte_dpaa2_device *dpaa2_dev)
 
 	eth_dev = dpaa2_dev->eth_dev;
 	dpaa2_dev_close(eth_dev);
+	dpaa2_valid_dev--;
+	if (!dpaa2_valid_dev)
+		rte_mempool_free(dpaa2_tx_sg_pool);
 	ret = rte_eth_dev_release_port(eth_dev);
 
 	return ret;

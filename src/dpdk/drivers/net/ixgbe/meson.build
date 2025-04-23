@@ -20,15 +20,19 @@ sources = files(
         'rte_pmd_ixgbe.c',
 )
 
+testpmd_sources = files('ixgbe_testpmd.c')
+
 deps += ['hash', 'security']
 
 if arch_subdir == 'x86'
     sources += files('ixgbe_rxtx_vec_sse.c')
+    sources += files('ixgbe_recycle_mbufs_vec_common.c')
     if is_windows and cc.get_id() != 'clang'
         cflags += ['-fno-asynchronous-unwind-tables']
     endif
 elif arch_subdir == 'arm'
     sources += files('ixgbe_rxtx_vec_neon.c')
+    sources += files('ixgbe_recycle_mbufs_vec_common.c')
 endif
 
 includes += include_directories('base')

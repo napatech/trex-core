@@ -937,8 +937,22 @@ efx_rx_qcreate_internal(
 
 		rss_hash_field =
 		    &erplp->erpl_fields[EFX_RX_PREFIX_FIELD_RSS_HASH];
-		if (rss_hash_field->erpfi_width_bits == 0)
+		if (rss_hash_field->erpfi_width_bits == 0) {
+			rc = ENOTSUP;
 			goto fail5;
+		}
+	}
+
+	if (flags & EFX_RXQ_FLAG_VLAN_STRIPPED_TCI) {
+		const efx_rx_prefix_layout_t *erplp = &erp->er_prefix_layout;
+		const efx_rx_prefix_field_info_t *vlan_tci_field;
+
+		vlan_tci_field =
+		    &erplp->erpl_fields[EFX_RX_PREFIX_FIELD_VLAN_STRIP_TCI];
+		if (vlan_tci_field->erpfi_width_bits == 0) {
+			rc = ENOTSUP;
+			goto fail6;
+		}
 	}
 
 	enp->en_rx_qcount++;
@@ -946,6 +960,8 @@ efx_rx_qcreate_internal(
 
 	return (0);
 
+fail6:
+	EFSYS_PROBE(fail6);
 fail5:
 	EFSYS_PROBE(fail5);
 
@@ -978,7 +994,14 @@ efx_rx_qcreate(
 	__in		efx_evq_t *eep,
 	__deref_out	efx_rxq_t **erpp)
 {
+	const efx_nic_cfg_t *encp = efx_nic_cfg_get(enp);
 	efx_rxq_type_data_t type_data;
+	efx_rc_t rc;
+
+	if (buf_size > encp->enc_rx_dma_desc_size_max) {
+		rc = EINVAL;
+		goto fail1;
+	}
 
 	memset(&type_data, 0, sizeof (type_data));
 
@@ -986,6 +1009,11 @@ efx_rx_qcreate(
 
 	return efx_rx_qcreate_internal(enp, index, label, type, &type_data,
 	    esmp, ndescs, id, flags, eep, erpp);
+
+fail1:
+	EFSYS_PROBE1(fail1, efx_rc_t, rc);
+
+	return (rc);
 }
 
 #if EFSYS_OPT_RX_PACKED_STREAM

@@ -209,21 +209,12 @@ fm10k_rx_vec_condition_check(struct rte_eth_dev *dev)
 {
 #ifndef RTE_LIBRTE_IEEE1588
 	struct rte_eth_rxmode *rxmode = &dev->data->dev_conf.rxmode;
-	struct rte_eth_fdir_conf *fconf = &dev->data->dev_conf.fdir_conf;
 
 #ifndef RTE_FM10K_RX_OLFLAGS_ENABLE
 	/* without rx ol_flags, no VP flag report */
 	if (rxmode->offloads & RTE_ETH_RX_OFFLOAD_VLAN_EXTEND)
 		return -1;
 #endif
-
-	/* no fdir support */
-	if (fconf->mode != RTE_FDIR_MODE_NONE)
-		return -1;
-
-	/* no header split support */
-	if (rxmode->offloads & RTE_ETH_RX_OFFLOAD_HEADER_SPLIT)
-		return -1;
 
 	return 0;
 #else
@@ -574,7 +565,7 @@ fm10k_recv_raw_pkts_vec(void *rx_queue, struct rte_mbuf **rx_pkts,
 		fm10k_desc_to_pktype_v(descs0, &rx_pkts[pos]);
 
 		/* C.4 calc available number of desc */
-		var = __builtin_popcountll(_mm_cvtsi128_si64(staterr));
+		var = rte_popcount64(_mm_cvtsi128_si64(staterr));
 		nb_pkts_recd += var;
 		if (likely(var != RTE_FM10K_DESCS_PER_LOOP))
 			break;

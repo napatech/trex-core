@@ -2273,9 +2273,23 @@ s32 txgbe_setup_mac_link_multispeed_fiber(struct txgbe_hw *hw,
 	}
 
 	if (speed & TXGBE_LINK_SPEED_1GB_FULL) {
+		u32 curr_autoneg;
+
 		speedcnt++;
 		if (highest_link_speed == TXGBE_LINK_SPEED_UNKNOWN)
 			highest_link_speed = TXGBE_LINK_SPEED_1GB_FULL;
+
+		status = hw->mac.check_link(hw, &link_speed, &link_up, false);
+		if (status != 0)
+			return status;
+
+		/* If we already have link at this speed, just jump out */
+		if (link_speed == TXGBE_LINK_SPEED_1GB_FULL) {
+			curr_autoneg = rd32_epcs(hw, SR_MII_MMD_CTL);
+			if (link_up && (hw->autoneg ==
+					!!(curr_autoneg & SR_MII_MMD_CTL_AN_EN)))
+				goto out;
+		}
 
 		/* Set the module link speed */
 		switch (hw->phy.media_type) {
@@ -2608,6 +2622,45 @@ out:
 	return err;
 }
 
+/* cmd_addr is used for some special command:
+ * 1. to be sector address, when implemented erase sector command
+ * 2. to be flash address when implemented read, write flash address
+ *
+ * Return 0 on success, return 1 on failure.
+ */
+u32 txgbe_fmgr_cmd_op(struct txgbe_hw *hw, u32 cmd, u32 cmd_addr)
+{
+	u32 cmd_val, i;
+
+	cmd_val = TXGBE_SPICMD_CMD(cmd) | TXGBE_SPICMD_CLK(3) | cmd_addr;
+	wr32(hw, TXGBE_SPICMD, cmd_val);
+
+	for (i = 0; i < TXGBE_SPI_TIMEOUT; i++) {
+		if (rd32(hw, TXGBE_SPISTAT) & TXGBE_SPISTAT_OPDONE)
+			break;
+
+		usec_delay(10);
+	}
+
+	if (i == TXGBE_SPI_TIMEOUT)
+		return 1;
+
+	return 0;
+}
+
+u32 txgbe_flash_read_dword(struct txgbe_hw *hw, u32 addr)
+{
+	u32 status;
+
+	status = txgbe_fmgr_cmd_op(hw, 1, addr);
+	if (status == 0x1) {
+		DEBUGOUT("Read flash timeout.");
+		return status;
+	}
+
+	return rd32(hw, TXGBE_SPIDAT);
+}
+
 /**
  *  txgbe_init_ops_pf - Inits func ptrs and MAC type
  *  @hw: pointer to hardware structure
@@ -2645,6 +2698,7 @@ s32 txgbe_init_ops_pf(struct txgbe_hw *hw)
 	phy->identify_sfp = txgbe_identify_module;
 	phy->read_i2c_byte_unlocked = txgbe_read_i2c_byte_unlocked;
 	phy->write_i2c_byte_unlocked = txgbe_write_i2c_byte_unlocked;
+	phy->check_overtemp = txgbe_check_overtemp;
 	phy->reset = txgbe_reset_phy;
 
 	/* MAC */
@@ -2948,10 +3002,6 @@ void txgbe_disable_tx_laser_multispeed_fiber(struct txgbe_hw *hw)
 {
 	u32 esdp_reg = rd32(hw, TXGBE_GPIODATA);
 
-	/* Blocked by MNG FW so bail */
-	if (txgbe_check_reset_blocked(hw))
-		return;
-
 	if (txgbe_close_notify(hw))
 		txgbe_led_off(hw, TXGBE_LEDCTL_UP | TXGBE_LEDCTL_10G |
 				TXGBE_LEDCTL_1G | TXGBE_LEDCTL_ACTIVE);
@@ -2999,10 +3049,6 @@ void txgbe_enable_tx_laser_multispeed_fiber(struct txgbe_hw *hw)
  **/
 void txgbe_flap_tx_laser_multispeed_fiber(struct txgbe_hw *hw)
 {
-	/* Blocked by MNG FW so bail */
-	if (txgbe_check_reset_blocked(hw))
-		return;
-
 	if (hw->mac.autotry_restart) {
 		txgbe_disable_tx_laser_multispeed_fiber(hw);
 		txgbe_enable_tx_laser_multispeed_fiber(hw);
@@ -3393,18 +3439,9 @@ s32 txgbe_reset_hw(struct txgbe_hw *hw)
 	autoc = hw->mac.autoc_read(hw);
 
 mac_reset_top:
-	/*
-	 * Issue global reset to the MAC.  Needs to be SW reset if link is up.
-	 * If link reset is used when link is up, it might reset the PHY when
-	 * mng is using it.  If link is down or the flag to force full link
-	 * reset is set, then perform link reset.
-	 */
-	if (txgbe_mng_present(hw)) {
-		txgbe_hic_reset(hw);
-	} else {
-		wr32(hw, TXGBE_RST, TXGBE_RST_LAN(hw->bus.lan_id));
-		txgbe_flush(hw);
-	}
+	/* Do LAN reset, the MNG domain will not be reset. */
+	wr32(hw, TXGBE_RST, TXGBE_RST_LAN(hw->bus.lan_id));
+	txgbe_flush(hw);
 	usec_delay(10);
 
 	txgbe_reset_misc(hw);

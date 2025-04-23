@@ -14,7 +14,6 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include <rte_compat.h>
 #include <rte_rcu_qsbr.h>
 
 #ifdef __cplusplus
@@ -177,7 +176,6 @@ rte_hash_find_existing(const char *name);
  *
  * @param h
  *   Hash table to free, if NULL, the function does nothing.
- *
  */
 void
 rte_hash_free(struct rte_hash *h);

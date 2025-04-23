@@ -90,6 +90,7 @@ static int ngbe_dev_misc_interrupt_setup(struct rte_eth_dev *dev);
 static int ngbe_dev_rxq_interrupt_setup(struct rte_eth_dev *dev);
 static void ngbe_dev_interrupt_handler(void *param);
 static void ngbe_configure_msix(struct rte_eth_dev *dev);
+static void ngbe_pbthresh_set(struct rte_eth_dev *dev);
 
 #define NGBE_SET_HWSTRIP(h, q) do {\
 		uint32_t idx = (q) / (sizeof((h)->bitmap[0]) * NBBY); \
@@ -160,10 +161,15 @@ static const struct rte_ngbe_xstats_name_off rte_ngbe_stats_strings[] = {
 	HW_XSTAT(tx_total_packets),
 	HW_XSTAT(rx_total_missed_packets),
 	HW_XSTAT(rx_broadcast_packets),
+	HW_XSTAT(tx_broadcast_packets),
 	HW_XSTAT(rx_multicast_packets),
+	HW_XSTAT(tx_multicast_packets),
 	HW_XSTAT(rx_management_packets),
 	HW_XSTAT(tx_management_packets),
 	HW_XSTAT(rx_management_dropped),
+	HW_XSTAT(rx_dma_drop),
+	HW_XSTAT(tx_dma_drop),
+	HW_XSTAT(tx_secdrp_packets),
 
 	/* Basic Error */
 	HW_XSTAT(rx_crc_errors),
@@ -173,11 +179,17 @@ static const struct rte_ngbe_xstats_name_off rte_ngbe_stats_strings[] = {
 	HW_XSTAT(rx_length_errors),
 	HW_XSTAT(rx_undersize_errors),
 	HW_XSTAT(rx_fragment_errors),
-	HW_XSTAT(rx_oversize_errors),
+	HW_XSTAT(rx_oversize_cnt),
 	HW_XSTAT(rx_jabber_errors),
 	HW_XSTAT(rx_l3_l4_xsum_error),
 	HW_XSTAT(mac_local_errors),
 	HW_XSTAT(mac_remote_errors),
+
+	/* PB Stats */
+	HW_XSTAT(rx_up_dropped),
+	HW_XSTAT(rdb_pkt_cnt),
+	HW_XSTAT(rdb_repli_cnt),
+	HW_XSTAT(rdb_drp_cnt),
 
 	/* MACSEC */
 	HW_XSTAT(tx_macsec_pkts_untagged),
@@ -355,12 +367,26 @@ eth_ngbe_dev_init(struct rte_eth_dev *eth_dev, void *init_params __rte_unused)
 	rte_eth_copy_pci_info(eth_dev, pci_dev);
 	eth_dev->data->dev_flags |= RTE_ETH_DEV_AUTOFILL_QUEUE_XSTATS;
 
+	hw->hw_addr = (void *)pci_dev->mem_resource[0].addr;
+
 	/* Vendor and Device ID need to be set before init of shared code */
+	hw->back = pci_dev;
 	hw->device_id = pci_dev->id.device_id;
 	hw->vendor_id = pci_dev->id.vendor_id;
-	hw->sub_system_id = pci_dev->id.subsystem_device_id;
+	if (pci_dev->id.subsystem_vendor_id == PCI_VENDOR_ID_WANGXUN) {
+		hw->sub_system_id = pci_dev->id.subsystem_device_id;
+	} else {
+		u32 ssid;
+
+		ssid = ngbe_flash_read_dword(hw, 0xFFFDC);
+		if (ssid == 0x1) {
+			PMD_INIT_LOG(ERR,
+				"Read of internal subsystem device id failed\n");
+			return -ENODEV;
+		}
+		hw->sub_system_id = (u16)ssid >> 8 | (u16)ssid << 8;
+	}
 	ngbe_map_device_id(hw);
-	hw->hw_addr = (void *)pci_dev->mem_resource[0].addr;
 
 	/* Reserve memory for interrupt status block */
 	mz = rte_eth_dma_zone_reserve(eth_dev, "ngbe_driver", -1,
@@ -924,7 +950,7 @@ ngbe_dev_phy_intr_setup(struct rte_eth_dev *dev)
 	else
 		wr32(hw, NGBE_GPIOINTPOL, NGBE_GPIOINTPOL_ACT(3));
 
-	intr->mask_misc |= NGBE_ICRMISC_GPIO;
+	intr->mask_misc |= NGBE_ICRMISC_GPIO | NGBE_ICRMISC_HEAT;
 }
 
 /*
@@ -948,9 +974,6 @@ ngbe_dev_start(struct rte_eth_dev *dev)
 	uint32_t *link_speeds;
 
 	PMD_INIT_FUNC_TRACE();
-
-	/* Stop the link setup handler before resetting the HW. */
-	rte_eal_alarm_cancel(ngbe_dev_setup_link_alarm_handler, dev);
 
 	/* disable uio/vfio intr/eventfd mapping */
 	rte_intr_disable(intr_handle);
@@ -1015,6 +1038,7 @@ ngbe_dev_start(struct rte_eth_dev *dev)
 	}
 
 	hw->mac.setup_pba(hw);
+	ngbe_pbthresh_set(dev);
 	ngbe_configure_port(dev);
 
 	err = ngbe_dev_rxtx_start(dev);
@@ -1026,6 +1050,8 @@ ngbe_dev_start(struct rte_eth_dev *dev)
 	/* Skip link setup if loopback mode is enabled. */
 	if (hw->is_pf && dev->data->dev_conf.lpbk_mode)
 		goto skip_link_setup;
+
+	hw->lsc = dev->data->dev_conf.intr_conf.lsc;
 
 	err = hw->mac.check_link(hw, &speed, &link_up, 0);
 	if (err != 0)
@@ -1048,7 +1074,7 @@ ngbe_dev_start(struct rte_eth_dev *dev)
 	if (hw->mac.default_speeds & NGBE_LINK_SPEED_10M_FULL)
 		allowed_speeds |= RTE_ETH_LINK_SPEED_10M;
 
-	if (*link_speeds & ~allowed_speeds) {
+	if (((*link_speeds) >> 1) & ~(allowed_speeds >> 1)) {
 		PMD_INIT_LOG(ERR, "Invalid link setting");
 		goto error;
 	}
@@ -1141,11 +1167,9 @@ ngbe_dev_stop(struct rte_eth_dev *dev)
 	int vf;
 
 	if (hw->adapter_stopped)
-		return 0;
+		goto out;
 
 	PMD_INIT_FUNC_TRACE();
-
-	rte_eal_alarm_cancel(ngbe_dev_setup_link_alarm_handler, dev);
 
 	if (hw->gpio_ctl) {
 		/* gpio0 is used to power on/off control*/
@@ -1191,6 +1215,36 @@ ngbe_dev_stop(struct rte_eth_dev *dev)
 	hw->adapter_stopped = true;
 	dev->data->dev_started = 0;
 
+out:
+	/* close phy to prevent reset in dev_close from restarting physical link */
+	hw->phy.set_phy_power(hw, false);
+
+	return 0;
+}
+
+/*
+ * Set device link up: power on.
+ */
+static int
+ngbe_dev_set_link_up(struct rte_eth_dev *dev)
+{
+	struct ngbe_hw *hw = ngbe_dev_hw(dev);
+
+	hw->phy.set_phy_power(hw, true);
+
+	return 0;
+}
+
+/*
+ * Set device link down: power off.
+ */
+static int
+ngbe_dev_set_link_down(struct rte_eth_dev *dev)
+{
+	struct ngbe_hw *hw = ngbe_dev_hw(dev);
+
+	hw->phy.set_phy_power(hw, false);
+
 	return 0;
 }
 
@@ -1207,6 +1261,9 @@ ngbe_dev_close(struct rte_eth_dev *dev)
 	int ret;
 
 	PMD_INIT_FUNC_TRACE();
+
+	if (rte_eal_process_type() != RTE_PROC_PRIMARY)
+		return 0;
 
 	ngbe_pf_reset_hw(hw);
 
@@ -1350,9 +1407,8 @@ ngbe_read_stats_registers(struct ngbe_hw *hw,
 	hw_stats->rx_xoff_packets += rd32(hw, NGBE_PBRXLNKXOFF);
 
 	/* DMA Stats */
-	hw_stats->rx_drop_packets += rd32(hw, NGBE_DMARXDROP);
-	hw_stats->tx_drop_packets += rd32(hw, NGBE_DMATXDROP);
 	hw_stats->rx_dma_drop += rd32(hw, NGBE_DMARXDROP);
+	hw_stats->tx_dma_drop += rd32(hw, NGBE_DMATXDROP);
 	hw_stats->tx_secdrp_packets += rd32(hw, NGBE_DMATXSECDROP);
 	hw_stats->rx_packets += rd32(hw, NGBE_DMARXPKT);
 	hw_stats->tx_packets += rd32(hw, NGBE_DMATXPKT);
@@ -1389,7 +1445,7 @@ ngbe_read_stats_registers(struct ngbe_hw *hw,
 			rd64(hw, NGBE_MACTX1024TOMAXL);
 
 	hw_stats->rx_undersize_errors += rd64(hw, NGBE_MACRXERRLENL);
-	hw_stats->rx_oversize_errors += rd32(hw, NGBE_MACRXOVERSIZE);
+	hw_stats->rx_oversize_cnt += rd32(hw, NGBE_MACRXOVERSIZE);
 	hw_stats->rx_jabber_errors += rd32(hw, NGBE_MACRXJABBER);
 
 	/* MNG Stats */
@@ -1488,7 +1544,7 @@ ngbe_dev_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *stats)
 			  hw_stats->rx_mac_short_packet_dropped +
 			  hw_stats->rx_length_errors +
 			  hw_stats->rx_undersize_errors +
-			  hw_stats->rx_oversize_errors +
+			  hw_stats->rdb_drp_cnt +
 			  hw_stats->rx_illegal_byte_errors +
 			  hw_stats->rx_error_bytes +
 			  hw_stats->rx_fragment_errors;
@@ -1808,33 +1864,37 @@ ngbe_dev_info_get(struct rte_eth_dev *dev, struct rte_eth_dev_info *dev_info)
 }
 
 const uint32_t *
-ngbe_dev_supported_ptypes_get(struct rte_eth_dev *dev)
+ngbe_dev_supported_ptypes_get(struct rte_eth_dev *dev, size_t *no_of_elements)
 {
 	if (dev->rx_pkt_burst == ngbe_recv_pkts ||
 	    dev->rx_pkt_burst == ngbe_recv_pkts_sc_single_alloc ||
 	    dev->rx_pkt_burst == ngbe_recv_pkts_sc_bulk_alloc ||
 	    dev->rx_pkt_burst == ngbe_recv_pkts_bulk_alloc)
-		return ngbe_get_supported_ptypes();
+		return ngbe_get_supported_ptypes(no_of_elements);
 
 	return NULL;
 }
 
-void
-ngbe_dev_setup_link_alarm_handler(void *param)
+static void
+ngbe_dev_overheat(struct rte_eth_dev *dev)
 {
-	struct rte_eth_dev *dev = (struct rte_eth_dev *)param;
 	struct ngbe_hw *hw = ngbe_dev_hw(dev);
-	struct ngbe_interrupt *intr = ngbe_dev_intr(dev);
-	u32 speed;
-	bool autoneg = false;
+	s32 temp_state;
 
-	speed = hw->phy.autoneg_advertised;
-	if (!speed)
-		hw->mac.get_link_capabilities(hw, &speed, &autoneg);
+	temp_state = hw->mac.check_overtemp(hw);
+	if (!temp_state)
+		return;
 
-	hw->mac.setup_link(hw, speed, true);
-
-	intr->flags &= ~NGBE_FLAG_NEED_LINK_CONFIG;
+	if (temp_state == NGBE_ERR_UNDERTEMP) {
+		PMD_DRV_LOG(CRIT, "Network adapter has been started again, "
+			"since the temperature has been back to normal state.");
+		wr32m(hw, NGBE_PBRXCTL, NGBE_PBRXCTL_ENA, NGBE_PBRXCTL_ENA);
+		ngbe_dev_set_link_up(dev);
+	} else if (temp_state == NGBE_ERR_OVERTEMP) {
+		PMD_DRV_LOG(CRIT, "Network adapter has been stopped because it has over heated.");
+		wr32m(hw, NGBE_PBRXCTL, NGBE_PBRXCTL_ENA, 0);
+		ngbe_dev_set_link_down(dev);
+	}
 }
 
 /* return 0 means link status changed, -1 means not changed */
@@ -1846,7 +1906,6 @@ ngbe_dev_link_update_share(struct rte_eth_dev *dev,
 	struct rte_eth_link link;
 	u32 link_speed = NGBE_LINK_SPEED_UNKNOWN;
 	u32 lan_speed = 0;
-	struct ngbe_interrupt *intr = ngbe_dev_intr(dev);
 	bool link_up;
 	int err;
 	int wait = 1;
@@ -1860,9 +1919,6 @@ ngbe_dev_link_update_share(struct rte_eth_dev *dev,
 
 	hw->mac.get_link_status = true;
 
-	if (intr->flags & NGBE_FLAG_NEED_LINK_CONFIG)
-		return rte_eth_linkstatus_set(dev, &link);
-
 	/* check if it needs to wait to complete, if lsc interrupt is enabled */
 	if (wait_to_complete == 0 || dev->data->dev_conf.intr_conf.lsc != 0)
 		wait = 0;
@@ -1874,18 +1930,9 @@ ngbe_dev_link_update_share(struct rte_eth_dev *dev,
 		return rte_eth_linkstatus_set(dev, &link);
 	}
 
-	if (!link_up) {
-		if (hw->phy.media_type == ngbe_media_type_fiber &&
-			hw->phy.type != ngbe_phy_mvl_sfi) {
-			intr->flags |= NGBE_FLAG_NEED_LINK_CONFIG;
-			rte_eal_alarm_set(10,
-				ngbe_dev_setup_link_alarm_handler, dev);
-		}
-
+	if (!link_up)
 		return rte_eth_linkstatus_set(dev, &link);
-	}
 
-	intr->flags &= ~NGBE_FLAG_NEED_LINK_CONFIG;
 	link.link_status = RTE_ETH_LINK_UP;
 	link.link_duplex = RTE_ETH_LINK_FULL_DUPLEX;
 
@@ -1919,6 +1966,8 @@ ngbe_dev_link_update_share(struct rte_eth_dev *dev,
 			wr32m(hw, NGBE_MACTXCFG, NGBE_MACTXCFG_SPEED_MASK,
 				NGBE_MACTXCFG_SPEED_1G | NGBE_MACTXCFG_TE);
 		}
+		wr32m(hw, NGBE_MACRXFLT, NGBE_MACRXFLT_PROMISC,
+			NGBE_MACRXFLT_PROMISC);
 	}
 
 	return rte_eth_linkstatus_set(dev, &link);
@@ -2125,6 +2174,9 @@ ngbe_dev_interrupt_get_status(struct rte_eth_dev *dev)
 	if (eicr & NGBE_ICRMISC_GPIO)
 		intr->flags |= NGBE_FLAG_NEED_LINK_UPDATE;
 
+	if (eicr & NGBE_ICRMISC_HEAT)
+		intr->flags |= NGBE_FLAG_OVERHEAT;
+
 	((u32 *)hw->isb_mem)[NGBE_ISB_MISC] = 0;
 
 	return 0;
@@ -2199,6 +2251,11 @@ ngbe_dev_interrupt_action(struct rte_eth_dev *dev)
 		if (dev->data->dev_link.link_speed != link.link_speed)
 			rte_eth_dev_callback_process(dev,
 				RTE_ETH_EVENT_INTR_LSC, NULL);
+	}
+
+	if (intr->flags & NGBE_FLAG_OVERHEAT) {
+		ngbe_dev_overheat(dev);
+		intr->flags &= ~NGBE_FLAG_OVERHEAT;
 	}
 
 	PMD_DRV_LOG(DEBUG, "enable intr immediately");
@@ -2338,6 +2395,93 @@ ngbe_flow_ctrl_set(struct rte_eth_dev *dev, struct rte_eth_fc_conf *fc_conf)
 	return -EIO;
 }
 
+/* Additional bittime to account for NGBE framing */
+#define NGBE_ETH_FRAMING 20
+
+/*
+ * ngbe_fc_hpbthresh_set - calculate high water mark for flow control
+ *
+ * @dv_id: device interface delay
+ * @pb: packet buffer to calculate
+ */
+static s32
+ngbe_fc_hpbthresh_set(struct rte_eth_dev *dev)
+{
+	struct ngbe_hw *hw = ngbe_dev_hw(dev);
+	struct rte_pci_device *pci_dev = RTE_ETH_DEV_TO_PCI(dev);
+	u32 max_frame_size, tc, dv_id, rx_pb;
+	s32 kb, marker;
+
+	/* Calculate max LAN frame size */
+	max_frame_size = rd32m(hw, NGBE_FRMSZ, NGBE_FRMSZ_MAX_MASK);
+	tc = max_frame_size + NGBE_ETH_FRAMING;
+
+	/* Calculate delay value for device */
+	dv_id = NGBE_DV(tc, tc);
+
+	/* Loopback switch introduces additional latency */
+	if (pci_dev->max_vfs)
+		dv_id += NGBE_B2BT(tc);
+
+	/* Delay value is calculated in bit times convert to KB */
+	kb = NGBE_BT2KB(dv_id);
+	rx_pb = rd32(hw, NGBE_PBRXSIZE) >> 10;
+
+	marker = rx_pb - kb;
+
+	/* It is possible that the packet buffer is not large enough
+	 * to provide required headroom. In this case throw an error
+	 * to user and do the best we can.
+	 */
+	if (marker < 0) {
+		PMD_DRV_LOG(WARNING, "Packet Buffer can not provide enough headroom to support flow control.");
+		marker = tc + 1;
+	}
+
+	return marker;
+}
+
+/*
+ * ngbe_fc_lpbthresh_set - calculate low water mark for flow control
+ *
+ * @dv_id: device interface delay
+ */
+static s32
+ngbe_fc_lpbthresh_set(struct rte_eth_dev *dev)
+{
+	struct ngbe_hw *hw = ngbe_dev_hw(dev);
+	u32 max_frame_size, tc, dv_id;
+	s32 kb;
+
+	/* Calculate max LAN frame size */
+	max_frame_size = rd32m(hw, NGBE_FRMSZ, NGBE_FRMSZ_MAX_MASK);
+	tc = max_frame_size + NGBE_ETH_FRAMING;
+
+	/* Calculate delay value for device */
+	dv_id = NGBE_LOW_DV(tc);
+
+	/* Delay value is calculated in bit times convert to KB */
+	kb = NGBE_BT2KB(dv_id);
+
+	return kb;
+}
+
+/*
+ * ngbe_pbthresh_setup - calculate and setup high low water marks
+ */
+static void
+ngbe_pbthresh_set(struct rte_eth_dev *dev)
+{
+	struct ngbe_hw *hw = ngbe_dev_hw(dev);
+
+	hw->fc.high_water = ngbe_fc_hpbthresh_set(dev);
+	hw->fc.low_water = ngbe_fc_lpbthresh_set(dev);
+
+	/* Low water marks must not be larger than high water marks */
+	if (hw->fc.low_water > hw->fc.high_water)
+		hw->fc.low_water = 0;
+}
+
 int
 ngbe_dev_rss_reta_update(struct rte_eth_dev *dev,
 			  struct rte_eth_rss_reta_entry64 *reta_conf,
@@ -2457,7 +2601,7 @@ static int
 ngbe_dev_mtu_set(struct rte_eth_dev *dev, uint16_t mtu)
 {
 	struct ngbe_hw *hw = ngbe_dev_hw(dev);
-	uint32_t frame_size = mtu + RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN + 4;
+	uint32_t frame_size = mtu + RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN;
 	struct rte_eth_dev_data *dev_data = dev->data;
 
 	/* If device is started, refuse mtu that requires the support of
@@ -2470,12 +2614,8 @@ ngbe_dev_mtu_set(struct rte_eth_dev *dev, uint16_t mtu)
 		return -EINVAL;
 	}
 
-	if (hw->mode)
-		wr32m(hw, NGBE_FRMSZ, NGBE_FRMSZ_MAX_MASK,
-			NGBE_FRAME_SIZE_MAX);
-	else
-		wr32m(hw, NGBE_FRMSZ, NGBE_FRMSZ_MAX_MASK,
-			NGBE_FRMSZ_MAX(frame_size));
+	wr32m(hw, NGBE_FRMSZ, NGBE_FRMSZ_MAX_MASK,
+		NGBE_FRMSZ_MAX(frame_size));
 
 	return 0;
 }
@@ -3018,6 +3158,8 @@ static const struct eth_dev_ops ngbe_eth_dev_ops = {
 	.dev_infos_get              = ngbe_dev_info_get,
 	.dev_start                  = ngbe_dev_start,
 	.dev_stop                   = ngbe_dev_stop,
+	.dev_set_link_up            = ngbe_dev_set_link_up,
+	.dev_set_link_down          = ngbe_dev_set_link_down,
 	.dev_close                  = ngbe_dev_close,
 	.dev_reset                  = ngbe_dev_reset,
 	.promiscuous_enable         = ngbe_dev_promiscuous_enable,

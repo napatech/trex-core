@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0)
  *
  * Copyright 2008-2016 Freescale Semiconductor Inc.
- * Copyright 2016,2019 NXP
+ * Copyright 2016,2019,2023 NXP
  *
  */
 
@@ -32,9 +32,6 @@ __rta_ssl_proto(uint16_t protoinfo)
 	case OP_PCL_TLS_ECDHE_RSA_WITH_RC4_128_SHA:
 	case OP_PCL_TLS_ECDH_anon_WITH_RC4_128_SHA:
 	case OP_PCL_TLS_ECDHE_PSK_WITH_RC4_128_SHA:
-		if (rta_sec_era == RTA_SEC_ERA_7)
-			return -EINVAL;
-		/* fall through if not Era 7 */
 	case OP_PCL_TLS_RSA_EXPORT_WITH_DES40_CBC_SHA:
 	case OP_PCL_TLS_RSA_WITH_DES_CBC_SHA:
 	case OP_PCL_TLS_RSA_WITH_3DES_EDE_CBC_SHA:
@@ -215,9 +212,6 @@ __rta_ipsec_proto(uint16_t protoinfo)
 
 	switch (proto_cls1) {
 	case OP_PCL_IPSEC_AES_NULL_WITH_GMAC:
-		if (rta_sec_era < RTA_SEC_ERA_2)
-			return -EINVAL;
-		/* no break */
 	case OP_PCL_IPSEC_AES_CCM8:
 	case OP_PCL_IPSEC_AES_CCM12:
 	case OP_PCL_IPSEC_AES_CCM16:
@@ -229,9 +223,6 @@ __rta_ipsec_proto(uint16_t protoinfo)
 			return 0;
 		return -EINVAL;
 	case OP_PCL_IPSEC_NULL:
-		if (rta_sec_era < RTA_SEC_ERA_2)
-			return -EINVAL;
-		/* no break */
 	case OP_PCL_IPSEC_DES_IV64:
 	case OP_PCL_IPSEC_DES:
 	case OP_PCL_IPSEC_3DES:
@@ -250,6 +241,9 @@ __rta_ipsec_proto(uint16_t protoinfo)
 	case OP_PCL_IPSEC_HMAC_MD5_128:
 	case OP_PCL_IPSEC_HMAC_SHA1_160:
 	case OP_PCL_IPSEC_AES_CMAC_96:
+	case OP_PCL_IPSEC_HMAC_SHA2_224_96:
+	case OP_PCL_IPSEC_HMAC_SHA2_224_112:
+	case OP_PCL_IPSEC_HMAC_SHA2_224_224:
 	case OP_PCL_IPSEC_HMAC_SHA2_256_128:
 	case OP_PCL_IPSEC_HMAC_SHA2_384_192:
 	case OP_PCL_IPSEC_HMAC_SHA2_512_256:
@@ -351,9 +345,6 @@ __rta_blob_proto(uint16_t protoinfo)
 
 	switch (protoinfo & OP_PCL_BLOB_REG_MASK) {
 	case OP_PCL_BLOB_AFHA_SBOX:
-		if (rta_sec_era < RTA_SEC_ERA_3)
-			return -EINVAL;
-		/* no break */
 	case OP_PCL_BLOB_REG_MEMORY:
 	case OP_PCL_BLOB_REG_KEY1:
 	case OP_PCL_BLOB_REG_KEY2:
@@ -368,12 +359,6 @@ __rta_blob_proto(uint16_t protoinfo)
 static inline int
 __rta_dlc_proto(uint16_t protoinfo)
 {
-	if ((rta_sec_era < RTA_SEC_ERA_2) &&
-	    (protoinfo & (OP_PCL_PKPROT_DSA_MSG | OP_PCL_PKPROT_HASH_MASK |
-	     OP_PCL_PKPROT_EKT_Z | OP_PCL_PKPROT_DECRYPT_Z |
-	     OP_PCL_PKPROT_DECRYPT_PRI)))
-		return -EINVAL;
-
 	switch (protoinfo & OP_PCL_PKPROT_HASH_MASK) {
 	case OP_PCL_PKPROT_HASH_MD5:
 	case OP_PCL_PKPROT_HASH_SHA1:
@@ -482,9 +467,6 @@ __rta_dkp_proto(uint16_t protoinfo)
 static inline int
 __rta_3g_dcrc_proto(uint16_t protoinfo)
 {
-	if (rta_sec_era == RTA_SEC_ERA_7)
-		return -EINVAL;
-
 	switch (protoinfo) {
 	case OP_PCL_3G_DCRC_CRC7:
 	case OP_PCL_3G_DCRC_CRC11:
@@ -497,9 +479,6 @@ __rta_3g_dcrc_proto(uint16_t protoinfo)
 static inline int
 __rta_3g_rlc_proto(uint16_t protoinfo)
 {
-	if (rta_sec_era == RTA_SEC_ERA_7)
-		return -EINVAL;
-
 	switch (protoinfo) {
 	case OP_PCL_3G_RLC_NULL:
 	case OP_PCL_3G_RLC_KASUMI:
@@ -513,13 +492,8 @@ __rta_3g_rlc_proto(uint16_t protoinfo)
 static inline int
 __rta_lte_pdcp_proto(uint16_t protoinfo)
 {
-	if (rta_sec_era == RTA_SEC_ERA_7)
-		return -EINVAL;
-
 	switch (protoinfo) {
 	case OP_PCL_LTE_ZUC:
-		if (rta_sec_era < RTA_SEC_ERA_5)
-			break;
 	case OP_PCL_LTE_NULL:
 	case OP_PCL_LTE_SNOW:
 	case OP_PCL_LTE_AES:

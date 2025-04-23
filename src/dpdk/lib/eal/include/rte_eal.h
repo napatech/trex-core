@@ -17,7 +17,6 @@
 #include <rte_config.h>
 #include <rte_compat.h>
 #include <rte_per_lcore.h>
-#include <rte_bus.h>
 #include <rte_uuid.h>
 
 #include <rte_pci_dev_feature_defs.h>
@@ -27,9 +26,6 @@ extern "C" {
 #endif
 
 #define RTE_MAGIC 19820526 /**< Magic number written by the main partition when ready. */
-
-/* Maximum thread_name length. */
-#define RTE_MAX_THREAD_NAME_LEN 16
 
 /**
  * The type of process in a linux, multi-process setup
@@ -75,6 +71,8 @@ int rte_eal_iopl_init(void);
  * @param argv
  *   An array of strings.  The contents of the array, as well as the strings
  *   which are pointed to by the array, may be modified by this function.
+ *   The program name pointer argv[0] is copied into the last parsed argv
+ *   so that argv[0] is still the same after deducing the parsed arguments.
  * @return
  *   - On success, the number of parsed arguments, which is greater or
  *     equal to zero. After the call to rte_eal_init(),
@@ -241,7 +239,6 @@ rte_mp_action_register(const char *name, rte_mp_t action);
  *
  * @param name
  *   The name argument plays as the nonredundant key to find the action.
- *
  */
 void
 rte_mp_action_unregister(const char *name);
@@ -412,16 +409,12 @@ int rte_eal_create_uio_dev(void);
 enum rte_intr_mode rte_eal_vfio_intr_mode(void);
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change without prior notice
- *
  * Copy the user-configured vfio VF token.
  *
  * @param vf_token
  *   vfio VF token configured with the command line is copied
  *   into this parameter, zero uuid by default.
  */
-__rte_experimental
 void rte_eal_vfio_get_vf_token(rte_uuid_t vf_token);
 
 /**
@@ -459,6 +452,19 @@ __rte_internal
 uint64_t rte_eal_get_baseaddr(void);
 
 /**
+ * IOVA mapping mode.
+ *
+ * IOVA mapping mode is iommu programming mode of a device.
+ * That device (for example: IOMMU backed DMA device) based
+ * on rte_iova_mode will generate physical or virtual address.
+ */
+enum rte_iova_mode {
+	RTE_IOVA_DC = 0,	/* Don't care mode */
+	RTE_IOVA_PA = (1 << 0), /* DMA using physical address */
+	RTE_IOVA_VA = (1 << 1)  /* DMA using virtual address */
+};
+
+/**
  * Get the iova mode
  *
  * @return
@@ -483,6 +489,26 @@ rte_eal_mbuf_user_pool_ops(void);
  */
 const char *
 rte_eal_get_runtime_dir(void);
+
+/**
+ * Convert a string describing a mask of core ids into an array of core ids.
+ *
+ * On success, the passed array is filled with the orders of the core ids
+ * present in the mask (-1 indicating that a core id is absent).
+ * For example, passing a 0xa coremask results in cores[1] = 0, cores[3] = 1,
+ * and the rest of the array is set to -1.
+ *
+ * @param coremask
+ *   A string describing a mask of core ids.
+ * @param cores
+ *   An array where to store the core ids orders.
+ *   This array must be at least RTE_MAX_LCORE large.
+ * @return
+ *   0 on success, -1 if the string content was invalid.
+ */
+__rte_internal
+int
+rte_eal_parse_coremask(const char *coremask, int *cores);
 
 #ifdef __cplusplus
 }

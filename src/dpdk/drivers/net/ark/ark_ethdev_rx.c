@@ -9,6 +9,7 @@
 #include "ark_logs.h"
 #include "ark_mpu.h"
 #include "ark_udm.h"
+#include "ark_ext.h"
 
 #define ARK_RX_META_SIZE 32
 #define ARK_RX_META_OFFSET (RTE_PKTMBUF_HEADROOM - ARK_RX_META_SIZE)
@@ -68,7 +69,7 @@ struct ark_rx_queue {
 static int
 eth_ark_rx_hw_setup(struct rte_eth_dev *dev,
 		    struct ark_rx_queue *queue,
-		    uint16_t rx_queue_id __rte_unused, uint16_t rx_queue_idx)
+		    uint16_t rx_queue_idx)
 {
 	rte_iova_t queue_base;
 	rte_iova_t phys_addr_q_base;
@@ -90,9 +91,6 @@ eth_ark_rx_hw_setup(struct rte_eth_dev *dev,
 	ark_mpu_configure(queue->mpu, phys_addr_q_base, queue->queue_size, 0);
 
 	ark_udm_write_addr(queue->udm, phys_addr_prod_index);
-
-	/* advance the valid pointer, but don't start until the queue starts */
-	ark_mpu_reset_stats(queue->mpu);
 
 	/* The seed is the producer index for the HW */
 	ark_mpu_set_producer(queue->mpu, queue->seed_index);
@@ -127,7 +125,7 @@ eth_ark_dev_rx_queue_setup(struct rte_eth_dev *dev,
 	uint32_t i;
 	int status;
 
-	int qidx = queue_idx;
+	int qidx = ark->qbase + queue_idx;
 
 	/* We may already be setup, free memory prior to re-allocation */
 	if (dev->data->rx_queues[queue_idx] != NULL) {
@@ -169,6 +167,13 @@ eth_ark_dev_rx_queue_setup(struct rte_eth_dev *dev,
 	queue->mb_pool = mb_pool;
 	queue->dataroom = rte_pktmbuf_data_room_size(mb_pool) -
 		RTE_PKTMBUF_HEADROOM;
+
+	/* Check pool's private data to confirm pool structure */
+	if (mb_pool->private_data_size != 0) {
+		struct rte_pmd_ark_lmbuf_mempool_priv *pool_priv = rte_mempool_get_priv(mb_pool);
+		if (strncmp(pool_priv->cookie, ARK_MEMPOOL_COOKIE, sizeof(pool_priv->cookie)) == 0)
+			queue->dataroom = pool_priv->dataroom;
+	}
 	queue->headroom = RTE_PKTMBUF_HEADROOM;
 	queue->phys_qid = qidx;
 	queue->queue_index = queue_idx;
@@ -203,13 +208,10 @@ eth_ark_dev_rx_queue_setup(struct rte_eth_dev *dev,
 	queue->mpu = RTE_PTR_ADD(ark->mpurx.v, qidx * ARK_MPU_QOFFSET);
 
 	/* Configure UDM per queue */
-	ark_udm_stop(queue->udm, 0);
 	ark_udm_configure(queue->udm,
 			  RTE_PKTMBUF_HEADROOM,
-			  queue->dataroom,
-			  ARK_RX_WRITE_TIME_NS);
-	ark_udm_stats_reset(queue->udm);
-	ark_udm_stop(queue->udm, 0);
+			  queue->dataroom);
+	ark_udm_queue_stats_reset(queue->udm);
 
 	/* populate mbuf reserve */
 	status = eth_ark_rx_seed_mbufs(queue);
@@ -221,7 +223,7 @@ eth_ark_dev_rx_queue_setup(struct rte_eth_dev *dev,
 	}
 	/* MPU Setup */
 	if (status == 0)
-		status = eth_ark_rx_hw_setup(dev, queue, qidx, queue_idx);
+		status = eth_ark_rx_hw_setup(dev, queue, queue_idx);
 
 	if (unlikely(status != 0)) {
 		struct rte_mbuf **mbuf;
@@ -589,38 +591,7 @@ eth_rx_queue_stats_reset(void *vqueue)
 	if (queue == 0)
 		return;
 
-	ark_mpu_reset_stats(queue->mpu);
 	ark_udm_queue_stats_reset(queue->udm);
-}
-
-void
-eth_ark_udm_force_close(struct rte_eth_dev *dev)
-{
-	struct ark_adapter *ark = dev->data->dev_private;
-	struct ark_rx_queue *queue;
-	uint32_t index;
-	uint16_t i;
-
-	if (!ark_udm_is_flushed(ark->udm.v)) {
-		/* restart the MPUs */
-		ARK_PMD_LOG(NOTICE, "UDM not flushed -- forcing flush\n");
-		for (i = 0; i < dev->data->nb_rx_queues; i++) {
-			queue = (struct ark_rx_queue *)dev->data->rx_queues[i];
-			if (queue == 0)
-				continue;
-
-			ark_mpu_start(queue->mpu);
-			/* Add some buffers */
-			index = ARK_RX_MPU_CHUNK + queue->seed_index;
-			ark_mpu_set_producer(queue->mpu, index);
-		}
-		/* Wait to allow data to pass */
-		usleep(100);
-
-		ARK_PMD_LOG(NOTICE, "UDM forced flush attempt, stopped = %d\n",
-			    ark_udm_is_flushed(ark->udm.v));
-	}
-	ark_udm_reset(ark->udm.v);
 }
 
 static void
@@ -637,7 +608,6 @@ ark_ethdev_rx_dump(const char *name, struct ark_rx_queue *queue)
 
 	ark_mpu_dump(queue->mpu, name, queue->phys_qid);
 	ark_mpu_dump_setup(queue->mpu, queue->phys_qid);
-	ark_udm_dump(queue->udm, name);
 	ark_udm_dump_setup(queue->udm, queue->phys_qid);
 }
 

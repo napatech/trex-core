@@ -31,7 +31,6 @@ struct idxd_hw_desc {
 	uint32_t op_flags;
 	rte_iova_t completion;
 
-	RTE_STD_C11
 	union {
 		rte_iova_t src;      /* source address for copy ops etc. */
 		rte_iova_t desc_addr; /* descriptor pointer for batch */
@@ -48,6 +47,7 @@ struct idxd_hw_desc {
 
 #define IDXD_COMP_STATUS_INCOMPLETE        0
 #define IDXD_COMP_STATUS_SUCCESS           1
+#define IDXD_COMP_STATUS_PAGE_FAULT     0X03
 #define IDXD_COMP_STATUS_INVALID_OPCODE 0x10
 #define IDXD_COMP_STATUS_INVALID_SIZE   0x13
 #define IDXD_COMP_STATUS_SKIPPED        0xFF /* not official IDXD error, needed as placeholder */

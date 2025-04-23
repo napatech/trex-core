@@ -10,7 +10,7 @@
 #include <ethdev_driver.h>
 #include <ethdev_vdev.h>
 #include <rte_malloc.h>
-#include <rte_bus_vdev.h>
+#include <bus_vdev_driver.h>
 #include <rte_kvargs.h>
 #include <rte_net.h>
 #include <rte_debug.h>
@@ -30,6 +30,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -54,6 +55,7 @@
 #define ETH_TAP_REMOTE_ARG      "remote"
 #define ETH_TAP_MAC_ARG         "mac"
 #define ETH_TAP_MAC_FIXED       "fixed"
+#define ETH_TAP_PERSIST_ARG     "persist"
 
 #define ETH_TAP_USR_MAC_FMT     "xx:xx:xx:xx:xx:xx"
 #define ETH_TAP_CMP_MAC_FMT     "0123456789ABCDEFabcdef"
@@ -92,6 +94,7 @@ static const char *valid_arguments[] = {
 	ETH_TAP_IFACE_ARG,
 	ETH_TAP_REMOTE_ARG,
 	ETH_TAP_MAC_ARG,
+	ETH_TAP_PERSIST_ARG,
 	NULL
 };
 
@@ -140,11 +143,14 @@ static int tap_intr_handle_set(struct rte_eth_dev *dev, int set);
  * @param[in] is_keepalive
  *   Keepalive flag
  *
+ * @param[in] persistent
+ *   Mark device as persistent
+ *
  * @return
  *   -1 on failure, fd on success
  */
 static int
-tun_alloc(struct pmd_internals *pmd, int is_keepalive)
+tun_alloc(struct pmd_internals *pmd, int is_keepalive, int persistent)
 {
 	struct ifreq ifr;
 #ifdef IFF_MULTI_QUEUE
@@ -190,6 +196,14 @@ tun_alloc(struct pmd_internals *pmd, int is_keepalive)
 	/* Set the TUN/TAP configuration and set the name if needed */
 	if (ioctl(fd, TUNSETIFF, (void *)&ifr) < 0) {
 		TAP_LOG(WARNING, "Unable to set TUNSETIFF for %s: %s",
+			ifr.ifr_name, strerror(errno));
+		goto error;
+	}
+
+	/* Keep the device after application exit */
+	if (persistent && ioctl(fd, TUNSETPERSIST, 1) < 0) {
+		TAP_LOG(WARNING,
+			"Unable to set persist %s: %s",
 			ifr.ifr_name, strerror(errno));
 		goto error;
 	}
@@ -507,79 +521,13 @@ end:
 	return num_rx;
 }
 
-/* Finalize l4 checksum calculation */
-static void
-tap_tx_l4_cksum(uint16_t *l4_cksum, uint16_t l4_phdr_cksum,
-		uint32_t l4_raw_cksum)
-{
-	if (l4_cksum) {
-		uint32_t cksum;
-
-		cksum = __rte_raw_cksum_reduce(l4_raw_cksum);
-		cksum += l4_phdr_cksum;
-
-		cksum = ((cksum & 0xffff0000) >> 16) + (cksum & 0xffff);
-		cksum = (~cksum) & 0xffff;
-		if (cksum == 0)
-			cksum = 0xffff;
-		*l4_cksum = cksum;
-	}
-}
-
-/* Accumulate L4 raw checksums */
-static void
-tap_tx_l4_add_rcksum(char *l4_data, unsigned int l4_len, uint16_t *l4_cksum,
-			uint32_t *l4_raw_cksum)
-{
-	if (l4_cksum == NULL)
-		return;
-
-	*l4_raw_cksum = __rte_raw_cksum(l4_data, l4_len, *l4_raw_cksum);
-}
-
-/* L3 and L4 pseudo headers checksum offloads */
-static void
-tap_tx_l3_cksum(char *packet, uint64_t ol_flags, unsigned int l2_len,
-		unsigned int l3_len, unsigned int l4_len, uint16_t **l4_cksum,
-		uint16_t *l4_phdr_cksum, uint32_t *l4_raw_cksum)
-{
-	void *l3_hdr = packet + l2_len;
-
-	if (ol_flags & (RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_IPV4)) {
-		struct rte_ipv4_hdr *iph = l3_hdr;
-		uint16_t cksum;
-
-		iph->hdr_checksum = 0;
-		cksum = rte_raw_cksum(iph, l3_len);
-		iph->hdr_checksum = (cksum == 0xffff) ? cksum : ~cksum;
-	}
-	if (ol_flags & RTE_MBUF_F_TX_L4_MASK) {
-		void *l4_hdr;
-
-		l4_hdr = packet + l2_len + l3_len;
-		if ((ol_flags & RTE_MBUF_F_TX_L4_MASK) == RTE_MBUF_F_TX_UDP_CKSUM)
-			*l4_cksum = &((struct rte_udp_hdr *)l4_hdr)->dgram_cksum;
-		else if ((ol_flags & RTE_MBUF_F_TX_L4_MASK) == RTE_MBUF_F_TX_TCP_CKSUM)
-			*l4_cksum = &((struct rte_tcp_hdr *)l4_hdr)->cksum;
-		else
-			return;
-		**l4_cksum = 0;
-		if (ol_flags & RTE_MBUF_F_TX_IPV4)
-			*l4_phdr_cksum = rte_ipv4_phdr_cksum(l3_hdr, 0);
-		else
-			*l4_phdr_cksum = rte_ipv6_phdr_cksum(l3_hdr, 0);
-		*l4_raw_cksum = __rte_raw_cksum(l4_hdr, l4_len, 0);
-	}
-}
-
 static inline int
 tap_write_mbufs(struct tx_queue *txq, uint16_t num_mbufs,
 			struct rte_mbuf **pmbufs,
 			uint16_t *num_packets, unsigned long *num_tx_bytes)
 {
-	int i;
-	uint16_t l234_hlen;
 	struct pmd_process_private *process_private;
+	int i;
 
 	process_private = rte_eth_devices[txq->out_port].process_private;
 
@@ -588,19 +536,12 @@ tap_write_mbufs(struct tx_queue *txq, uint16_t num_mbufs,
 		struct iovec iovecs[mbuf->nb_segs + 2];
 		struct tun_pi pi = { .flags = 0, .proto = 0x00 };
 		struct rte_mbuf *seg = mbuf;
-		char m_copy[mbuf->data_len];
+		uint64_t l4_ol_flags;
 		int proto;
 		int n;
 		int j;
 		int k; /* current index in iovecs for copying segments */
-		uint16_t seg_len; /* length of first segment */
-		uint16_t nb_segs;
-		uint16_t *l4_cksum; /* l4 checksum (pseudo header + payload) */
-		uint32_t l4_raw_cksum = 0; /* TCP/UDP payload raw checksum */
-		uint16_t l4_phdr_cksum = 0; /* TCP/UDP pseudo header checksum */
-		uint16_t is_cksum = 0; /* in case cksum should be offloaded */
 
-		l4_cksum = NULL;
 		if (txq->type == ETH_TUNTAP_TYPE_TUN) {
 			/*
 			 * TUN and TAP are created with IFF_NO_PI disabled.
@@ -626,64 +567,83 @@ tap_write_mbufs(struct tx_queue *txq, uint16_t num_mbufs,
 		iovecs[k].iov_len = sizeof(pi);
 		k++;
 
-		nb_segs = mbuf->nb_segs;
-		if (txq->csum &&
-		    ((mbuf->ol_flags & (RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_IPV4) ||
-		      (mbuf->ol_flags & RTE_MBUF_F_TX_L4_MASK) == RTE_MBUF_F_TX_UDP_CKSUM ||
-		      (mbuf->ol_flags & RTE_MBUF_F_TX_L4_MASK) == RTE_MBUF_F_TX_TCP_CKSUM))) {
-			is_cksum = 1;
+		l4_ol_flags = mbuf->ol_flags & RTE_MBUF_F_TX_L4_MASK;
+		if (txq->csum && (mbuf->ol_flags & RTE_MBUF_F_TX_IP_CKSUM ||
+				l4_ol_flags == RTE_MBUF_F_TX_UDP_CKSUM ||
+				l4_ol_flags == RTE_MBUF_F_TX_TCP_CKSUM)) {
+			unsigned int hdrlens = mbuf->l2_len + mbuf->l3_len;
+			uint16_t *l4_cksum;
+			void *l3_hdr;
+
+			if (l4_ol_flags == RTE_MBUF_F_TX_UDP_CKSUM)
+				hdrlens += sizeof(struct rte_udp_hdr);
+			else if (l4_ol_flags == RTE_MBUF_F_TX_TCP_CKSUM)
+				hdrlens += sizeof(struct rte_tcp_hdr);
+			else if (l4_ol_flags != RTE_MBUF_F_TX_L4_NO_CKSUM)
+				return -1;
 
 			/* Support only packets with at least layer 4
 			 * header included in the first segment
 			 */
-			seg_len = rte_pktmbuf_data_len(mbuf);
-			l234_hlen = mbuf->l2_len + mbuf->l3_len + mbuf->l4_len;
-			if (seg_len < l234_hlen)
+			if (rte_pktmbuf_data_len(mbuf) < hdrlens)
 				return -1;
 
-			/* To change checksums, work on a * copy of l2, l3
-			 * headers + l4 pseudo header
+			/* To change checksums (considering that a mbuf can be
+			 * indirect, for example), copy l2, l3 and l4 headers
+			 * in a new segment and chain it to existing data
 			 */
-			rte_memcpy(m_copy, rte_pktmbuf_mtod(mbuf, void *),
-					l234_hlen);
-			tap_tx_l3_cksum(m_copy, mbuf->ol_flags,
-				       mbuf->l2_len, mbuf->l3_len, mbuf->l4_len,
-				       &l4_cksum, &l4_phdr_cksum,
-				       &l4_raw_cksum);
-			iovecs[k].iov_base = m_copy;
-			iovecs[k].iov_len = l234_hlen;
-			k++;
+			seg = rte_pktmbuf_copy(mbuf, mbuf->pool, 0, hdrlens);
+			if (seg == NULL)
+				return -1;
+			rte_pktmbuf_adj(mbuf, hdrlens);
+			rte_pktmbuf_chain(seg, mbuf);
+			pmbufs[i] = mbuf = seg;
 
-			/* Update next iovecs[] beyond l2, l3, l4 headers */
-			if (seg_len > l234_hlen) {
-				iovecs[k].iov_len = seg_len - l234_hlen;
-				iovecs[k].iov_base =
-					rte_pktmbuf_mtod(seg, char *) +
-						l234_hlen;
-				tap_tx_l4_add_rcksum(iovecs[k].iov_base,
-					iovecs[k].iov_len, l4_cksum,
-					&l4_raw_cksum);
-				k++;
-				nb_segs++;
+			l3_hdr = rte_pktmbuf_mtod_offset(mbuf, void *, mbuf->l2_len);
+			if (mbuf->ol_flags & RTE_MBUF_F_TX_IP_CKSUM) {
+				struct rte_ipv4_hdr *iph = l3_hdr;
+
+				iph->hdr_checksum = 0;
+				iph->hdr_checksum = rte_ipv4_cksum(iph);
 			}
-			seg = seg->next;
+
+			if (l4_ol_flags == RTE_MBUF_F_TX_L4_NO_CKSUM)
+				goto skip_l4_cksum;
+
+			if (l4_ol_flags == RTE_MBUF_F_TX_UDP_CKSUM) {
+				struct rte_udp_hdr *udp_hdr;
+
+				udp_hdr = rte_pktmbuf_mtod_offset(mbuf, struct rte_udp_hdr *,
+					mbuf->l2_len + mbuf->l3_len);
+				l4_cksum = &udp_hdr->dgram_cksum;
+			} else {
+				struct rte_tcp_hdr *tcp_hdr;
+
+				tcp_hdr = rte_pktmbuf_mtod_offset(mbuf, struct rte_tcp_hdr *,
+					mbuf->l2_len + mbuf->l3_len);
+				l4_cksum = &tcp_hdr->cksum;
+			}
+
+			*l4_cksum = 0;
+			if (mbuf->ol_flags & RTE_MBUF_F_TX_IPV4) {
+				*l4_cksum = rte_ipv4_udptcp_cksum_mbuf(mbuf, l3_hdr,
+					mbuf->l2_len + mbuf->l3_len);
+			} else {
+				*l4_cksum = rte_ipv6_udptcp_cksum_mbuf(mbuf, l3_hdr,
+					mbuf->l2_len + mbuf->l3_len);
+			}
 		}
 
-		for (j = k; j <= nb_segs; j++) {
-			iovecs[j].iov_len = rte_pktmbuf_data_len(seg);
-			iovecs[j].iov_base = rte_pktmbuf_mtod(seg, void *);
-			if (is_cksum)
-				tap_tx_l4_add_rcksum(iovecs[j].iov_base,
-					iovecs[j].iov_len, l4_cksum,
-					&l4_raw_cksum);
+skip_l4_cksum:
+		for (j = 0; j < mbuf->nb_segs; j++) {
+			iovecs[k].iov_len = rte_pktmbuf_data_len(seg);
+			iovecs[k].iov_base = rte_pktmbuf_mtod(seg, void *);
+			k++;
 			seg = seg->next;
 		}
-
-		if (is_cksum)
-			tap_tx_l4_cksum(l4_cksum, l4_phdr_cksum, l4_raw_cksum);
 
 		/* copy the tx frame data */
-		n = writev(process_private->txq_fds[txq->queue_id], iovecs, j);
+		n = writev(process_private->txq_fds[txq->queue_id], iovecs, k);
 		if (n <= 0)
 			return -1;
 
@@ -778,11 +738,15 @@ pmd_tx_burst(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 			break;
 		}
 		num_tx++;
-		/* free original mbuf */
-		rte_pktmbuf_free(mbuf_in);
-		/* free tso mbufs */
-		if (num_tso_mbufs > 0)
+		if (num_tso_mbufs == 0) {
+			/* tap_write_mbufs may prepend a segment to mbuf_in */
+			rte_pktmbuf_free(mbuf[0]);
+		} else {
+			/* free original mbuf */
+			rte_pktmbuf_free(mbuf_in);
+			/* free tso mbufs */
 			rte_pktmbuf_free_bulk(mbuf, num_tso_mbufs);
+		}
 	}
 
 	txq->stats.opackets += num_packets;
@@ -973,6 +937,7 @@ tap_mp_req_start_rxtx(const struct rte_mp_msg *request, __rte_unused const void 
 static int
 tap_dev_stop(struct rte_eth_dev *dev)
 {
+	struct pmd_internals *pmd = dev->data->dev_private;
 	int i;
 
 	for (i = 0; i < dev->data->nb_tx_queues; i++)
@@ -981,7 +946,8 @@ tap_dev_stop(struct rte_eth_dev *dev)
 		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
 
 	tap_intr_handle_set(dev, 0);
-	tap_link_set_down(dev);
+	if (!pmd->persist)
+		tap_link_set_down(dev);
 
 	return 0;
 }
@@ -1066,7 +1032,7 @@ tap_dev_info(struct rte_eth_dev *dev, struct rte_eth_dev_info *dev_info)
 
 	dev_info->if_index = internals->if_index;
 	dev_info->max_mac_addrs = 1;
-	dev_info->max_rx_pktlen = (uint32_t)RTE_ETHER_MAX_VLAN_FRAME_LEN;
+	dev_info->max_rx_pktlen = RTE_ETHER_MAX_JUMBO_FRAME_LEN;
 	dev_info->max_rx_queues = RTE_PMD_TAP_MAX_QUEUES;
 	dev_info->max_tx_queues = RTE_PMD_TAP_MAX_QUEUES;
 	dev_info->min_rx_bufsize = 0;
@@ -1165,7 +1131,8 @@ tap_dev_close(struct rte_eth_dev *dev)
 		return 0;
 	}
 
-	tap_link_set_down(dev);
+	if (!internals->persist)
+		tap_link_set_down(dev);
 	if (internals->nlsk_fd != -1) {
 		tap_flow_flush(dev, NULL);
 		tap_flow_implicit_flush(internals, NULL);
@@ -1212,6 +1179,8 @@ tap_dev_close(struct rte_eth_dev *dev)
 	internals = dev->data->dev_private;
 	TAP_LOG(DEBUG, "Closing %s Ethernet device on numa %u",
 		tuntap_types[internals->type], rte_socket_id());
+
+	rte_intr_instance_free(internals->intr_handle);
 
 	if (internals->ioctl_sock != -1) {
 		close(internals->ioctl_sock);
@@ -1551,7 +1520,7 @@ tap_setup_queue(struct rte_eth_dev *dev,
 			pmd->name, *other_fd, dir, qid, *fd);
 	} else {
 		/* Both RX and TX fds do not exist (equal -1). Create fd */
-		*fd = tun_alloc(pmd, 0);
+		*fd = tun_alloc(pmd, 0, 0);
 		if (*fd < 0) {
 			*fd = -1; /* restore original value */
 			TAP_LOG(ERR, "%s: tun_alloc() failed.", pmd->name);
@@ -1809,7 +1778,8 @@ tap_intr_handle_set(struct rte_eth_dev *dev, int set)
 }
 
 static const uint32_t*
-tap_dev_supported_ptypes_get(struct rte_eth_dev *dev __rte_unused)
+tap_dev_supported_ptypes_get(struct rte_eth_dev *dev __rte_unused,
+			     size_t *no_of_elements)
 {
 	static const uint32_t ptypes[] = {
 		RTE_PTYPE_INNER_L2_ETHER,
@@ -1836,6 +1806,7 @@ tap_dev_supported_ptypes_get(struct rte_eth_dev *dev __rte_unused)
 		RTE_PTYPE_L4_SCTP,
 	};
 
+	*no_of_elements = RTE_DIM(ptypes);
 	return ptypes;
 }
 
@@ -1956,7 +1927,7 @@ static const struct eth_dev_ops ops = {
 static int
 eth_dev_tap_create(struct rte_vdev_device *vdev, const char *tap_name,
 		   char *remote_iface, struct rte_ether_addr *mac_addr,
-		   enum rte_tuntap_type type)
+		   enum rte_tuntap_type type, int persist)
 {
 	int numa_node = rte_socket_id();
 	struct rte_eth_dev *dev;
@@ -2048,7 +2019,7 @@ eth_dev_tap_create(struct rte_vdev_device *vdev, const char *tap_name,
 	 * This keep-alive file descriptor will guarantee that the TUN device
 	 * exists even when all of its queues are closed
 	 */
-	pmd->ka_fd = tun_alloc(pmd, 1);
+	pmd->ka_fd = tun_alloc(pmd, 1, persist);
 	if (pmd->ka_fd == -1) {
 		TAP_LOG(ERR, "Unable to create %s interface", tuntap_name);
 		goto error_exit;
@@ -2067,6 +2038,9 @@ eth_dev_tap_create(struct rte_vdev_device *vdev, const char *tap_name,
 		if (tap_ioctl(pmd, SIOCSIFHWADDR, &ifr, 0, LOCAL_ONLY) < 0)
 			goto error_exit;
 	}
+
+	/* Make network device persist after application exit */
+	pmd->persist = persist;
 
 	/*
 	 * Set up everything related to rte_flow:
@@ -2177,8 +2151,8 @@ error_exit:
 		close(pmd->ioctl_sock);
 	/* mac_addrs must not be freed alone because part of dev_private */
 	dev->data->mac_addrs = NULL;
-	rte_eth_dev_release_port(dev);
 	rte_intr_instance_free(pmd->intr_handle);
+	rte_eth_dev_release_port(dev);
 
 error_exit_nodev:
 	TAP_LOG(ERR, "%s Unable to initialize %s",
@@ -2245,29 +2219,6 @@ set_remote_iface(const char *key __rte_unused,
 	return 0;
 }
 
-static int parse_user_mac(struct rte_ether_addr *user_mac,
-		const char *value)
-{
-	unsigned int index = 0;
-	char mac_temp[strlen(ETH_TAP_USR_MAC_FMT) + 1], *mac_byte = NULL;
-
-	if (user_mac == NULL || value == NULL)
-		return 0;
-
-	strlcpy(mac_temp, value, sizeof(mac_temp));
-	mac_byte = strtok(mac_temp, ":");
-
-	while ((mac_byte != NULL) &&
-			(strlen(mac_byte) <= 2) &&
-			(strlen(mac_byte) == strspn(mac_byte,
-					ETH_TAP_CMP_MAC_FMT))) {
-		user_mac->addr_bytes[index++] = strtoul(mac_byte, NULL, 16);
-		mac_byte = strtok(NULL, ":");
-	}
-
-	return index;
-}
-
 static int
 set_mac_type(const char *key __rte_unused,
 	     const char *value,
@@ -2281,15 +2232,15 @@ set_mac_type(const char *key __rte_unused,
 	if (!strncasecmp(ETH_TAP_MAC_FIXED, value, strlen(ETH_TAP_MAC_FIXED))) {
 		static int iface_idx;
 
-		/* fixed mac = 00:64:74:61:70:<iface_idx> */
-		memcpy((char *)user_mac->addr_bytes, "\0dtap",
+		/* fixed mac = 02:64:74:61:70:<iface_idx> */
+		memcpy((char *)user_mac->addr_bytes, "\002dtap",
 			RTE_ETHER_ADDR_LEN);
 		user_mac->addr_bytes[RTE_ETHER_ADDR_LEN - 1] =
 			iface_idx++ + '0';
 		goto success;
 	}
 
-	if (parse_user_mac(user_mac, value) != 6)
+	if (rte_ether_unformat_addr(value, user_mac) < 0)
 		goto error;
 success:
 	TAP_LOG(DEBUG, "TAP user MAC param (%s)", value);
@@ -2358,7 +2309,7 @@ rte_pmd_tun_probe(struct rte_vdev_device *dev)
 	TAP_LOG(DEBUG, "Initializing pmd_tun for %s", name);
 
 	ret = eth_dev_tap_create(dev, tun_name, remote_iface, 0,
-				 ETH_TUNTAP_TYPE_TUN);
+				 ETH_TUNTAP_TYPE_TUN, 0);
 
 leave:
 	if (ret == -1) {
@@ -2488,6 +2439,7 @@ rte_pmd_tap_probe(struct rte_vdev_device *dev)
 	struct rte_ether_addr user_mac = { .addr_bytes = {0} };
 	struct rte_eth_dev *eth_dev;
 	int tap_devices_count_increased = 0;
+	int persist = 0;
 
 	name = rte_vdev_device_name(dev);
 	params = rte_vdev_device_args(dev);
@@ -2571,6 +2523,9 @@ rte_pmd_tap_probe(struct rte_vdev_device *dev)
 				if (ret == -1)
 					goto leave;
 			}
+
+			if (rte_kvargs_count(kvlist, ETH_TAP_PERSIST_ARG) == 1)
+				persist = 1;
 		}
 	}
 	pmd_link.link_speed = speed;
@@ -2589,7 +2544,7 @@ rte_pmd_tap_probe(struct rte_vdev_device *dev)
 	tap_devices_count++;
 	tap_devices_count_increased = 1;
 	ret = eth_dev_tap_create(dev, tap_name, remote_iface, &user_mac,
-		ETH_TUNTAP_TYPE_TAP);
+				 ETH_TUNTAP_TYPE_TAP, persist);
 
 leave:
 	if (ret == -1) {

@@ -32,7 +32,7 @@
  */
 
 #include <stdint.h>
-#include <rte_compat.h>
+
 #include <rte_common.h>
 #include <rte_config.h>
 #include <rte_mempool.h>
@@ -136,6 +136,43 @@ rte_mbuf_prefetch_part2(struct rte_mbuf *m)
 static inline uint16_t rte_pktmbuf_priv_size(struct rte_mempool *mp);
 
 /**
+ * Get the IOVA address of the mbuf data buffer.
+ *
+ * @param m
+ *   The pointer to the mbuf.
+ * @return
+ *   The IOVA address of the mbuf.
+ */
+static inline rte_iova_t
+rte_mbuf_iova_get(const struct rte_mbuf *m)
+{
+#if RTE_IOVA_IN_MBUF
+	return m->buf_iova;
+#else
+	return (rte_iova_t)m->buf_addr;
+#endif
+}
+
+/**
+ * Set the IOVA address of the mbuf data buffer.
+ *
+ * @param m
+ *   The pointer to the mbuf.
+ * @param iova
+ *   Value to set as IOVA address of the mbuf.
+ */
+static inline void
+rte_mbuf_iova_set(struct rte_mbuf *m, rte_iova_t iova)
+{
+#if RTE_IOVA_IN_MBUF
+	m->buf_iova = iova;
+#else
+	RTE_SET_USED(m);
+	RTE_SET_USED(iova);
+#endif
+}
+
+/**
  * Return the IO address of the beginning of the mbuf data
  *
  * @param mb
@@ -146,7 +183,7 @@ static inline uint16_t rte_pktmbuf_priv_size(struct rte_mempool *mp);
 static inline rte_iova_t
 rte_mbuf_data_iova(const struct rte_mbuf *mb)
 {
-	return mb->buf_iova + mb->data_off;
+	return rte_mbuf_iova_get(mb) + mb->data_off;
 }
 
 /**
@@ -164,7 +201,7 @@ rte_mbuf_data_iova(const struct rte_mbuf *mb)
 static inline rte_iova_t
 rte_mbuf_data_iova_default(const struct rte_mbuf *mb)
 {
-	return mb->buf_iova + RTE_PKTMBUF_HEADROOM;
+	return rte_mbuf_iova_get(mb) + RTE_PKTMBUF_HEADROOM;
 }
 
 /**
@@ -341,7 +378,7 @@ rte_mbuf_refcnt_read(const struct rte_mbuf *m)
       };
       return (res);
 #else
-	return __atomic_load_n(&m->refcnt, __ATOMIC_RELAXED);
+	return rte_atomic_load_explicit(&m->refcnt, rte_memory_order_relaxed);
 #endif
 }
 
@@ -355,14 +392,14 @@ rte_mbuf_refcnt_read(const struct rte_mbuf *m)
 static inline void
 rte_mbuf_refcnt_set(struct rte_mbuf *m, uint16_t new_value)
 {
-#ifdef TREX_PATCH
+    #ifdef TREX_PATCH
         if (likely(m->m_core_locality > RTE_MBUF_CORE_LOCALITY_MULTI)) {
             m->refcnt = new_value;
         } else {
           __atomic_store_n(&m->refcnt, new_value, __ATOMIC_RELAXED);
         }
 #else
-	__atomic_store_n(&m->refcnt, new_value, __ATOMIC_RELAXED);
+	rte_atomic_store_explicit(&m->refcnt, new_value, rte_memory_order_relaxed);
 #endif
 }
 
@@ -370,8 +407,8 @@ rte_mbuf_refcnt_set(struct rte_mbuf *m, uint16_t new_value)
 static inline uint16_t
 __rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t value)
 {
-	return __atomic_add_fetch(&m->refcnt, (uint16_t)value,
-				 __ATOMIC_ACQ_REL);
+	return rte_atomic_fetch_add_explicit(&m->refcnt, value,
+				 rte_memory_order_acq_rel) + value;
 }
 
 /**
@@ -466,7 +503,7 @@ rte_mbuf_refcnt_set(struct rte_mbuf *m, uint16_t new_value)
 static inline uint16_t
 rte_mbuf_ext_refcnt_read(const struct rte_mbuf_ext_shared_info *shinfo)
 {
-	return __atomic_load_n(&shinfo->refcnt, __ATOMIC_RELAXED);
+	return rte_atomic_load_explicit(&shinfo->refcnt, rte_memory_order_relaxed);
 }
 
 /**
@@ -481,7 +518,7 @@ static inline void
 rte_mbuf_ext_refcnt_set(struct rte_mbuf_ext_shared_info *shinfo,
 	uint16_t new_value)
 {
-	__atomic_store_n(&shinfo->refcnt, new_value, __ATOMIC_RELAXED);
+	rte_atomic_store_explicit(&shinfo->refcnt, new_value, rte_memory_order_relaxed);
 }
 
 /**
@@ -505,8 +542,8 @@ rte_mbuf_ext_refcnt_update(struct rte_mbuf_ext_shared_info *shinfo,
 		return (uint16_t)value;
 	}
 
-	return __atomic_add_fetch(&shinfo->refcnt, (uint16_t)value,
-				 __ATOMIC_ACQ_REL);
+	return rte_atomic_fetch_add_explicit(&shinfo->refcnt, value,
+				 rte_memory_order_acq_rel) + value;
 }
 
 /** Mbuf prefetch */
@@ -710,7 +747,6 @@ void rte_pktmbuf_pool_init(struct rte_mempool *mp, void *opaque_arg);
  *   The pointer to the new allocated mempool, on success. NULL on error
  *   with rte_errno set appropriately. Possible rte_errno values include:
  *    - E_RTE_NO_CONFIG - function could not get pointer to rte_config structure
- *    - E_RTE_SECONDARY - function was called from a secondary process instance
  *    - EINVAL - cache size provided is too large, or priv_size is not aligned.
  *    - ENOSPC - the maximum number of memzones has already been allocated
  *    - EEXIST - a memzone with the same name already exists
@@ -752,7 +788,6 @@ rte_pktmbuf_pool_create(const char *name, unsigned n,
  *   The pointer to the new allocated mempool, on success. NULL on error
  *   with rte_errno set appropriately. Possible rte_errno values include:
  *    - E_RTE_NO_CONFIG - function could not get pointer to rte_config structure
- *    - E_RTE_SECONDARY - function was called from a secondary process instance
  *    - EINVAL - cache size provided is too large, or priv_size is not aligned.
  *    - ENOSPC - the maximum number of memzones has already been allocated
  *    - EEXIST - a memzone with the same name already exists
@@ -806,13 +841,11 @@ struct rte_pktmbuf_extmem {
  *   The pointer to the new allocated mempool, on success. NULL on error
  *   with rte_errno set appropriately. Possible rte_errno values include:
  *    - E_RTE_NO_CONFIG - function could not get pointer to rte_config structure
- *    - E_RTE_SECONDARY - function was called from a secondary process instance
  *    - EINVAL - cache size provided is too large, or priv_size is not aligned.
  *    - ENOSPC - the maximum number of memzones has already been allocated
  *    - EEXIST - a memzone with the same name already exists
  *    - ENOMEM - no appropriate memory area found in which to create memzone
  */
-__rte_experimental
 struct rte_mempool *
 rte_pktmbuf_pool_create_extbuf(const char *name, unsigned int n,
 	unsigned int cache_size, uint16_t priv_size,
@@ -1105,7 +1138,7 @@ rte_pktmbuf_attach_extbuf(struct rte_mbuf *m, void *buf_addr,
 	RTE_ASSERT(shinfo->free_cb != NULL);
 
 	m->buf_addr = buf_addr;
-	m->buf_iova = buf_iova;
+	rte_mbuf_iova_set(m, buf_iova);
 	m->buf_len = buf_len;
 
 	m->data_len = 0;
@@ -1192,7 +1225,7 @@ static inline void rte_pktmbuf_attach(struct rte_mbuf *mi, struct rte_mbuf *m)
 
 	mi->data_off = m->data_off;
 	mi->data_len = m->data_len;
-	mi->buf_iova = m->buf_iova;
+	rte_mbuf_iova_set(mi, rte_mbuf_iova_get(m));
 	mi->buf_addr = m->buf_addr;
 	mi->buf_len = m->buf_len;
 
@@ -1294,7 +1327,7 @@ static inline void rte_pktmbuf_detach(struct rte_mbuf *m)
 
 	m->priv_size = priv_size;
 	m->buf_addr = (char *)m + mbuf_size;
-	m->buf_iova = rte_mempool_virt2iova(m) + mbuf_size;
+	rte_mbuf_iova_set(m, rte_mempool_virt2iova(m) + mbuf_size);
 	m->buf_len = (uint16_t)buf_len;
 	rte_pktmbuf_reset_headroom(m);
 	m->data_len = 0;
@@ -1330,8 +1363,8 @@ static inline int __rte_pktmbuf_pinned_extbuf_decref(struct rte_mbuf *m)
 	 * Direct usage of add primitive to avoid
 	 * duplication of comparing with one.
 	 */
-	if (likely(__atomic_add_fetch(&shinfo->refcnt, (uint16_t)-1,
-				     __ATOMIC_ACQ_REL)))
+	if (likely(rte_atomic_fetch_add_explicit(&shinfo->refcnt, -1,
+				     rte_memory_order_acq_rel) - 1))
 		return 1;
 
 	/* Reinitialize counter before mbuf freeing. */
@@ -1379,7 +1412,6 @@ rte_pktmbuf_prefree_seg(struct rte_mbuf *m)
 #else
 	} else if (rte_mbuf_refcnt_update(m, -1) == 0) {
 #endif 
-
 		if (!RTE_MBUF_DIRECT(m)) {
 			rte_pktmbuf_detach(m);
 			if (RTE_MBUF_HAS_EXTBUF(m) &&

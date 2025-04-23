@@ -765,7 +765,7 @@ struct vnic_devcmd_notify {
 struct vnic_devcmd_provinfo {
 	uint8_t oui[3];
 	uint8_t type;
-	uint8_t data[0];
+	uint8_t data[];
 };
 
 /*
@@ -997,7 +997,7 @@ enum {
 struct filter_tlv {
 	uint32_t type;
 	uint32_t length;
-	uint32_t val[0];
+	uint32_t val[];
 };
 
 /* Data for CMD_ADD_FILTER is 2 TLV and filter + action structs */

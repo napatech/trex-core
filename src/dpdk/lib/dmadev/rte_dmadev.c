@@ -3,7 +3,9 @@
  * Copyright(c) 2021 Intel Corporation
  */
 
+#include <ctype.h>
 #include <inttypes.h>
+#include <stdlib.h>
 
 #include <rte_eal.h>
 #include <rte_lcore.h>
@@ -11,9 +13,11 @@
 #include <rte_malloc.h>
 #include <rte_memzone.h>
 #include <rte_string_fns.h>
+#include <rte_telemetry.h>
 
 #include "rte_dmadev.h"
 #include "rte_dmadev_pmd.h"
+#include "rte_dmadev_trace.h"
 
 static int16_t dma_devices_max;
 
@@ -28,9 +32,10 @@ static struct {
 } *dma_devices_shared_data;
 
 RTE_LOG_REGISTER_DEFAULT(rte_dma_logtype, INFO);
+#define RTE_LOGTYPE_DMADEV rte_dma_logtype
+
 #define RTE_DMA_LOG(level, ...) \
-	rte_log(RTE_LOG_ ## level, rte_dma_logtype, RTE_FMT("dma: " \
-		RTE_FMT_HEAD(__VA_ARGS__,) "\n", RTE_FMT_TAIL(__VA_ARGS__,)))
+	RTE_LOG_LINE(level, DMADEV, "" __VA_ARGS__)
 
 int
 rte_dma_dev_max(size_t dev_max)
@@ -393,6 +398,15 @@ rte_dma_is_valid(int16_t dev_id)
 		rte_dma_devices[dev_id].state != RTE_DMA_DEV_UNUSED;
 }
 
+struct rte_dma_dev *
+rte_dma_pmd_get_dev_by_id(int16_t dev_id)
+{
+	if (!rte_dma_is_valid(dev_id))
+		return NULL;
+
+	return &rte_dma_devices[dev_id];
+}
+
 uint16_t
 rte_dma_count_avail(void)
 {
@@ -419,7 +433,8 @@ rte_dma_info_get(int16_t dev_id, struct rte_dma_info *dev_info)
 	if (!rte_dma_is_valid(dev_id) || dev_info == NULL)
 		return -EINVAL;
 
-	RTE_FUNC_PTR_OR_ERR_RET(*dev->dev_ops->dev_info_get, -ENOTSUP);
+	if (*dev->dev_ops->dev_info_get == NULL)
+		return -ENOTSUP;
 	memset(dev_info, 0, sizeof(struct rte_dma_info));
 	ret = (*dev->dev_ops->dev_info_get)(dev, dev_info,
 					    sizeof(struct rte_dma_info));
@@ -429,6 +444,8 @@ rte_dma_info_get(int16_t dev_id, struct rte_dma_info *dev_info)
 	dev_info->dev_name = dev->data->dev_name;
 	dev_info->numa_node = dev->device->numa_node;
 	dev_info->nb_vchans = dev->data->dev_conf.nb_vchans;
+
+	rte_dma_trace_info_get(dev_id, dev_info);
 
 	return 0;
 }
@@ -471,12 +488,15 @@ rte_dma_configure(int16_t dev_id, const struct rte_dma_conf *dev_conf)
 		return -EINVAL;
 	}
 
-	RTE_FUNC_PTR_OR_ERR_RET(*dev->dev_ops->dev_configure, -ENOTSUP);
+	if (*dev->dev_ops->dev_configure == NULL)
+		return -ENOTSUP;
 	ret = (*dev->dev_ops->dev_configure)(dev, dev_conf,
 					     sizeof(struct rte_dma_conf));
 	if (ret == 0)
 		memcpy(&dev->data->dev_conf, dev_conf,
 		       sizeof(struct rte_dma_conf));
+
+	rte_dma_trace_configure(dev_id, dev_conf, ret);
 
 	return ret;
 }
@@ -504,6 +524,7 @@ rte_dma_start(int16_t dev_id)
 		goto mark_started;
 
 	ret = (*dev->dev_ops->dev_start)(dev);
+	rte_dma_trace_start(dev_id, ret);
 	if (ret != 0)
 		return ret;
 
@@ -530,6 +551,7 @@ rte_dma_stop(int16_t dev_id)
 		goto mark_stopped;
 
 	ret = (*dev->dev_ops->dev_stop)(dev);
+	rte_dma_trace_stop(dev_id, ret);
 	if (ret != 0)
 		return ret;
 
@@ -554,10 +576,13 @@ rte_dma_close(int16_t dev_id)
 		return -EBUSY;
 	}
 
-	RTE_FUNC_PTR_OR_ERR_RET(*dev->dev_ops->dev_close, -ENOTSUP);
+	if (*dev->dev_ops->dev_close == NULL)
+		return -ENOTSUP;
 	ret = (*dev->dev_ops->dev_close)(dev);
 	if (ret == 0)
 		dma_release(dev);
+
+	rte_dma_trace_close(dev_id, ret);
 
 	return ret;
 }
@@ -647,9 +672,13 @@ rte_dma_vchan_setup(int16_t dev_id, uint16_t vchan,
 		return -EINVAL;
 	}
 
-	RTE_FUNC_PTR_OR_ERR_RET(*dev->dev_ops->vchan_setup, -ENOTSUP);
-	return (*dev->dev_ops->vchan_setup)(dev, vchan, conf,
+	if (*dev->dev_ops->vchan_setup == NULL)
+		return -ENOTSUP;
+	ret = (*dev->dev_ops->vchan_setup)(dev, vchan, conf,
 					sizeof(struct rte_dma_vchan_conf));
+	rte_dma_trace_vchan_setup(dev_id, vchan, conf, ret);
+
+	return ret;
 }
 
 int
@@ -667,7 +696,8 @@ rte_dma_stats_get(int16_t dev_id, uint16_t vchan, struct rte_dma_stats *stats)
 		return -EINVAL;
 	}
 
-	RTE_FUNC_PTR_OR_ERR_RET(*dev->dev_ops->stats_get, -ENOTSUP);
+	if (*dev->dev_ops->stats_get == NULL)
+		return -ENOTSUP;
 	memset(stats, 0, sizeof(struct rte_dma_stats));
 	return (*dev->dev_ops->stats_get)(dev, vchan, stats,
 					  sizeof(struct rte_dma_stats));
@@ -677,6 +707,7 @@ int
 rte_dma_stats_reset(int16_t dev_id, uint16_t vchan)
 {
 	struct rte_dma_dev *dev = &rte_dma_devices[dev_id];
+	int ret;
 
 	if (!rte_dma_is_valid(dev_id))
 		return -EINVAL;
@@ -688,8 +719,12 @@ rte_dma_stats_reset(int16_t dev_id, uint16_t vchan)
 		return -EINVAL;
 	}
 
-	RTE_FUNC_PTR_OR_ERR_RET(*dev->dev_ops->stats_reset, -ENOTSUP);
-	return (*dev->dev_ops->stats_reset)(dev, vchan);
+	if (*dev->dev_ops->stats_reset == NULL)
+		return -ENOTSUP;
+	ret = (*dev->dev_ops->stats_reset)(dev, vchan);
+	rte_dma_trace_stats_reset(dev_id, vchan, ret);
+
+	return ret;
 }
 
 int
@@ -701,11 +736,12 @@ rte_dma_vchan_status(int16_t dev_id, uint16_t vchan, enum rte_dma_vchan_status *
 		return -EINVAL;
 
 	if (vchan >= dev->data->dev_conf.nb_vchans) {
-		RTE_DMA_LOG(ERR, "Device %u vchan %u out of range\n", dev_id, vchan);
+		RTE_DMA_LOG(ERR, "Device %u vchan %u out of range", dev_id, vchan);
 		return -EINVAL;
 	}
 
-	RTE_FUNC_PTR_OR_ERR_RET(*dev->dev_ops->vchan_status, -ENOTSUP);
+	if (*dev->dev_ops->vchan_status == NULL)
+		return -ENOTSUP;
 	return (*dev->dev_ops->vchan_status)(dev, vchan, status);
 }
 
@@ -723,6 +759,7 @@ dma_capability_name(uint64_t capability)
 		{ RTE_DMA_CAPA_SVA,         "sva"     },
 		{ RTE_DMA_CAPA_SILENT,      "silent"  },
 		{ RTE_DMA_CAPA_HANDLES_ERRORS, "handles_errors" },
+		{ RTE_DMA_CAPA_M2D_AUTO_FREE,  "m2d_auto_free"  },
 		{ RTE_DMA_CAPA_OPS_COPY,    "copy"    },
 		{ RTE_DMA_CAPA_OPS_COPY_SG, "copy_sg" },
 		{ RTE_DMA_CAPA_OPS_FILL,    "fill"    },
@@ -748,7 +785,7 @@ dma_dump_capability(FILE *f, uint64_t dev_capa)
 
 	(void)fprintf(f, "  dev_capa: 0x%" PRIx64 " -", dev_capa);
 	while (dev_capa > 0) {
-		capa = 1ull << __builtin_ctzll(dev_capa);
+		capa = 1ull << rte_ctz64(dev_capa);
 		(void)fprintf(f, " %s", dma_capability_name(capa));
 		dev_capa &= ~capa;
 	}
@@ -782,9 +819,10 @@ rte_dma_dump(int16_t dev_id, FILE *f)
 		dev->data->dev_conf.enable_silent ? "on" : "off");
 
 	if (dev->dev_ops->dev_dump != NULL)
-		return (*dev->dev_ops->dev_dump)(dev, f);
+		ret = (*dev->dev_ops->dev_dump)(dev, f);
+	rte_dma_trace_dump(dev_id, f, ret);
 
-	return 0;
+	return ret;
 }
 
 static int
@@ -863,4 +901,177 @@ dma_fp_object_dummy(struct rte_dma_fp_object *obj)
 	obj->completed        = dummy_completed;
 	obj->completed_status = dummy_completed_status;
 	obj->burst_capacity   = dummy_burst_capacity;
+}
+
+static int
+dmadev_handle_dev_list(const char *cmd __rte_unused,
+		const char *params __rte_unused,
+		struct rte_tel_data *d)
+{
+	int dev_id;
+
+	rte_tel_data_start_array(d, RTE_TEL_INT_VAL);
+	for (dev_id = 0; dev_id < dma_devices_max; dev_id++)
+		if (rte_dma_is_valid(dev_id))
+			rte_tel_data_add_array_int(d, dev_id);
+
+	return 0;
+}
+
+#define ADD_CAPA(td, dc, c) rte_tel_data_add_dict_int(td, dma_capability_name(c), !!(dc & c))
+
+static int
+dmadev_handle_dev_info(const char *cmd __rte_unused,
+		const char *params, struct rte_tel_data *d)
+{
+	struct rte_dma_info dma_info;
+	struct rte_tel_data *dma_caps;
+	int dev_id, ret;
+	uint64_t dev_capa;
+	char *end_param;
+
+	if (params == NULL || strlen(params) == 0 || !isdigit(*params))
+		return -EINVAL;
+
+	dev_id = strtoul(params, &end_param, 0);
+	if (*end_param != '\0')
+		RTE_DMA_LOG(WARNING, "Extra parameters passed to dmadev telemetry command, ignoring");
+
+	/* Function info_get validates dev_id so we don't need to. */
+	ret = rte_dma_info_get(dev_id, &dma_info);
+	if (ret < 0)
+		return -EINVAL;
+	dev_capa = dma_info.dev_capa;
+
+	rte_tel_data_start_dict(d);
+	rte_tel_data_add_dict_string(d, "name", dma_info.dev_name);
+	rte_tel_data_add_dict_int(d, "nb_vchans", dma_info.nb_vchans);
+	rte_tel_data_add_dict_int(d, "numa_node", dma_info.numa_node);
+	rte_tel_data_add_dict_int(d, "max_vchans", dma_info.max_vchans);
+	rte_tel_data_add_dict_int(d, "max_desc", dma_info.max_desc);
+	rte_tel_data_add_dict_int(d, "min_desc", dma_info.min_desc);
+	rte_tel_data_add_dict_int(d, "max_sges", dma_info.max_sges);
+
+	dma_caps = rte_tel_data_alloc();
+	if (!dma_caps)
+		return -ENOMEM;
+
+	rte_tel_data_start_dict(dma_caps);
+	ADD_CAPA(dma_caps, dev_capa, RTE_DMA_CAPA_MEM_TO_MEM);
+	ADD_CAPA(dma_caps, dev_capa, RTE_DMA_CAPA_MEM_TO_DEV);
+	ADD_CAPA(dma_caps, dev_capa, RTE_DMA_CAPA_DEV_TO_MEM);
+	ADD_CAPA(dma_caps, dev_capa, RTE_DMA_CAPA_DEV_TO_DEV);
+	ADD_CAPA(dma_caps, dev_capa, RTE_DMA_CAPA_SVA);
+	ADD_CAPA(dma_caps, dev_capa, RTE_DMA_CAPA_SILENT);
+	ADD_CAPA(dma_caps, dev_capa, RTE_DMA_CAPA_HANDLES_ERRORS);
+	ADD_CAPA(dma_caps, dev_capa, RTE_DMA_CAPA_M2D_AUTO_FREE);
+	ADD_CAPA(dma_caps, dev_capa, RTE_DMA_CAPA_OPS_COPY);
+	ADD_CAPA(dma_caps, dev_capa, RTE_DMA_CAPA_OPS_COPY_SG);
+	ADD_CAPA(dma_caps, dev_capa, RTE_DMA_CAPA_OPS_FILL);
+	rte_tel_data_add_dict_container(d, "capabilities", dma_caps, 0);
+
+	return 0;
+}
+
+#define ADD_DICT_STAT(s) rte_tel_data_add_dict_uint(d, #s, dma_stats.s)
+
+static int
+dmadev_handle_dev_stats(const char *cmd __rte_unused,
+		const char *params,
+		struct rte_tel_data *d)
+{
+	struct rte_dma_info dma_info;
+	struct rte_dma_stats dma_stats;
+	int dev_id, ret, vchan_id;
+	char *end_param;
+	const char *vchan_param;
+
+	if (params == NULL || strlen(params) == 0 || !isdigit(*params))
+		return -EINVAL;
+
+	dev_id = strtoul(params, &end_param, 0);
+
+	/* Function info_get validates dev_id so we don't need to. */
+	ret = rte_dma_info_get(dev_id, &dma_info);
+	if (ret < 0)
+		return -EINVAL;
+
+	/* If the device has one vchan the user does not need to supply the
+	 * vchan id and only the device id is needed, no extra parameters.
+	 */
+	if (dma_info.nb_vchans == 1 && *end_param == '\0')
+		vchan_id = 0;
+	else {
+		vchan_param = strtok(end_param, ",");
+		if (!vchan_param || strlen(vchan_param) == 0 || !isdigit(*vchan_param))
+			return -EINVAL;
+
+		vchan_id = strtoul(vchan_param, &end_param, 0);
+	}
+	if (*end_param != '\0')
+		RTE_DMA_LOG(WARNING, "Extra parameters passed to dmadev telemetry command, ignoring");
+
+	ret = rte_dma_stats_get(dev_id, vchan_id, &dma_stats);
+	if (ret < 0)
+		return -EINVAL;
+
+	rte_tel_data_start_dict(d);
+	ADD_DICT_STAT(submitted);
+	ADD_DICT_STAT(completed);
+	ADD_DICT_STAT(errors);
+
+	return 0;
+}
+
+#ifndef RTE_EXEC_ENV_WINDOWS
+static int
+dmadev_handle_dev_dump(const char *cmd __rte_unused,
+		const char *params,
+		struct rte_tel_data *d)
+{
+	char *buf, *end_param;
+	int dev_id, ret;
+	FILE *f;
+
+	if (params == NULL || strlen(params) == 0 || !isdigit(*params))
+		return -EINVAL;
+
+	dev_id = strtoul(params, &end_param, 0);
+	if (*end_param != '\0')
+		RTE_DMA_LOG(WARNING, "Extra parameters passed to dmadev telemetry command, ignoring");
+
+	buf = calloc(RTE_TEL_MAX_SINGLE_STRING_LEN, sizeof(char));
+	if (buf == NULL)
+		return -ENOMEM;
+
+	f = fmemopen(buf, RTE_TEL_MAX_SINGLE_STRING_LEN - 1, "w+");
+	if (f == NULL) {
+		free(buf);
+		return -EINVAL;
+	}
+
+	ret = rte_dma_dump(dev_id, f);
+	fclose(f);
+	if (ret == 0) {
+		rte_tel_data_start_dict(d);
+		rte_tel_data_string(d, buf);
+	}
+
+	free(buf);
+	return ret;
+}
+#endif /* !RTE_EXEC_ENV_WINDOWS */
+
+RTE_INIT(dmadev_init_telemetry)
+{
+	rte_telemetry_register_cmd("/dmadev/list", dmadev_handle_dev_list,
+			"Returns list of available dmadev devices by IDs. No parameters.");
+	rte_telemetry_register_cmd("/dmadev/info", dmadev_handle_dev_info,
+			"Returns information for a dmadev. Parameters: int dev_id");
+	rte_telemetry_register_cmd("/dmadev/stats", dmadev_handle_dev_stats,
+			"Returns the stats for a dmadev vchannel. Parameters: int dev_id, vchan_id (Optional if only one vchannel)");
+#ifndef RTE_EXEC_ENV_WINDOWS
+	rte_telemetry_register_cmd("/dmadev/dump", dmadev_handle_dev_dump,
+			"Returns dump information for a dmadev. Parameters: int dev_id");
+#endif
 }

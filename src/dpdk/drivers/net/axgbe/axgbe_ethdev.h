@@ -539,6 +539,13 @@ struct axgbe_port {
 	void *xprop_regs;	/* AXGBE property registers */
 	void *xi2c_regs;	/* AXGBE I2C CSRs */
 
+	/* Port property registers */
+	unsigned int pp0;
+	unsigned int pp1;
+	unsigned int pp2;
+	unsigned int pp3;
+	unsigned int pp4;
+
 	bool cdr_track_early;
 	/* XPCS indirect addressing lock */
 	unsigned int xpcs_window_def_reg;
@@ -582,6 +589,7 @@ struct axgbe_port {
 	unsigned int tx_pbl;
 	unsigned int tx_osp_mode;
 	unsigned int tx_max_fifo_size;
+	unsigned int multi_segs_tx;
 
 	/* Rx settings */
 	unsigned int rx_sf_mode;

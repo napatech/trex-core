@@ -5,6 +5,8 @@
 
 #include <rte_eventdev.h>
 
+#define CNXK_NIX_CQ_INL_CLAMP_MAX (64UL * 1024UL)
+
 static inline uint64_t
 nix_get_rx_offload_capa(struct cnxk_eth_dev *dev)
 {
@@ -40,13 +42,44 @@ nix_get_speed_capa(struct cnxk_eth_dev *dev)
 	return speed_capa;
 }
 
+static uint32_t
+nix_inl_cq_sz_clamp_up(struct roc_nix *nix, struct rte_mempool *mp,
+		       uint32_t nb_desc)
+{
+	struct roc_nix_rq *inl_rq;
+	uint64_t limit;
+
+	/* For CN10KB and above, LBP needs minimum CQ size */
+	if (!roc_errata_cpt_hang_on_x2p_bp())
+		return RTE_MAX(nb_desc, (uint32_t)4096);
+
+	/* CQ should be able to hold all buffers in first pass RQ's aura
+	 * this RQ's aura.
+	 */
+	inl_rq = roc_nix_inl_dev_rq(nix);
+	if (!inl_rq) {
+		/* This itself is going to be inline RQ's aura */
+		limit = roc_npa_aura_op_limit_get(mp->pool_id);
+	} else {
+		limit = roc_npa_aura_op_limit_get(inl_rq->aura_handle);
+		/* Also add this RQ's aura if it is different */
+		if (inl_rq->aura_handle != mp->pool_id)
+			limit += roc_npa_aura_op_limit_get(mp->pool_id);
+	}
+	nb_desc = PLT_MAX(limit + 1, nb_desc);
+	if (nb_desc > CNXK_NIX_CQ_INL_CLAMP_MAX) {
+		plt_warn("Could not setup CQ size to accommodate"
+			 " all buffers in related auras (%" PRIu64 ")",
+			 limit);
+		nb_desc = CNXK_NIX_CQ_INL_CLAMP_MAX;
+	}
+	return nb_desc;
+}
+
 int
 cnxk_nix_inb_mode_set(struct cnxk_eth_dev *dev, bool use_inl_dev)
 {
 	struct roc_nix *nix = &dev->nix;
-
-	if (dev->inb.inl_dev == use_inl_dev)
-		return 0;
 
 	plt_nix_dbg("Security sessions(%u) still active, inl=%u!!!",
 		    dev->inb.nb_sess, !!dev->inb.inl_dev);
@@ -68,6 +101,10 @@ nix_security_setup(struct cnxk_eth_dev *dev)
 	int i, rc = 0;
 
 	if (dev->rx_offloads & RTE_ETH_RX_OFFLOAD_SECURITY) {
+		/* Setup minimum SA table when inline device is used */
+		nix->ipsec_in_min_spi = dev->inb.no_inl_dev ? dev->inb.min_spi : 0;
+		nix->ipsec_in_max_spi = dev->inb.no_inl_dev ? dev->inb.max_spi : 1;
+
 		/* Setup Inline Inbound */
 		rc = roc_nix_inl_inb_init(nix);
 		if (rc) {
@@ -79,7 +116,7 @@ nix_security_setup(struct cnxk_eth_dev *dev)
 		/* By default pick using inline device for poll mode.
 		 * Will be overridden when event mode rq's are setup.
 		 */
-		cnxk_nix_inb_mode_set(dev, true);
+		cnxk_nix_inb_mode_set(dev, !dev->inb.no_inl_dev);
 
 		/* Allocate memory to be used as dptr for CPT ucode
 		 * WRITE_SA op.
@@ -155,9 +192,21 @@ nix_security_setup(struct cnxk_eth_dev *dev)
 		dev->outb.sa_base = roc_nix_inl_outb_sa_base_get(nix);
 		dev->outb.sa_bmap_mem = mem;
 		dev->outb.sa_bmap = bmap;
+
+		dev->outb.fc_sw_mem = plt_zmalloc(dev->outb.nb_crypto_qs *
+							  RTE_CACHE_LINE_SIZE,
+						  RTE_CACHE_LINE_SIZE);
+		if (!dev->outb.fc_sw_mem) {
+			plt_err("Outbound fc sw mem alloc failed");
+			goto sa_bmap_free;
+		}
+
+		dev->outb.cpt_eng_caps = roc_nix_inl_eng_caps_get(nix);
 	}
 	return 0;
 
+sa_bmap_free:
+	plt_free(dev->outb.sa_bmap_mem);
 sa_dptr_free:
 	if (dev->inb.sa_dptr)
 		plt_free(dev->inb.sa_dptr);
@@ -225,6 +274,8 @@ nix_security_release(struct cnxk_eth_dev *dev)
 			plt_err("Failed to cleanup nix inline inb, rc=%d", rc);
 		ret |= rc;
 
+		cnxk_nix_lookup_mem_metapool_clear(dev);
+
 		if (dev->inb.sa_dptr) {
 			plt_free(dev->inb.sa_dptr);
 			dev->inb.sa_dptr = NULL;
@@ -253,6 +304,9 @@ nix_security_release(struct cnxk_eth_dev *dev)
 			plt_free(dev->outb.sa_dptr);
 			dev->outb.sa_dptr = NULL;
 		}
+
+		plt_free(dev->outb.fc_sw_mem);
+		dev->outb.fc_sw_mem = NULL;
 	}
 
 	dev->inb.inl_dev = false;
@@ -310,6 +364,9 @@ nix_init_flow_ctrl_config(struct rte_eth_dev *eth_dev)
 	struct cnxk_fc_cfg *fc = &dev->fc_cfg;
 	int rc;
 
+	if (roc_nix_is_vf_or_sdp(&dev->nix) && !roc_nix_is_lbk(&dev->nix))
+		return 0;
+
 	/* To avoid Link credit deadlock on Ax, disable Tx FC if it's enabled */
 	if (roc_model_is_cn96_ax() &&
 	    dev->npc.switch_header_type != ROC_PRIV_FLAGS_HIGIG)
@@ -320,8 +377,9 @@ nix_init_flow_ctrl_config(struct rte_eth_dev *eth_dev)
 	if (rc)
 		return rc;
 
-	fc->mode = (fc_mode == ROC_NIX_FC_FULL) ? RTE_ETH_FC_FULL :
-						  RTE_ETH_FC_TX_PAUSE;
+	fc->mode = (fc_mode == ROC_NIX_FC_FULL) ? RTE_ETH_FC_FULL : RTE_ETH_FC_TX_PAUSE;
+	fc->rx_pause = (fc->mode == RTE_ETH_FC_FULL) || (fc->mode == RTE_ETH_FC_RX_PAUSE);
+	fc->tx_pause = (fc->mode == RTE_ETH_FC_FULL) || (fc->mode == RTE_ETH_FC_TX_PAUSE);
 	return rc;
 }
 
@@ -332,7 +390,11 @@ nix_update_flow_ctrl_config(struct rte_eth_dev *eth_dev)
 	struct cnxk_fc_cfg *fc = &dev->fc_cfg;
 	struct rte_eth_fc_conf fc_cfg = {0};
 
-	if (roc_nix_is_vf_or_sdp(&dev->nix) && !roc_nix_is_lbk(&dev->nix))
+	if (roc_nix_is_sdp(&dev->nix) || roc_nix_is_esw(&dev->nix))
+		return 0;
+
+	/* Don't do anything if PFC is enabled */
+	if (dev->pfc_cfg.rx_pause_en || dev->pfc_cfg.tx_pause_en)
 		return 0;
 
 	fc_cfg.mode = fc->mode;
@@ -400,7 +462,9 @@ cnxk_nix_tx_queue_setup(struct rte_eth_dev *eth_dev, uint16_t qid,
 {
 	struct cnxk_eth_dev *dev = cnxk_eth_pmd_priv(eth_dev);
 	const struct eth_dev_ops *dev_ops = eth_dev->dev_ops;
+	struct roc_nix *nix = &dev->nix;
 	struct cnxk_eth_txq_sp *txq_sp;
+	struct roc_nix_cq *cq;
 	struct roc_nix_sq *sq;
 	size_t txq_sz;
 	int rc;
@@ -423,6 +487,21 @@ cnxk_nix_tx_queue_setup(struct rte_eth_dev *eth_dev, uint16_t qid,
 	sq->qid = qid;
 	sq->nb_desc = nb_desc;
 	sq->max_sqe_sz = nix_sq_max_sqe_sz(dev);
+	if (sq->nb_desc >= CNXK_NIX_DEF_SQ_COUNT)
+		sq->fc_hyst_bits = 0x1;
+
+	if (nix->tx_compl_ena) {
+		sq->cqid = sq->qid + dev->nb_rxq;
+		sq->cq_ena = 1;
+		cq = &dev->cqs[sq->cqid];
+		cq->qid = sq->cqid;
+		cq->nb_desc = nb_desc;
+		rc = roc_nix_cq_init(&dev->nix, cq);
+		if (rc) {
+			plt_err("Failed to init cq=%d, rc=%d", cq->qid, rc);
+			return rc;
+		}
+	}
 
 	rc = roc_nix_sq_init(&dev->nix, sq);
 	if (rc) {
@@ -457,7 +536,7 @@ cnxk_nix_tx_queue_setup(struct rte_eth_dev *eth_dev, uint16_t qid,
 	return 0;
 }
 
-static void
+void
 cnxk_nix_tx_queue_release(struct rte_eth_dev *eth_dev, uint16_t qid)
 {
 	void *txq = eth_dev->data->tx_queues[qid];
@@ -485,9 +564,61 @@ cnxk_nix_tx_queue_release(struct rte_eth_dev *eth_dev, uint16_t qid)
 	plt_free(txq_sp);
 }
 
+static int
+cnxk_nix_process_rx_conf(const struct rte_eth_rxconf *rx_conf,
+			 struct rte_mempool **lpb_pool,
+			 struct rte_mempool **spb_pool)
+{
+	struct rte_mempool *pool0;
+	struct rte_mempool *pool1;
+	struct rte_mempool **mp = rx_conf->rx_mempools;
+	const char *platform_ops;
+	struct rte_mempool_ops *ops;
+
+	if (*lpb_pool ||
+	    rx_conf->rx_nmempool != CNXK_NIX_NUM_POOLS_MAX) {
+		plt_err("invalid arguments");
+		return -EINVAL;
+	}
+
+	if (mp == NULL || mp[0] == NULL || mp[1] == NULL) {
+		plt_err("invalid memory pools\n");
+		return -EINVAL;
+	}
+
+	pool0 = mp[0];
+	pool1 = mp[1];
+
+	if (pool0->elt_size > pool1->elt_size) {
+		*lpb_pool = pool0;
+		*spb_pool = pool1;
+
+	} else {
+		*lpb_pool = pool1;
+		*spb_pool = pool0;
+	}
+
+	if ((*spb_pool)->pool_id == 0) {
+		plt_err("Invalid pool_id");
+		return -EINVAL;
+	}
+
+	platform_ops = rte_mbuf_platform_mempool_ops();
+	ops = rte_mempool_get_ops((*spb_pool)->ops_index);
+	if (strncmp(ops->name, platform_ops, RTE_MEMPOOL_OPS_NAMESIZE)) {
+		plt_err("mempool ops should be of cnxk_npa type");
+		return -EINVAL;
+	}
+
+	plt_info("spb_pool:%s lpb_pool:%s lpb_len:%u spb_len:%u\n", (*spb_pool)->name,
+		 (*lpb_pool)->name, (*lpb_pool)->elt_size, (*spb_pool)->elt_size);
+
+	return 0;
+}
+
 int
 cnxk_nix_rx_queue_setup(struct rte_eth_dev *eth_dev, uint16_t qid,
-			uint16_t nb_desc, uint16_t fp_rx_q_sz,
+			uint32_t nb_desc, uint16_t fp_rx_q_sz,
 			const struct rte_eth_rxconf *rx_conf,
 			struct rte_mempool *mp)
 {
@@ -499,8 +630,11 @@ cnxk_nix_rx_queue_setup(struct rte_eth_dev *eth_dev, uint16_t qid,
 	struct roc_nix_rq *rq;
 	struct roc_nix_cq *cq;
 	uint16_t first_skip;
+	uint16_t wqe_skip;
 	int rc = -EINVAL;
 	size_t rxq_sz;
+	struct rte_mempool *lpb_pool = mp;
+	struct rte_mempool *spb_pool = NULL;
 
 	/* Sanity checks */
 	if (rx_conf->rx_deferred_start == 1) {
@@ -508,15 +642,21 @@ cnxk_nix_rx_queue_setup(struct rte_eth_dev *eth_dev, uint16_t qid,
 		goto fail;
 	}
 
+	if (rx_conf->rx_nmempool > 0) {
+		rc = cnxk_nix_process_rx_conf(rx_conf, &lpb_pool, &spb_pool);
+		if (rc)
+			goto fail;
+	}
+
 	platform_ops = rte_mbuf_platform_mempool_ops();
 	/* This driver needs cnxk_npa mempool ops to work */
-	ops = rte_mempool_get_ops(mp->ops_index);
+	ops = rte_mempool_get_ops(lpb_pool->ops_index);
 	if (strncmp(ops->name, platform_ops, RTE_MEMPOOL_OPS_NAMESIZE)) {
 		plt_err("mempool ops should be of cnxk_npa type");
 		goto fail;
 	}
 
-	if (mp->pool_id == 0) {
+	if (lpb_pool->pool_id == 0) {
 		plt_err("Invalid pool_id");
 		goto fail;
 	}
@@ -530,23 +670,16 @@ cnxk_nix_rx_queue_setup(struct rte_eth_dev *eth_dev, uint16_t qid,
 		eth_dev->data->rx_queues[qid] = NULL;
 	}
 
-	/* Clam up cq limit to size of packet pool aura for LBK
-	 * to avoid meta packet drop as LBK does not currently support
-	 * backpressure.
-	 */
-	if (dev->rx_offloads & RTE_ETH_RX_OFFLOAD_SECURITY && roc_nix_is_lbk(nix)) {
-		uint64_t pkt_pool_limit = roc_nix_inl_dev_rq_limit_get();
-
-		/* Use current RQ's aura limit if inl rq is not available */
-		if (!pkt_pool_limit)
-			pkt_pool_limit = roc_npa_aura_op_limit_get(mp->pool_id);
-		nb_desc = RTE_MAX(nb_desc, pkt_pool_limit);
-	}
-
 	/* Its a no-op when inline device is not used */
 	if (dev->rx_offloads & RTE_ETH_RX_OFFLOAD_SECURITY ||
 	    dev->tx_offloads & RTE_ETH_TX_OFFLOAD_SECURITY)
-		roc_nix_inl_dev_xaq_realloc(mp->pool_id);
+		roc_nix_inl_dev_xaq_realloc(lpb_pool->pool_id);
+
+	/* Increase CQ size to Aura size to avoid CQ overflow and
+	 * then CPT buffer leak.
+	 */
+	if (dev->rx_offloads & RTE_ETH_RX_OFFLOAD_SECURITY)
+		nb_desc = nix_inl_cq_sz_clamp_up(nix, lpb_pool, nb_desc);
 
 	/* Setup ROC CQ */
 	cq = &dev->cqs[qid];
@@ -561,22 +694,37 @@ cnxk_nix_rx_queue_setup(struct rte_eth_dev *eth_dev, uint16_t qid,
 	/* Setup ROC RQ */
 	rq = &dev->rqs[qid];
 	rq->qid = qid;
-	rq->aura_handle = mp->pool_id;
+	rq->cqid = cq->qid;
+	rq->aura_handle = lpb_pool->pool_id;
 	rq->flow_tag_width = 32;
 	rq->sso_ena = false;
 
 	/* Calculate first mbuf skip */
 	first_skip = (sizeof(struct rte_mbuf));
 	first_skip += RTE_PKTMBUF_HEADROOM;
-	first_skip += rte_pktmbuf_priv_size(mp);
+	first_skip += rte_pktmbuf_priv_size(lpb_pool);
 	rq->first_skip = first_skip;
-	rq->later_skip = sizeof(struct rte_mbuf);
-	rq->lpb_size = mp->elt_size;
-	rq->lpb_drop_ena = !(dev->rx_offloads & RTE_ETH_RX_OFFLOAD_SECURITY);
+	rq->later_skip = sizeof(struct rte_mbuf) + rte_pktmbuf_priv_size(lpb_pool);
+	rq->lpb_size = lpb_pool->elt_size;
+	if (roc_errata_nix_no_meta_aura())
+		rq->lpb_drop_ena = !(dev->rx_offloads & RTE_ETH_RX_OFFLOAD_SECURITY);
 
 	/* Enable Inline IPSec on RQ, will not be used for Poll mode */
-	if (roc_nix_inl_inb_is_enabled(nix))
+	if (roc_nix_inl_inb_is_enabled(nix) && !dev->inb.inl_dev) {
 		rq->ipsech_ena = true;
+		/* WQE skip is needed when poll mode is enabled in CN10KA_B0 and above
+		 * for Inline IPsec traffic to CQ without inline device.
+		 */
+		wqe_skip = RTE_ALIGN_CEIL(sizeof(struct rte_mbuf), ROC_CACHE_LINE_SZ);
+		wqe_skip = wqe_skip / ROC_CACHE_LINE_SZ;
+		rq->wqe_skip = wqe_skip;
+	}
+
+	if (spb_pool) {
+		rq->spb_ena = 1;
+		rq->spb_aura_handle = spb_pool->pool_id;
+		rq->spb_size = spb_pool->elt_size;
+	}
 
 	rc = roc_nix_rq_init(&dev->nix, rq, !!eth_dev->data->dev_started);
 	if (rc) {
@@ -600,7 +748,10 @@ cnxk_nix_rx_queue_setup(struct rte_eth_dev *eth_dev, uint16_t qid,
 	/* Queue config should reflect global offloads */
 	rxq_sp->qconf.conf.rx.offloads = dev->rx_offloads;
 	rxq_sp->qconf.nb_desc = nb_desc;
-	rxq_sp->qconf.mp = mp;
+	rxq_sp->qconf.mp = lpb_pool;
+	rxq_sp->tc = 0;
+	rxq_sp->tx_pause = (dev->fc_cfg.mode == RTE_ETH_FC_FULL ||
+			    dev->fc_cfg.mode == RTE_ETH_FC_TX_PAUSE);
 
 	if (dev->rx_offloads & RTE_ETH_RX_OFFLOAD_SECURITY) {
 		/* Pass a tagmask used to handle error packets in inline device.
@@ -611,12 +762,12 @@ cnxk_nix_rx_queue_setup(struct rte_eth_dev *eth_dev, uint16_t qid,
 			0x0FF00000 | ((uint32_t)RTE_EVENT_TYPE_ETHDEV << 28);
 
 		/* Setup rq reference for inline dev if present */
-		rc = roc_nix_inl_dev_rq_get(rq);
+		rc = roc_nix_inl_dev_rq_get(rq, !!eth_dev->data->dev_started);
 		if (rc)
 			goto free_mem;
 	}
 
-	plt_nix_dbg("rq=%d pool=%s nb_desc=%d->%d", qid, mp->name, nb_desc,
+	plt_nix_dbg("rq=%d pool=%s nb_desc=%d->%d", qid, lpb_pool->name, nb_desc,
 		    cq->nb_desc);
 
 	/* Store start of fast path area */
@@ -762,6 +913,27 @@ cnxk_rss_ethdev_to_nix(struct cnxk_eth_dev *dev, uint64_t ethdev_rss,
 		flowkey_cfg |= FLOW_KEY_TYPE_GTPU;
 
 	return flowkey_cfg;
+}
+
+static int
+nix_rxchan_cfg_disable(struct cnxk_eth_dev *dev)
+{
+	struct roc_nix *nix = &dev->nix;
+	struct roc_nix_fc_cfg fc_cfg;
+	int rc;
+
+	if (!roc_nix_is_lbk(nix))
+		return 0;
+
+	memset(&fc_cfg, 0, sizeof(struct roc_nix_fc_cfg));
+	fc_cfg.type = ROC_NIX_FC_RXCHAN_CFG;
+	fc_cfg.rxchan_cfg.enable = false;
+	rc = roc_nix_fc_config_set(nix, &fc_cfg);
+	if (rc) {
+		plt_err("Failed to setup flow control, rc=%d(%s)", rc, roc_error_msg_get(rc));
+		return rc;
+	}
+	return 0;
 }
 
 static void
@@ -958,7 +1130,7 @@ nix_set_nop_rxtx_function(struct rte_eth_dev *eth_dev)
 {
 	/* These dummy functions are required for supporting
 	 * some applications which reconfigure queues without
-	 * stopping tx burst and rx burst threads(eg kni app)
+	 * stopping tx burst and rx burst threads.
 	 * When the queues context is saved, txq/rxqs are released
 	 * which caused app crash since rx/tx burst is still
 	 * on different lcores
@@ -1025,8 +1197,8 @@ cnxk_nix_configure(struct rte_eth_dev *eth_dev)
 	char ea_fmt[RTE_ETHER_ADDR_FMT_SIZE];
 	struct roc_nix_fc_cfg fc_cfg = {0};
 	struct roc_nix *nix = &dev->nix;
+	uint16_t nb_rxq, nb_txq, nb_cq;
 	struct rte_ether_addr *ea;
-	uint8_t nb_rxq, nb_txq;
 	uint64_t rx_cfg;
 	void *qs;
 	int rc;
@@ -1041,11 +1213,6 @@ cnxk_nix_configure(struct rte_eth_dev *eth_dev)
 
 	if (conf->dcb_capability_en == 1) {
 		plt_err("dcb enable is not supported");
-		goto fail_configure;
-	}
-
-	if (conf->fdir_conf.mode != RTE_FDIR_MODE_NONE) {
-		plt_err("Flow director is not supported");
 		goto fail_configure;
 	}
 
@@ -1087,6 +1254,7 @@ cnxk_nix_configure(struct rte_eth_dev *eth_dev)
 			goto fail_configure;
 
 		roc_nix_tm_fini(nix);
+		nix_rxchan_cfg_disable(dev);
 		roc_nix_lf_free(nix);
 	}
 
@@ -1104,6 +1272,11 @@ cnxk_nix_configure(struct rte_eth_dev *eth_dev)
 		   ROC_NIX_LF_RX_CFG_LEN_IL4 | ROC_NIX_LF_RX_CFG_LEN_IL3 |
 		   ROC_NIX_LF_RX_CFG_LEN_OL4 | ROC_NIX_LF_RX_CFG_LEN_OL3);
 
+	rx_cfg &= (ROC_NIX_LF_RX_CFG_RX_ERROR_MASK);
+
+	if (roc_feature_nix_has_drop_re_mask())
+		rx_cfg |= (ROC_NIX_RE_CRC8_PCH | ROC_NIX_RE_MACSEC);
+
 	if (dev->rx_offloads & RTE_ETH_RX_OFFLOAD_SECURITY) {
 		rx_cfg |= ROC_NIX_LF_RX_CFG_IP6_UDP_OPT;
 		/* Disable drop re if rx offload security is enabled and
@@ -1116,11 +1289,25 @@ cnxk_nix_configure(struct rte_eth_dev *eth_dev)
 	nb_rxq = RTE_MAX(data->nb_rx_queues, 1);
 	nb_txq = RTE_MAX(data->nb_tx_queues, 1);
 
+	if (roc_nix_is_lbk(nix))
+		nix->enable_loop = eth_dev->data->dev_conf.lpbk_mode;
+
+	nix->tx_compl_ena = dev->tx_compl_ena;
+
 	/* Alloc a nix lf */
 	rc = roc_nix_lf_alloc(nix, nb_rxq, nb_txq, rx_cfg);
 	if (rc) {
 		plt_err("Failed to init nix_lf rc=%d", rc);
 		goto fail_configure;
+	}
+
+	if (!roc_nix_is_vf_or_sdp(nix)) {
+		/* Sync same MAC address to CGX/RPM table */
+		rc = roc_nix_mac_addr_set(nix, dev->mac_addr);
+		if (rc) {
+			plt_err("Failed to set mac addr, rc=%d", rc);
+			goto fail_configure;
+		}
 	}
 
 	/* Check if ptp is enable in PF owning this VF*/
@@ -1131,6 +1318,9 @@ cnxk_nix_configure(struct rte_eth_dev *eth_dev)
 
 	nb_rxq = data->nb_rx_queues;
 	nb_txq = data->nb_tx_queues;
+	nb_cq = nb_rxq;
+	if (nix->tx_compl_ena)
+		nb_cq += nb_txq;
 	rc = -ENOMEM;
 	if (nb_rxq) {
 		/* Allocate memory for roc rq's and cq's */
@@ -1140,13 +1330,6 @@ cnxk_nix_configure(struct rte_eth_dev *eth_dev)
 			goto free_nix_lf;
 		}
 		dev->rqs = qs;
-
-		qs = plt_zmalloc(sizeof(struct roc_nix_cq) * nb_rxq, 0);
-		if (!qs) {
-			plt_err("Failed to alloc cqs");
-			goto free_nix_lf;
-		}
-		dev->cqs = qs;
 	}
 
 	if (nb_txq) {
@@ -1157,6 +1340,15 @@ cnxk_nix_configure(struct rte_eth_dev *eth_dev)
 			goto free_nix_lf;
 		}
 		dev->sqs = qs;
+	}
+
+	if (nb_cq) {
+		qs = plt_zmalloc(sizeof(struct roc_nix_cq) * nb_cq, 0);
+		if (!qs) {
+			plt_err("Failed to alloc cqs");
+			goto free_nix_lf;
+		}
+		dev->cqs = qs;
 	}
 
 	/* Re-enable NIX LF error interrupts */
@@ -1239,6 +1431,9 @@ cnxk_nix_configure(struct rte_eth_dev *eth_dev)
 		}
 	}
 
+	if (roc_nix_is_lbk(nix))
+		goto skip_lbk_setup;
+
 	/* Configure loop back mode */
 	rc = roc_nix_mac_loopback_enable(nix,
 					 eth_dev->data->dev_conf.lpbk_mode);
@@ -1247,18 +1442,21 @@ cnxk_nix_configure(struct rte_eth_dev *eth_dev)
 		goto cq_fini;
 	}
 
+skip_lbk_setup:
 	/* Setup Inline security support */
 	rc = nix_security_setup(dev);
 	if (rc)
 		goto cq_fini;
 
 	/* Init flow control configuration */
-	fc_cfg.type = ROC_NIX_FC_RXCHAN_CFG;
-	fc_cfg.rxchan_cfg.enable = true;
-	rc = roc_nix_fc_config_set(nix, &fc_cfg);
-	if (rc) {
-		plt_err("Failed to initialize flow control rc=%d", rc);
-		goto cq_fini;
+	if (!roc_nix_is_esw(nix)) {
+		fc_cfg.type = ROC_NIX_FC_RXCHAN_CFG;
+		fc_cfg.rxchan_cfg.enable = true;
+		rc = roc_nix_fc_config_set(nix, &fc_cfg);
+		if (rc) {
+			plt_err("Failed to initialize flow control rc=%d", rc);
+			goto cq_fini;
+		}
 	}
 
 	/* Update flow control configuration to PMD */
@@ -1268,8 +1466,6 @@ cnxk_nix_configure(struct rte_eth_dev *eth_dev)
 		goto cq_fini;
 	}
 
-	/* Initialize TC to SQ mapping as invalid */
-	memset(dev->pfc_tc_sq_map, 0xFF, sizeof(dev->pfc_tc_sq_map));
 	/*
 	 * Restore queue config when reconfigure followed by
 	 * reconfigure and no queue configure invoked from application case.
@@ -1309,6 +1505,7 @@ tm_fini:
 	roc_nix_tm_fini(nix);
 free_nix_lf:
 	nix_free_queue_mem(dev);
+	rc |= nix_rxchan_cfg_disable(dev);
 	rc |= roc_nix_lf_free(nix);
 fail_configure:
 	dev->configured = 0;
@@ -1326,7 +1523,7 @@ cnxk_nix_tx_queue_start(struct rte_eth_dev *eth_dev, uint16_t qid)
 	if (data->tx_queue_state[qid] == RTE_ETH_QUEUE_STATE_STARTED)
 		return 0;
 
-	rc = roc_nix_tm_sq_aura_fc(sq, true);
+	rc = roc_nix_sq_ena_dis(sq, true);
 	if (rc) {
 		plt_err("Failed to enable sq aura fc, txq=%u, rc=%d", qid, rc);
 		goto done;
@@ -1348,7 +1545,7 @@ cnxk_nix_tx_queue_stop(struct rte_eth_dev *eth_dev, uint16_t qid)
 	if (data->tx_queue_state[qid] == RTE_ETH_QUEUE_STATE_STOPPED)
 		return 0;
 
-	rc = roc_nix_tm_sq_aura_fc(sq, false);
+	rc = roc_nix_sq_ena_dis(sq, false);
 	if (rc) {
 		plt_err("Failed to disable sqb aura fc, txq=%u, rc=%d", qid,
 			rc);
@@ -1428,6 +1625,10 @@ cnxk_nix_dev_stop(struct rte_eth_dev *eth_dev)
 
 	roc_nix_inl_outb_soft_exp_poll_switch(&dev->nix, false);
 
+	/* Stop inline device RQ first */
+	if (dev->rx_offloads & RTE_ETH_RX_OFFLOAD_SECURITY)
+		roc_nix_inl_rq_ena_dis(&dev->nix, false);
+
 	/* Stop rx queues and free up pkts pending */
 	for (i = 0; i < eth_dev->data->nb_rx_queues; i++) {
 		rc = dev_ops->rx_queue_stop(eth_dev, i);
@@ -1471,6 +1672,14 @@ cnxk_nix_dev_start(struct rte_eth_dev *eth_dev)
 		rc = cnxk_nix_rx_queue_start(eth_dev, i);
 		if (rc)
 			return rc;
+	}
+
+	if (dev->rx_offloads & RTE_ETH_RX_OFFLOAD_SECURITY) {
+		rc = roc_nix_inl_rq_ena_dis(&dev->nix, true);
+		if (rc) {
+			plt_err("Failed to enable Inline device RQ, rc=%d", rc);
+			return rc;
+		}
 	}
 
 	/* Start tx queues  */
@@ -1609,7 +1818,23 @@ struct eth_dev_ops cnxk_eth_dev_ops = {
 	.set_queue_rate_limit = cnxk_nix_tm_set_queue_rate_limit,
 	.tm_ops_get = cnxk_nix_tm_ops_get,
 	.mtr_ops_get = cnxk_nix_mtr_ops_get,
+	.eth_dev_priv_dump  = cnxk_nix_eth_dev_priv_dump,
+	.cman_info_get = cnxk_nix_cman_info_get,
+	.cman_config_init = cnxk_nix_cman_config_init,
+	.cman_config_set = cnxk_nix_cman_config_set,
+	.cman_config_get = cnxk_nix_cman_config_get,
+	.eth_tx_descriptor_dump = cnxk_nix_tx_descriptor_dump,
 };
+
+void
+cnxk_eth_dev_q_err_cb(struct roc_nix *nix, void *data)
+{
+	struct cnxk_eth_dev *dev = (struct cnxk_eth_dev *)nix;
+	struct rte_eth_dev *eth_dev = dev->eth_dev;
+
+	/* Set the flag and execute application callbacks */
+	rte_eth_dev_callback_process(eth_dev, RTE_ETH_EVENT_INTR_RESET, data);
+}
 
 static int
 cnxk_eth_dev_init(struct rte_eth_dev *eth_dev)
@@ -1631,8 +1856,7 @@ cnxk_eth_dev_init(struct rte_eth_dev *eth_dev)
 		return -ENOMEM;
 	sec_ctx->device = eth_dev;
 	sec_ctx->ops = &cnxk_eth_sec_ops;
-	sec_ctx->flags =
-		(RTE_SEC_CTX_F_FAST_SET_MDATA | RTE_SEC_CTX_F_FAST_GET_UDATA);
+	sec_ctx->flags = RTE_SEC_CTX_F_FAST_SET_MDATA;
 	eth_dev->security_ctx = sec_ctx;
 
 	/* For secondary processes, the primary has done all the work */
@@ -1652,6 +1876,9 @@ cnxk_eth_dev_init(struct rte_eth_dev *eth_dev)
 	/* Initialize base roc nix */
 	nix->pci_dev = pci_dev;
 	nix->hw_vlan_ins = true;
+	nix->port_id = eth_dev->data->port_id;
+	if (roc_feature_nix_has_own_meta_aura())
+		nix->local_meta_aura_ena = true;
 	rc = roc_nix_dev_init(nix);
 	if (rc) {
 		plt_err("Failed to initialize roc nix rc=%d", rc);
@@ -1665,9 +1892,19 @@ cnxk_eth_dev_init(struct rte_eth_dev *eth_dev)
 	roc_nix_mac_link_info_get_cb_register(nix,
 					      cnxk_eth_dev_link_status_get_cb);
 
+	/* Register up msg callbacks */
+	roc_nix_q_err_cb_register(nix, cnxk_eth_dev_q_err_cb);
+
+	/* Register callback for inline meta pool create */
+	roc_nix_inl_meta_pool_cb_register(cnxk_nix_inl_meta_pool_cb);
+
+	/* Register callback for inline meta pool create 1:N pool:aura */
+	roc_nix_inl_custom_meta_pool_cb_register(cnxk_nix_inl_custom_meta_pool_cb);
+
 	dev->eth_dev = eth_dev;
 	dev->configured = 0;
 	dev->ptype_disable = 0;
+	dev->proto = RTE_MTR_COLOR_IN_PROTO_OUTER_VLAN;
 
 	TAILQ_INIT(&dev->inb.list);
 	TAILQ_INIT(&dev->outb.list);
@@ -1696,6 +1933,13 @@ cnxk_eth_dev_init(struct rte_eth_dev *eth_dev)
 		goto dev_fini;
 	}
 
+	dev->dmac_idx_map = rte_zmalloc("dmac_idx_map", max_entries * sizeof(int), 0);
+	if (dev->dmac_idx_map == NULL) {
+		plt_err("Failed to allocate memory for dmac idx map");
+		rc = -ENOMEM;
+		goto free_mac_addrs;
+	}
+
 	dev->max_mac_entries = max_entries;
 	dev->dmac_filter_count = 1;
 
@@ -1708,15 +1952,6 @@ cnxk_eth_dev_init(struct rte_eth_dev *eth_dev)
 
 	/* Update the mac address */
 	memcpy(eth_dev->data->mac_addrs, dev->mac_addr, RTE_ETHER_ADDR_LEN);
-
-	if (!roc_nix_is_vf_or_sdp(nix)) {
-		/* Sync same MAC address to CGX/RPM table */
-		rc = roc_nix_mac_addr_set(nix, dev->mac_addr);
-		if (rc) {
-			plt_err("Failed to set mac addr, rc=%d", rc);
-			goto free_mac_addrs;
-		}
-	}
 
 	/* Union of all capabilities supported by CNXK.
 	 * Platform specific capabilities will be
@@ -1732,15 +1967,38 @@ cnxk_eth_dev_init(struct rte_eth_dev *eth_dev)
 	if (rc)
 		goto free_mac_addrs;
 
-	plt_nix_dbg("Port=%d pf=%d vf=%d ver=%s hwcap=0x%" PRIx64
-		    " rxoffload_capa=0x%" PRIx64 " txoffload_capa=0x%" PRIx64,
-		    eth_dev->data->port_id, roc_nix_get_pf(nix),
-		    roc_nix_get_vf(nix), CNXK_ETH_DEV_PMD_VERSION, dev->hwcap,
-		    dev->rx_offload_capa, dev->tx_offload_capa);
+	if (roc_feature_nix_has_macsec()) {
+		rc = cnxk_mcs_dev_init(dev, 0);
+		if (rc) {
+			plt_err("Failed to init MCS");
+			goto free_mac_addrs;
+		}
+		dev->rx_offload_capa |= RTE_ETH_RX_OFFLOAD_MACSEC_STRIP;
+		dev->tx_offload_capa |= RTE_ETH_TX_OFFLOAD_MACSEC_INSERT;
+
+		TAILQ_INIT(&dev->mcs_list);
+	}
+
+	/* Reserve a switch domain for eswitch device */
+	if (pci_dev->id.device_id == PCI_DEVID_CNXK_RVU_ESWITCH_VF) {
+		eth_dev->data->dev_flags |= RTE_ETH_DEV_REPRESENTOR;
+		rc = rte_eth_switch_domain_alloc(&dev->switch_domain_id);
+		if (rc) {
+			plt_err("Failed to alloc switch domain: %d", rc);
+			goto free_mac_addrs;
+		}
+	}
+
+	plt_nix_dbg("Port=%d pf=%d vf=%d ver=%s hwcap=0x%" PRIx64 " rxoffload_capa=0x%" PRIx64
+		    " txoffload_capa=0x%" PRIx64,
+		    eth_dev->data->port_id, roc_nix_get_pf(nix), roc_nix_get_vf(nix),
+		    CNXK_ETH_DEV_PMD_VERSION, dev->hwcap, dev->rx_offload_capa,
+		    dev->tx_offload_capa);
 	return 0;
 
 free_mac_addrs:
 	rte_free(eth_dev->data->mac_addrs);
+	rte_free(dev->dmac_idx_map);
 dev_fini:
 	roc_nix_dev_fini(nix);
 error:
@@ -1753,13 +2011,12 @@ cnxk_eth_dev_uninit(struct rte_eth_dev *eth_dev, bool reset)
 {
 	struct cnxk_eth_dev *dev = cnxk_eth_pmd_priv(eth_dev);
 	const struct eth_dev_ops *dev_ops = eth_dev->dev_ops;
+	struct cnxk_pfc_cfg *pfc_cfg = &dev->pfc_cfg;
+	struct cnxk_fc_cfg *fc_cfg = &dev->fc_cfg;
 	struct rte_eth_pfc_queue_conf pfc_conf;
 	struct roc_nix *nix = &dev->nix;
 	struct rte_eth_fc_conf fc_conf;
 	int rc, i;
-
-	/* Disable switch hdr pkind */
-	roc_nix_switch_hdr_set(&dev->nix, 0, 0, 0, 0);
 
 	plt_free(eth_dev->security_ctx);
 	eth_dev->security_ctx = NULL;
@@ -1767,6 +2024,9 @@ cnxk_eth_dev_uninit(struct rte_eth_dev *eth_dev, bool reset)
 	/* Nothing to be done for secondary processes */
 	if (rte_eal_process_type() != RTE_PROC_PRIMARY)
 		return 0;
+
+	/* Disable switch hdr pkind */
+	roc_nix_switch_hdr_set(&dev->nix, 0, 0, 0, 0);
 
 	/* Clear the flag since we are closing down */
 	dev->configured = 0;
@@ -1776,26 +2036,33 @@ cnxk_eth_dev_uninit(struct rte_eth_dev *eth_dev, bool reset)
 	/* Restore 802.3 Flow control configuration */
 	memset(&pfc_conf, 0, sizeof(struct rte_eth_pfc_queue_conf));
 	memset(&fc_conf, 0, sizeof(struct rte_eth_fc_conf));
-	fc_conf.mode = RTE_ETH_FC_NONE;
-	rc = cnxk_nix_flow_ctrl_set(eth_dev, &fc_conf);
-
-	pfc_conf.mode = RTE_ETH_FC_NONE;
-	for (i = 0; i < CNXK_NIX_PFC_CHAN_COUNT; i++) {
-		if (dev->pfc_tc_sq_map[i] != 0xFFFF) {
-			pfc_conf.rx_pause.tx_qid = dev->pfc_tc_sq_map[i];
-			pfc_conf.rx_pause.tc = i;
-			pfc_conf.tx_pause.rx_qid = i;
-			pfc_conf.tx_pause.tc = i;
-			rc = cnxk_nix_priority_flow_ctrl_queue_config(eth_dev,
-				&pfc_conf);
-			if (rc)
-				plt_err("Failed to reset PFC. error code(%d)",
+	if (fc_cfg->rx_pause || fc_cfg->tx_pause) {
+		fc_conf.mode = RTE_ETH_FC_NONE;
+		rc = cnxk_nix_flow_ctrl_set(eth_dev, &fc_conf);
+		if (rc < 0)
+			plt_err("Failed to reset control flow. error code(%d)",
 					rc);
+	}
+	if (pfc_cfg->rx_pause_en || pfc_cfg->tx_pause_en) {
+		for (i = 0; i < RTE_MAX(eth_dev->data->nb_rx_queues,
+					eth_dev->data->nb_tx_queues);
+		     i++) {
+			pfc_conf.mode = RTE_ETH_FC_NONE;
+			pfc_conf.rx_pause.tc = ROC_NIX_PFC_CLASS_INVALID;
+			pfc_conf.rx_pause.tx_qid = i;
+			pfc_conf.tx_pause.tc = ROC_NIX_PFC_CLASS_INVALID;
+			pfc_conf.tx_pause.rx_qid = i;
+			rc = cnxk_nix_priority_flow_ctrl_queue_config(eth_dev,
+					&pfc_conf);
+			if (rc && rc != -ENOTSUP)
+				plt_err("Failed to reset PFC. error code(%d)", rc);
 		}
 	}
 
-	fc_conf.mode = RTE_ETH_FC_FULL;
-	rc = cnxk_nix_flow_ctrl_set(eth_dev, &fc_conf);
+	/* Free switch domain ID reserved for eswitch device */
+	if ((eth_dev->data->dev_flags & RTE_ETH_DEV_REPRESENTOR) &&
+	    rte_eth_switch_domain_free(dev->switch_domain_id))
+		plt_err("Failed to free switch domain");
 
 	/* Disable and free rte_meter entries */
 	nix_meter_fini(dev);
@@ -1825,6 +2092,9 @@ cnxk_eth_dev_uninit(struct rte_eth_dev *eth_dev, bool reset)
 	}
 	eth_dev->data->nb_rx_queues = 0;
 
+	if (roc_feature_nix_has_macsec())
+		cnxk_mcs_dev_fini(dev);
+
 	/* Free security resources */
 	nix_security_release(dev);
 
@@ -1841,10 +2111,18 @@ cnxk_eth_dev_uninit(struct rte_eth_dev *eth_dev, bool reset)
 	/* Free ROC RQ's, SQ's and CQ's memory */
 	nix_free_queue_mem(dev);
 
+	/* free nix bpid */
+	rc = nix_rxchan_cfg_disable(dev);
+	if (rc)
+		plt_err("Failed to free nix bpid, rc=%d", rc);
+
 	/* Free nix lf resources */
 	rc = roc_nix_lf_free(nix);
 	if (rc)
 		plt_err("Failed to free nix lf, rc=%d", rc);
+
+	rte_free(dev->dmac_idx_map);
+	dev->dmac_idx_map = NULL;
 
 	rte_free(eth_dev->data->mac_addrs);
 	eth_dev->data->mac_addrs = NULL;
@@ -1904,7 +2182,7 @@ cnxk_nix_remove(struct rte_pci_device *pci_dev)
 
 	/* Check if this device is hosting common resource */
 	nix = roc_idev_npa_nix_get();
-	if (nix->pci_dev != pci_dev)
+	if (!nix || nix->pci_dev != pci_dev)
 		return 0;
 
 	/* Try nix fini now */

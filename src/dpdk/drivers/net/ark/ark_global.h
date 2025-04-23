@@ -15,7 +15,7 @@
 #include <rte_string_fns.h>
 #include <rte_cycles.h>
 #include <rte_kvargs.h>
-#include <rte_dev.h>
+#include <dev_driver.h>
 #include <rte_version.h>
 
 #include "ark_pktdir.h"
@@ -32,7 +32,6 @@
 #define ARK_CMAC_BASE     0x80000
 #define ARK_PKTDIR_BASE   0xa0000
 #define ARK_PKTCHKR_BASE  0x90000
-#define ARK_RCPACING_BASE 0xb0000
 #define ARK_EXTERNAL_BASE 0x100000
 #define ARK_MPU_QOFFSET   0x00100
 #define ARK_MAX_PORTS     RTE_MAX_ETHPORTS
@@ -112,7 +111,11 @@ struct ark_adapter {
 	ark_pkt_chkr_t pc;
 	ark_pkt_dir_t pd;
 
+	/* For single function, multiple ports */
 	int num_ports;
+	uint16_t qbase;
+
+	bool isvf;
 
 	/* Packet generator/checker args */
 	char pkt_gen_args[ARK_MAX_ARG_LEN];
@@ -146,8 +149,6 @@ struct ark_adapter {
 	int started;
 	uint16_t rx_queues;
 	uint16_t tx_queues;
-
-	struct ark_rqpace_t *rqpacing;
 };
 
 typedef uint32_t *ark_t;

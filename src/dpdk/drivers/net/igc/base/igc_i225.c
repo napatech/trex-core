@@ -122,6 +122,9 @@ static s32 igc_init_mac_params_i225(struct igc_hw *hw)
 
 	mac->ops.write_vfta = igc_write_vfta_generic;
 
+	/* Disable EEE by default */
+	dev_spec->eee_disable = true;
+
 	return IGC_SUCCESS;
 }
 
@@ -173,18 +176,8 @@ static s32 igc_init_phy_params_i225(struct igc_hw *hw)
 	phy->ops.write_reg = igc_write_phy_reg_gpy;
 
 	ret_val = igc_get_phy_id(hw);
-	/* Verify phy id and set remaining function pointers */
-	switch (phy->id) {
-	case I225_I_PHY_ID:
-		phy->type		= igc_phy_i225;
-		phy->ops.set_d0_lplu_state = igc_set_d0_lplu_state_i225;
-		phy->ops.set_d3_lplu_state = igc_set_d3_lplu_state_i225;
-		/* TODO - complete with GPY PHY information */
-		break;
-	default:
-		ret_val = -IGC_ERR_PHY;
-		goto out;
-	}
+	phy->type = igc_phy_i225;
+
 
 out:
 	return ret_val;
@@ -1253,6 +1246,7 @@ s32 igc_init_hw_i225(struct igc_hw *hw)
 
 	hw->phy.ops.get_cfg_done = igc_get_cfg_done_i225;
 	ret_val = igc_init_hw_base(hw);
+	igc_set_eee_i225(hw, false, false, false);
 	return ret_val;
 }
 

@@ -10,7 +10,7 @@
 #include <fcntl.h>
 
 #include <rte_pci.h>
-#include <rte_bus_pci.h>
+#include <bus_pci_driver.h>
 #include <rte_memzone.h>
 #include <rte_malloc.h>
 #include <rte_mbuf.h>
@@ -161,7 +161,6 @@ int enic_dev_stats_get(struct enic *enic, struct rte_eth_stats *r_stats)
 #ifdef TREX_PATCH
     r_stats->ibytes = stats->rx.rx_unicast_bytes_ok + stats->rx.rx_multicast_bytes_ok + stats->rx.rx_broadcast_bytes_ok;
 #else
-
 	r_stats->ibytes = stats->rx.rx_bytes_ok;
 #endif
 	r_stats->obytes = stats->tx.tx_bytes_ok;
@@ -831,7 +830,7 @@ int enic_alloc_rq(struct enic *enic, uint16_t queue_idx,
 	 * Representor uses a reserved PF queue. Translate representor
 	 * queue number to PF queue number.
 	 */
-	if (enic_is_vf_rep(enic)) {
+	if (rte_eth_dev_is_repr(enic->rte_dev)) {
 		RTE_ASSERT(queue_idx == 0);
 		vf = VF_ENIC_TO_VF_REP(enic);
 		sop_queue_idx = vf->pf_rq_sop_idx;
@@ -1060,7 +1059,7 @@ int enic_alloc_wq(struct enic *enic, uint16_t queue_idx,
 	 * Representor uses a reserved PF queue. Translate representor
 	 * queue number to PF queue number.
 	 */
-	if (enic_is_vf_rep(enic)) {
+	if (rte_eth_dev_is_repr(enic->rte_dev)) {
 		RTE_ASSERT(queue_idx == 0);
 		vf = VF_ENIC_TO_VF_REP(enic);
 		queue_idx = vf->pf_wq_idx;
@@ -1646,7 +1645,7 @@ int enic_set_mtu(struct enic *enic, uint16_t new_mtu)
 	 * packet length.
 	 */
 	if (!eth_dev->data->dev_started)
-		goto set_mtu_done;
+		return rc;
 
 	/*
 	 * The device has started, re-do RQs on the fly. In the process, we

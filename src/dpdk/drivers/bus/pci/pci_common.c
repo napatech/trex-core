@@ -13,7 +13,7 @@
 #include <rte_errno.h>
 #include <rte_interrupts.h>
 #include <rte_log.h>
-#include <rte_bus.h>
+#include <bus_driver.h>
 #include <rte_pci.h>
 #include <rte_bus_pci.h>
 #include <rte_lcore.h>
@@ -25,6 +25,7 @@
 #include <rte_common.h>
 #include <rte_devargs.h>
 #include <rte_vfio.h>
+#include <rte_tailq.h>
 
 #include "private.h"
 
@@ -44,6 +45,38 @@ const char *rte_pci_get_sysfs_path(void)
 	return path;
 }
 
+#ifdef RTE_EXEC_ENV_WINDOWS
+#define asprintf pci_asprintf
+
+static int
+__rte_format_printf(2, 3)
+pci_asprintf(char **buffer, const char *format, ...)
+{
+	int size, ret;
+	va_list arg;
+
+	va_start(arg, format);
+	size = vsnprintf(NULL, 0, format, arg);
+	va_end(arg);
+	if (size < 0)
+		return -1;
+	size++;
+
+	*buffer = malloc(size);
+	if (*buffer == NULL)
+		return -1;
+
+	va_start(arg, format);
+	ret = vsnprintf(*buffer, size, format, arg);
+	va_end(arg);
+	if (ret != size - 1) {
+		free(*buffer);
+		return -1;
+	}
+	return ret;
+}
+#endif /* RTE_EXEC_ENV_WINDOWS */
+
 static struct rte_devargs *
 pci_devargs_lookup(const struct rte_pci_addr *pci_addr)
 {
@@ -59,7 +92,7 @@ pci_devargs_lookup(const struct rte_pci_addr *pci_addr)
 }
 
 void
-pci_name_set(struct rte_pci_device *dev)
+pci_common_set(struct rte_pci_device *dev)
 {
 	struct rte_devargs *devargs;
 
@@ -80,6 +113,20 @@ pci_name_set(struct rte_pci_device *dev)
 	else
 		/* Otherwise, it uses the internal, canonical form. */
 		dev->device.name = dev->name;
+
+	if (dev->bus_info != NULL ||
+			asprintf(&dev->bus_info, "vendor_id=%"PRIx16", device_id=%"PRIx16,
+				dev->id.vendor_id, dev->id.device_id) != -1)
+		dev->device.bus_info = dev->bus_info;
+}
+
+void
+pci_free(struct rte_pci_device_internal *pdev)
+{
+	if (pdev == NULL)
+		return;
+	free(pdev->device.bus_info);
+	free(pdev);
 }
 
 /* map a particular resource from a file */
@@ -190,12 +237,8 @@ rte_pci_probe_one_driver(struct rte_pci_driver *dr,
 		return 1;
 	}
 
-	if (dev->device.numa_node < 0) {
-		if (rte_socket_count() > 1)
-			RTE_LOG(INFO, EAL, "Device %s is not NUMA-aware, defaulting socket to 0\n",
-					dev->name);
-		dev->device.numa_node = 0;
-	}
+	if (dev->device.numa_node < 0 && rte_socket_count() > 1)
+		RTE_LOG(INFO, EAL, "Device %s is not NUMA-aware\n", dev->name);
 
 	already_probed = rte_dev_is_probed(&dev->device);
 	if (already_probed && !(dr->drv_flags & RTE_PCI_DRV_PROBE_AGAIN)) {
@@ -261,7 +304,7 @@ rte_pci_probe_one_driver(struct rte_pci_driver *dr,
 		}
 	}
 
-	RTE_LOG(INFO, EAL, "Probe PCI driver: %s (%x:%x) device: "PCI_PRI_FMT" (socket %i)\n",
+	RTE_LOG(INFO, EAL, "Probe PCI driver: %s (%x:%04x) device: "PCI_PRI_FMT" (socket %i)\n",
 			dr->driver.name, dev->id.vendor_id, dev->id.device_id,
 			loc->domain, loc->bus, loc->devid, loc->function,
 			dev->device.numa_node);
@@ -394,6 +437,40 @@ pci_probe(void)
 	return (probed && probed == failed) ? -1 : 0;
 }
 
+static int
+pci_cleanup(void)
+{
+	struct rte_pci_device *dev, *tmp_dev;
+	int error = 0;
+
+	RTE_TAILQ_FOREACH_SAFE(dev, &rte_pci_bus.device_list, next, tmp_dev) {
+		struct rte_pci_driver *drv = dev->driver;
+		int ret = 0;
+
+		if (drv == NULL || drv->remove == NULL)
+			goto free;
+
+		ret = drv->remove(dev);
+		if (ret < 0) {
+			rte_errno = errno;
+			error = -1;
+		}
+		dev->driver = NULL;
+		dev->device.driver = NULL;
+
+free:
+		/* free interrupt handles */
+		rte_intr_instance_free(dev->intr_handle);
+		dev->intr_handle = NULL;
+		rte_intr_instance_free(dev->vfio_req_intr_handle);
+		dev->vfio_req_intr_handle = NULL;
+
+		pci_free(RTE_PCI_DEVICE_INTERNAL(dev));
+	}
+
+	return error;
+}
+
 /* dump one device */
 static int
 pci_dump_one_device(FILE *f, struct rte_pci_device *dev)
@@ -443,7 +520,6 @@ void
 rte_pci_register(struct rte_pci_driver *driver)
 {
 	TAILQ_INSERT_TAIL(&rte_pci_bus.driver_list, driver, next);
-	driver->bus = &rte_pci_bus;
 }
 
 /* unregister a driver */
@@ -451,7 +527,6 @@ void
 rte_pci_unregister(struct rte_pci_driver *driver)
 {
 	TAILQ_REMOVE(&rte_pci_bus.driver_list, driver, next);
-	driver->bus = NULL;
 }
 
 /* Add a device to PCI bus */
@@ -606,7 +681,7 @@ pci_unplug(struct rte_device *dev)
 	if (ret == 0) {
 		rte_pci_remove_device(pdev);
 		rte_devargs_remove(dev->devargs);
-		free(pdev);
+		pci_free(RTE_PCI_DEVICE_INTERNAL(pdev));
 	}
 	return ret;
 }
@@ -738,8 +813,62 @@ rte_pci_get_iommu_class(void)
 	return iova_mode;
 }
 
+bool
+rte_pci_has_capability_list(const struct rte_pci_device *dev)
+{
+	uint16_t status;
+
+	if (rte_pci_read_config(dev, &status, sizeof(status), RTE_PCI_STATUS) != sizeof(status))
+		return false;
+
+	return (status & RTE_PCI_STATUS_CAP_LIST) != 0;
+}
+
 off_t
-rte_pci_find_ext_capability(struct rte_pci_device *dev, uint32_t cap)
+rte_pci_find_capability(const struct rte_pci_device *dev, uint8_t cap)
+{
+	return rte_pci_find_next_capability(dev, cap, 0);
+}
+
+off_t
+rte_pci_find_next_capability(const struct rte_pci_device *dev, uint8_t cap,
+	off_t offset)
+{
+	uint8_t pos;
+	int ttl;
+
+	if (offset == 0)
+		offset = RTE_PCI_CAPABILITY_LIST;
+	else
+		offset += RTE_PCI_CAP_NEXT;
+	ttl = (RTE_PCI_CFG_SPACE_SIZE - RTE_PCI_STD_HEADER_SIZEOF) / RTE_PCI_CAP_SIZEOF;
+
+	if (rte_pci_read_config(dev, &pos, sizeof(pos), offset) < 0)
+		return -1;
+
+	while (pos && ttl--) {
+		uint16_t ent;
+		uint8_t id;
+
+		offset = pos;
+		if (rte_pci_read_config(dev, &ent, sizeof(ent), offset) < 0)
+			return -1;
+
+		id = ent & 0xff;
+		if (id == 0xff)
+			break;
+
+		if (id == cap)
+			return offset;
+
+		pos = (ent >> 8);
+	}
+
+	return 0;
+}
+
+off_t
+rte_pci_find_ext_capability(const struct rte_pci_device *dev, uint32_t cap)
 {
 	off_t offset = RTE_PCI_CFG_SPACE_SIZE;
 	uint32_t header;
@@ -782,7 +911,7 @@ rte_pci_find_ext_capability(struct rte_pci_device *dev, uint32_t cap)
 }
 
 int
-rte_pci_set_bus_master(struct rte_pci_device *dev, bool enable)
+rte_pci_set_bus_master(const struct rte_pci_device *dev, bool enable)
 {
 	uint16_t old_cmd, cmd;
 
@@ -809,10 +938,20 @@ rte_pci_set_bus_master(struct rte_pci_device *dev, bool enable)
 	return 0;
 }
 
+int
+rte_pci_pasid_set_state(const struct rte_pci_device *dev,
+		off_t offset, bool enable)
+{
+	uint16_t pasid = enable;
+	return rte_pci_write_config(dev, &pasid, sizeof(pasid),
+			offset + RTE_PCI_PASID_CTRL) != sizeof(pasid) ? -1 : 0;
+}
+
 struct rte_pci_bus rte_pci_bus = {
 	.bus = {
 		.scan = rte_pci_scan,
 		.probe = pci_probe,
+		.cleanup = pci_cleanup,
 		.find_device = pci_find_device,
 		.plug = pci_plug,
 		.unplug = pci_unplug,

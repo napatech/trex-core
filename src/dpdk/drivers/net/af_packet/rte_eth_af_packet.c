@@ -12,7 +12,7 @@
 #include <ethdev_vdev.h>
 #include <rte_malloc.h>
 #include <rte_kvargs.h>
-#include <rte_bus_vdev.h>
+#include <bus_vdev_driver.h>
 
 #include <errno.h>
 #include <linux/if_ether.h>
@@ -23,6 +23,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -108,6 +109,7 @@ RTE_LOG_REGISTER_DEFAULT(af_packet_logtype, NOTICE);
 #define PMD_LOG_ERRNO(level, fmt, args...) \
 	rte_log(RTE_LOG_ ## level, af_packet_logtype, \
 		"%s(): " fmt ":%s\n", __func__, ##args, strerror(errno))
+
 #ifdef TREX_PATCH
 /*
 Inserts VLAN layer into given mbuf (mimic Dot1Q)
@@ -135,6 +137,7 @@ static inline void rte_pktmbuf_insert_stripped_vlan_layer(struct rte_mbuf *m, ui
     memcpy(data_start + skip_size, &vlan_tag, insert_size);
 }
 #endif
+
 static uint16_t
 eth_af_packet_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 {
@@ -220,7 +223,6 @@ tx_ring_status_available(uint32_t tp_status)
 #ifndef TREX_PATCH
 	tp_status &= ~(TP_STATUS_TS_SOFTWARE | TP_STATUS_TS_RAW_HARDWARE);
 #endif
-
 	return tp_status == TP_STATUS_AVAILABLE;
 }
 
@@ -344,7 +346,14 @@ eth_af_packet_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 static int
 eth_dev_start(struct rte_eth_dev *dev)
 {
+	struct pmd_internals *internals = dev->data->dev_private;
+	uint16_t i;
+
 	dev->data->dev_link.link_status = RTE_ETH_LINK_UP;
+	for (i = 0; i < internals->nb_queues; i++) {
+		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
+		dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
+	}
 	return 0;
 }
 
@@ -372,6 +381,8 @@ eth_dev_stop(struct rte_eth_dev *dev)
 
 		internals->rx_queue[i].sockfd = -1;
 		internals->tx_queue[i].sockfd = -1;
+		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
+		dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STOPPED;
 	}
 
 	dev->data->dev_link.link_status = RTE_ETH_LINK_DOWN;

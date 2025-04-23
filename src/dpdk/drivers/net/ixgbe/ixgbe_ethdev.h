@@ -6,6 +6,7 @@
 #define _IXGBE_ETHDEV_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <sys/queue.h>
 
 #include "base/ixgbe_type.h"
@@ -20,7 +21,7 @@
 #include <rte_time.h>
 #include <rte_hash.h>
 #include <rte_pci.h>
-#include <rte_bus_pci.h>
+#include <bus_pci_driver.h>
 #include <rte_tm_driver.h>
 
 /* need update link, bit flag */
@@ -474,6 +475,7 @@ struct ixgbe_adapter {
 	struct ixgbe_hw_stats       stats;
 	struct ixgbe_macsec_stats   macsec_stats;
 	struct ixgbe_macsec_setting	macsec_setting;
+	struct rte_eth_fdir_conf    fdir_conf;
 	struct ixgbe_hw_fdir_info   fdir;
 	struct ixgbe_interrupt      intr;
 	struct ixgbe_stat_mapping_registers stat_mappings;
@@ -501,13 +503,16 @@ struct ixgbe_adapter {
 	/* For RSS reta table update */
 	uint8_t rss_reta_updated;
 
+	/* Used for limiting SDP3 TX_DISABLE checks */
+	uint8_t sdp3_no_tx_disable;
+
 	/* Used for VF link sync with PF's physical and logical (by checking
 	 * mailbox status) link status.
 	 */
 	uint8_t pflink_fullchk;
 	uint8_t mac_ctrl_frame_fwd;
-	rte_atomic32_t link_thread_running;
-	pthread_t link_thread_tid;
+	bool link_thread_running;
+	rte_thread_t link_thread_tid;
 };
 
 struct ixgbe_vf_representor {
@@ -518,6 +523,9 @@ struct ixgbe_vf_representor {
 
 int ixgbe_vf_representor_init(struct rte_eth_dev *ethdev, void *init_params);
 int ixgbe_vf_representor_uninit(struct rte_eth_dev *ethdev);
+
+#define IXGBE_DEV_FDIR_CONF(dev) \
+	(&((struct ixgbe_adapter *)(dev)->data->dev_private)->fdir_conf)
 
 #define IXGBE_DEV_PRIVATE_TO_HW(adapter)\
 	(&((struct ixgbe_adapter *)adapter)->hw)
@@ -617,6 +625,9 @@ void ixgbe_rxq_info_get(struct rte_eth_dev *dev, uint16_t queue_id,
 
 void ixgbe_txq_info_get(struct rte_eth_dev *dev, uint16_t queue_id,
 	struct rte_eth_txq_info *qinfo);
+
+void ixgbe_recycle_rxq_info_get(struct rte_eth_dev *dev, uint16_t queue_id,
+		struct rte_eth_recycle_rxq_info *recycle_rxq_info);
 
 int ixgbevf_dev_rx_init(struct rte_eth_dev *dev);
 
@@ -746,13 +757,13 @@ int ixgbe_enable_sec_tx_path_generic(struct ixgbe_hw *hw);
 
 int ixgbe_vt_check(struct ixgbe_hw *hw);
 int ixgbe_set_vf_rate_limit(struct rte_eth_dev *dev, uint16_t vf,
-			    uint16_t tx_rate, uint64_t q_msk);
+			    uint32_t tx_rate, uint64_t q_msk);
 bool is_ixgbe_supported(struct rte_eth_dev *dev);
 int ixgbe_tm_ops_get(struct rte_eth_dev *dev, void *ops);
 void ixgbe_tm_conf_init(struct rte_eth_dev *dev);
 void ixgbe_tm_conf_uninit(struct rte_eth_dev *dev);
 int ixgbe_set_queue_rate_limit(struct rte_eth_dev *dev, uint16_t queue_idx,
-			       uint16_t tx_rate);
+			       uint32_t tx_rate);
 int ixgbe_rss_conf_init(struct ixgbe_rte_flow_rss_conf *out,
 			const struct rte_flow_action_rss *in);
 int ixgbe_action_rss_same(const struct rte_flow_action_rss *comp,

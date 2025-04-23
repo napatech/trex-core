@@ -173,7 +173,6 @@ mlx5_os_capabilities_prepare(struct mlx5_dev_ctx_shared *sh)
 	sh->dev_cap.max_qp = 1 << hca_attr->log_max_qp;
 	sh->dev_cap.max_qp_wr = 1 << hca_attr->log_max_qp_sz;
 	sh->dev_cap.dv_flow_en = 1;
-	sh->dev_cap.mps = MLX5_MPW_DISABLED;
 	DRV_LOG(DEBUG, "MPW isn't supported.");
 	DRV_LOG(DEBUG, "MPLS over GRE/UDP tunnel offloading is no supported.");
 	sh->dev_cap.hw_csum = hca_attr->csum_cap;
@@ -187,17 +186,50 @@ mlx5_os_capabilities_prepare(struct mlx5_dev_ctx_shared *sh)
 	if (sh->dev_cap.tso)
 		sh->dev_cap.tso_max_payload_sz = 1 << hca_attr->max_lso_cap;
 	DRV_LOG(DEBUG, "Counters are not supported.");
+	if (hca_attr->striding_rq) {
+		sh->dev_cap.mprq.enabled = 1;
+		sh->dev_cap.mprq.log_min_stride_size =
+			MLX5_MIN_SINGLE_STRIDE_LOG_NUM_BYTES;
+		sh->dev_cap.mprq.log_max_stride_size =
+			MLX5_MAX_SINGLE_STRIDE_LOG_NUM_BYTES;
+		if (hca_attr->ext_stride_num_range)
+			sh->dev_cap.mprq.log_min_stride_num =
+				MLX5_EXT_MIN_SINGLE_WQE_LOG_NUM_STRIDES;
+		else
+			sh->dev_cap.mprq.log_min_stride_num =
+				MLX5_MIN_SINGLE_WQE_LOG_NUM_STRIDES;
+		sh->dev_cap.mprq.log_max_stride_num =
+			MLX5_MAX_SINGLE_WQE_LOG_NUM_STRIDES;
+		DRV_LOG(DEBUG, "\tmin_single_stride_log_num_of_bytes: %u",
+			sh->dev_cap.mprq.log_min_stride_size);
+		DRV_LOG(DEBUG, "\tmax_single_stride_log_num_of_bytes: %u",
+			sh->dev_cap.mprq.log_max_stride_size);
+		DRV_LOG(DEBUG, "\tmin_single_wqe_log_num_of_strides: %u",
+			sh->dev_cap.mprq.log_min_stride_num);
+		DRV_LOG(DEBUG, "\tmax_single_wqe_log_num_of_strides: %u",
+			sh->dev_cap.mprq.log_max_stride_num);
+		DRV_LOG(DEBUG, "\tmin_stride_wqe_log_size: %u",
+			sh->dev_cap.mprq.log_min_stride_wqe_size);
+		DRV_LOG(DEBUG, "Device supports Multi-Packet RQ.");
+	}
 	if (hca_attr->rss_ind_tbl_cap) {
 		/*
 		 * DPDK doesn't support larger/variable indirection tables.
 		 * Once DPDK supports it, take max size from device attr.
 		 */
 		sh->dev_cap.ind_table_max_size =
-			RTE_MIN(1 << hca_attr->rss_ind_tbl_cap,
-				(unsigned int)RTE_ETH_RSS_RETA_SIZE_512);
+			RTE_MIN((uint32_t)1 << hca_attr->rss_ind_tbl_cap,
+				(uint32_t)RTE_ETH_RSS_RETA_SIZE_512);
 		DRV_LOG(DEBUG, "Maximum Rx indirection table size is %u",
 			sh->dev_cap.ind_table_max_size);
 	}
+	if (hca_attr->enhanced_multi_pkt_send_wqe)
+		sh->dev_cap.mps = MLX5_MPW_ENHANCED;
+	else if (hca_attr->multi_pkt_send_wqe &&
+		 sh->dev_cap.mps != MLX5_ARG_UNSET)
+		sh->dev_cap.mps = MLX5_MPW;
+	else
+		sh->dev_cap.mps = MLX5_MPW_DISABLED;
 	sh->dev_cap.swp = mlx5_get_supported_sw_parsing_offloads(hca_attr);
 	sh->dev_cap.tunnel_en = mlx5_get_supported_tunneling_offloads(hca_attr);
 	if (sh->dev_cap.tunnel_en) {
@@ -211,6 +243,18 @@ mlx5_os_capabilities_prepare(struct mlx5_dev_ctx_shared *sh)
 	} else {
 		DRV_LOG(DEBUG, "Tunnel offloading is not supported.");
 	}
+	sh->dev_cap.cqe_comp = 0;
+#if (RTE_CACHE_LINE_SIZE == 128)
+	if (hca_attr->cqe_compression_128)
+		sh->dev_cap.cqe_comp = 1;
+	DRV_LOG(DEBUG, "Rx CQE 128B compression is %ssupported.",
+		sh->dev_cap.cqe_comp ? "" : "not ");
+#else
+	if (hca_attr->cqe_compression)
+		sh->dev_cap.cqe_comp = 1;
+	DRV_LOG(DEBUG, "Rx CQE compression is %ssupported.",
+		sh->dev_cap.cqe_comp ? "" : "not ");
+#endif
 	snprintf(sh->dev_cap.fw_ver, 64, "%x.%x.%04x",
 		 MLX5_GET(initial_seg, pv_iseg, fw_rev_major),
 		 MLX5_GET(initial_seg, pv_iseg, fw_rev_minor),
@@ -729,7 +773,6 @@ mlx5_os_vf_mac_addr_modify(struct mlx5_priv *priv,
 
 /**
  * Set device promiscuous mode
- * Currently it has no support under Windows.
  *
  * @param dev
  *   Pointer to Ethernet device structure.
@@ -742,10 +785,9 @@ mlx5_os_vf_mac_addr_modify(struct mlx5_priv *priv,
 int
 mlx5_os_set_promisc(struct rte_eth_dev *dev, int enable)
 {
-	(void)dev;
-	(void)enable;
-	DRV_LOG(WARNING, "%s: is not supported", __func__);
-	return -ENOTSUP;
+	struct mlx5_priv *priv = dev->data->dev_private;
+
+	return mlx5_glue->devx_set_promisc_vport(priv->sh->cdev->ctx, ALL_PROMISC, enable);
 }
 
 /**
@@ -762,10 +804,9 @@ mlx5_os_set_promisc(struct rte_eth_dev *dev, int enable)
 int
 mlx5_os_set_allmulti(struct rte_eth_dev *dev, int enable)
 {
-	(void)dev;
-	(void)enable;
-	DRV_LOG(WARNING, "%s: is not supported", __func__);
-	return -ENOTSUP;
+	struct mlx5_priv *priv = dev->data->dev_private;
+
+	return mlx5_glue->devx_set_promisc_vport(priv->sh->cdev->ctx, MC_PROMISC, enable);
 }
 
 /**

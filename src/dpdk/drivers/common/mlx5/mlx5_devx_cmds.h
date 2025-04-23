@@ -15,6 +15,16 @@
 #define MLX5_DEVX_MAX_KLM_ENTRIES ((UINT16_MAX - \
 		MLX5_ST_SZ_DW(create_mkey_in) * 4) / (MLX5_ST_SZ_DW(klm) * 4))
 
+struct mlx5_devx_counter_attr {
+	uint32_t pd_valid:1;
+	uint32_t pd:24;
+	uint32_t bulk_log_max_alloc:1;
+	union {
+		uint8_t flow_counter_bulk_log_size;
+		uint8_t bulk_n_128;
+	};
+};
+
 struct mlx5_devx_mkey_attr {
 	uint64_t addr;
 	uint64_t size;
@@ -74,6 +84,9 @@ struct mlx5_hca_vdpa_attr {
 	uint32_t log_doorbell_stride:5;
 	uint32_t log_doorbell_bar_size:5;
 	uint32_t queue_counters_valid:1;
+	uint32_t vnet_modify_ext:1;
+	uint32_t virtio_net_q_addr_modify:1;
+	uint32_t virtio_q_index_modify:1;
 	uint32_t max_num_virtio_queues;
 	struct {
 		uint32_t a;
@@ -101,11 +114,27 @@ struct mlx5_hca_flex_attr {
 	uint8_t  max_num_arc_out;
 	uint8_t  max_num_sample;
 	uint8_t  max_num_prog_sample:5;	/* From HCA CAP 2 */
+	uint8_t  parse_graph_anchor:1;
+	uint8_t  query_match_sample_info:1; /* Support DevX query sample info. */
+	uint8_t  sample_tunnel_inner2:1;
+	uint8_t  zero_size_supported:1;
 	uint8_t  sample_id_in_out:1;
 	uint16_t max_base_header_length;
 	uint8_t  max_sample_base_offset;
 	uint16_t max_next_header_offset;
 	uint8_t  header_length_mask_width;
+};
+
+__extension__
+struct mlx5_hca_crypto_mmo_attr {
+	uint32_t crypto_mmo_qp:1;
+	uint32_t gcm_256_encrypt:1;
+	uint32_t gcm_128_encrypt:1;
+	uint32_t gcm_256_decrypt:1;
+	uint32_t gcm_128_decrypt:1;
+	uint32_t gcm_auth_tag_128:1;
+	uint32_t gcm_auth_tag_96:1;
+	uint32_t log_crypto_mmo_max_size:6;
 };
 
 /* ISO C restricts enumerator values to range of 'int' */
@@ -167,6 +196,7 @@ struct mlx5_hca_attr {
 	uint32_t tunnel_stateless_geneve_rx:1;
 	uint32_t geneve_max_opt_len:1; /* 0x0: 14DW, 0x1: 63DW */
 	uint32_t tunnel_stateless_gtp:1;
+	uint32_t tunnel_stateless_vxlan_gpe_nsh:1;
 	uint32_t max_lso_cap;
 	uint32_t scatter_fcs:1;
 	uint32_t lro_cap:1;
@@ -182,12 +212,18 @@ struct mlx5_hca_attr {
 	uint32_t lro_timer_supported_periods[MLX5_LRO_NUM_SUPP_PERIODS];
 	uint16_t lro_min_mss_size;
 	uint32_t flex_parser_protocols;
-	uint32_t max_geneve_tlv_options;
-	uint32_t max_geneve_tlv_option_data_len;
+	uint32_t max_geneve_tlv_options:8;
+	uint32_t max_geneve_tlv_option_data_len:5;
+	uint32_t geneve_tlv_sample:1;
+	uint32_t geneve_tlv_option_offset:1;
+	uint32_t geneve_tlv_option_sample_id:4;
 	uint32_t hairpin:1;
 	uint32_t log_max_hairpin_queues:5;
 	uint32_t log_max_hairpin_wq_data_sz:5;
 	uint32_t log_max_hairpin_num_packets:5;
+	uint32_t hairpin_sq_wqe_bb_size:4;
+	uint32_t hairpin_sq_wq_in_host_mem:1;
+	uint32_t hairpin_data_buffer_locked:1;
 	uint32_t vhca_id:16;
 	uint32_t relaxed_ordering_write:1;
 	uint32_t relaxed_ordering_read:1;
@@ -224,11 +260,13 @@ struct mlx5_hca_attr {
 	uint32_t cqe_compression:1;
 	uint32_t mini_cqe_resp_flow_tag:1;
 	uint32_t mini_cqe_resp_l3_l4_tag:1;
+	uint32_t enhanced_cqe_compression:1;
 	uint32_t pkt_integrity_match:1; /* 1 if HW supports integrity item */
 	struct mlx5_hca_qos_attr qos;
 	struct mlx5_hca_vdpa_attr vdpa;
 	struct mlx5_hca_flow_attr flow;
 	struct mlx5_hca_flex_attr flex;
+	struct mlx5_hca_crypto_mmo_attr crypto_mmo;
 	int log_max_qp_sz;
 	int log_max_cq_sz;
 	int log_max_qp;
@@ -243,19 +281,51 @@ struct mlx5_hca_attr {
 	uint32_t mmo_decompress_sq_en:1;
 	uint32_t mmo_dma_qp_en:1;
 	uint32_t mmo_compress_qp_en:1;
-	uint32_t mmo_decompress_qp_en:1;
+	uint32_t decomp_deflate_v1_en:1;
+	uint32_t decomp_deflate_v2_en:1;
 	uint32_t mmo_regex_qp_en:1;
 	uint32_t mmo_regex_sq_en:1;
 	uint32_t compress_min_block_size:4;
 	uint32_t log_max_mmo_dma:5;
 	uint32_t log_max_mmo_compress:5;
 	uint32_t log_max_mmo_decompress:5;
+	uint32_t decomp_lz4_data_only_en:1;
+	uint32_t decomp_lz4_no_checksum_en:1;
+	uint32_t decomp_lz4_checksum_en:1;
 	uint32_t umr_modify_entity_size_disabled:1;
 	uint32_t umr_indirect_mkey_disabled:1;
 	uint32_t log_min_stride_wqe_sz:5;
 	uint32_t esw_mgr_vport_id_valid:1; /* E-Switch Mgr vport ID is valid. */
+	uint32_t crypto_wrapped_import_method:1;
 	uint16_t esw_mgr_vport_id; /* E-Switch Mgr vport ID . */
 	uint16_t max_wqe_sz_sq;
+	uint32_t striding_rq:1;
+	uint32_t ext_stride_num_range:1;
+	uint32_t cqe_compression_128:1;
+	uint32_t multi_pkt_send_wqe:1;
+	uint32_t enhanced_multi_pkt_send_wqe:1;
+	uint32_t set_reg_c:16;
+	uint32_t nic_flow_table:1;
+	uint32_t modify_outer_ip_ecn:1;
+	uint32_t modify_outer_ipv6_traffic_class:1;
+	union {
+		uint32_t max_flow_counter;
+		struct {
+			uint16_t max_flow_counter_15_0;
+			uint16_t max_flow_counter_31_16;
+		};
+	};
+	uint32_t flow_counter_bulk_log_max_alloc:5;
+	uint32_t flow_counter_bulk_log_granularity:5;
+	uint32_t alloc_flow_counter_pd:1;
+	uint32_t flow_counter_access_aso:1;
+	uint32_t query_match_sample_info:1;
+	uint32_t flow_access_aso_opc_mod:8;
+	uint32_t cross_vhca:1;
+	uint32_t lag_rx_port_affinity:1;
+	uint32_t wqe_based_flow_table_sup:1;
+	uint8_t max_header_modify_pattern_length;
+	uint64_t system_image_guid;
 };
 
 /* LAG Context. */
@@ -306,6 +376,7 @@ struct mlx5_devx_create_rq_attr {
 	uint32_t state:4;
 	uint32_t flush_in_error_en:1;
 	uint32_t hairpin:1;
+	uint32_t hairpin_data_buffer_type:3;
 	uint32_t ts_format:2;
 	uint32_t user_index:24;
 	uint32_t cqn:24;
@@ -402,6 +473,7 @@ struct mlx5_devx_create_sq_attr {
 	uint32_t non_wire:1;
 	uint32_t static_sq_wq:1;
 	uint32_t ts_format:2;
+	uint32_t hairpin_wq_buffer_type:3;
 	uint32_t user_index:24;
 	uint32_t cqn:24;
 	uint32_t packet_pacing_rate_limit_index:16;
@@ -428,6 +500,7 @@ struct mlx5_devx_cq_attr {
 	uint32_t cqe_comp_en:1;
 	uint32_t mini_cqe_res_format:2;
 	uint32_t mini_cqe_res_format_ext:2;
+	uint32_t cqe_comp_layout:2;
 	uint32_t log_cq_size:5;
 	uint32_t log_page_size:5;
 	uint32_t uar_page_id;
@@ -464,7 +537,7 @@ struct mlx5_devx_virtq_attr {
 	uint32_t tis_id;
 	uint32_t counters_obj_id;
 	uint64_t dirty_bitmap_addr;
-	uint64_t type;
+	uint64_t mod_fields_bitmap;
 	uint64_t desc_addr;
 	uint64_t used_addr;
 	uint64_t available_addr;
@@ -474,8 +547,8 @@ struct mlx5_devx_virtq_attr {
 		uint64_t offset;
 	} umems[3];
 	uint8_t error_type;
+	uint8_t q_type;
 };
-
 
 struct mlx5_devx_qp_attr {
 	uint32_t pd:24;
@@ -493,6 +566,9 @@ struct mlx5_devx_qp_attr {
 	uint64_t wq_umem_offset;
 	uint32_t user_index:24;
 	uint32_t mmo:1;
+	uint32_t cd_master:1;
+	uint32_t cd_slave_send:1;
+	uint32_t cd_slave_recv:1;
 };
 
 struct mlx5_devx_virtio_q_couners_attr {
@@ -502,6 +578,18 @@ struct mlx5_devx_virtio_q_couners_attr {
 	uint32_t bad_desc_errors;
 	uint32_t exceed_max_chain;
 	uint32_t invalid_buffer;
+};
+
+/*
+ * Match sample info attributes structure, used by:
+ *  - GENEVE TLV option query.
+ *  - Graph flow match sample query.
+ */
+struct mlx5_devx_match_sample_info_query_attr {
+	uint32_t modify_field_id:12;
+	uint32_t sample_dw_data:8;
+	uint32_t sample_dw_ok_bit:8;
+	uint32_t sample_dw_ok_bit_offset:5;
 };
 
 /*
@@ -583,7 +671,24 @@ struct mlx5_devx_crypto_login_attr {
 	uint8_t credential[MLX5_CRYPTO_CREDENTIAL_SIZE];
 };
 
+/*
+ * GENEVE TLV option attributes structure, used by GENEVE TLV option create.
+ */
+struct mlx5_devx_geneve_tlv_option_attr {
+	uint32_t option_class:16;
+	uint32_t option_type:8;
+	uint32_t option_data_len:5;
+	uint32_t option_class_ignore:1;
+	uint32_t offset_valid:1;
+	uint32_t sample_offset:8;
+};
+
 /* mlx5_devx_cmds.c */
+
+__rte_internal
+struct mlx5_devx_obj *
+mlx5_devx_cmd_flow_counter_alloc_general(void *ctx,
+				struct mlx5_devx_counter_attr *attr);
 
 __rte_internal
 struct mlx5_devx_obj *mlx5_devx_cmd_flow_counter_alloc(void *ctx,
@@ -665,8 +770,12 @@ __rte_internal
 int mlx5_devx_cmd_modify_tir(struct mlx5_devx_obj *tir,
 			     struct mlx5_devx_modify_tir_attr *tir_attr);
 __rte_internal
+int mlx5_devx_cmd_match_sample_info_query(void *ctx, uint32_t sample_field_id,
+					  struct mlx5_devx_match_sample_info_query_attr *attr);
+__rte_internal
 int mlx5_devx_cmd_query_parse_samples(struct mlx5_devx_obj *flex_obj,
-				      uint32_t ids[], uint32_t num);
+				      uint32_t *ids,
+				      uint32_t num, uint8_t *anchor);
 
 __rte_internal
 struct mlx5_devx_obj *
@@ -684,7 +793,13 @@ int mlx5_devx_cmd_register_write(void *ctx, uint16_t reg_id,
 __rte_internal
 struct mlx5_devx_obj *
 mlx5_devx_cmd_create_geneve_tlv_option(void *ctx,
-		uint16_t class, uint8_t type, uint8_t len);
+				 struct mlx5_devx_geneve_tlv_option_attr *attr);
+
+__rte_internal
+int
+mlx5_devx_cmd_query_geneve_tlv_option(void *ctx,
+				      struct mlx5_devx_obj *geneve_tlv_opt_obj,
+				      struct mlx5_devx_match_sample_info_query_attr *attr);
 
 /**
  * Create virtio queue counters object DevX API.
@@ -770,4 +885,5 @@ __rte_internal
 int
 mlx5_devx_cmd_query_lag(void *ctx,
 			struct mlx5_devx_lag_context *lag_ctx);
+
 #endif /* RTE_PMD_MLX5_DEVX_CMDS_H_ */

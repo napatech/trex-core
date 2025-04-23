@@ -19,8 +19,12 @@ cn9k_sso_hws_enq(void *port, const struct rte_event *ev)
 		cn9k_sso_hws_forward_event(ws, ev);
 		break;
 	case RTE_EVENT_OP_RELEASE:
-		cnxk_sso_hws_swtag_flush(ws->base + SSOW_LF_GWS_TAG,
-					 ws->base + SSOW_LF_GWS_OP_SWTAG_FLUSH);
+		if (ws->swtag_req) {
+			cnxk_sso_hws_desched(ev->u64, ws->base);
+			ws->swtag_req = 0;
+			break;
+		}
+		cnxk_sso_hws_swtag_flush(ws->base);
 		break;
 	default:
 		return 0;
@@ -62,6 +66,17 @@ cn9k_sso_hws_enq_fwd_burst(void *port, const struct rte_event ev[],
 	return 1;
 }
 
+int __rte_hot
+cn9k_sso_hws_profile_switch(void *port, uint8_t profile)
+{
+	struct cn9k_sso_hws *ws = port;
+
+	ws->gw_wdata &= ~(0xFFUL);
+	ws->gw_wdata |= (profile + 1);
+
+	return 0;
+}
+
 /* Dual ws ops. */
 
 uint16_t __rte_hot
@@ -78,8 +93,12 @@ cn9k_sso_hws_dual_enq(void *port, const struct rte_event *ev)
 		cn9k_sso_hws_dual_forward_event(dws, base, ev);
 		break;
 	case RTE_EVENT_OP_RELEASE:
-		cnxk_sso_hws_swtag_flush(base + SSOW_LF_GWS_TAG,
-					 base + SSOW_LF_GWS_OP_SWTAG_FLUSH);
+		if (dws->swtag_req) {
+			cnxk_sso_hws_desched(ev->u64, base);
+			dws->swtag_req = 0;
+			break;
+		}
+		cnxk_sso_hws_swtag_flush(base);
 		break;
 	default:
 		return 0;
@@ -128,8 +147,7 @@ cn9k_sso_hws_ca_enq(void *port, struct rte_event ev[], uint16_t nb_events)
 
 	RTE_SET_USED(nb_events);
 
-	return cn9k_cpt_crypto_adapter_enqueue(ws->base + SSOW_LF_GWS_TAG,
-					       ev->event_ptr);
+	return cn9k_cpt_crypto_adapter_enqueue(ws->base, ev->event_ptr);
 }
 
 uint16_t __rte_hot
@@ -139,6 +157,17 @@ cn9k_sso_hws_dual_ca_enq(void *port, struct rte_event ev[], uint16_t nb_events)
 
 	RTE_SET_USED(nb_events);
 
-	return cn9k_cpt_crypto_adapter_enqueue(
-		dws->base[!dws->vws] + SSOW_LF_GWS_TAG, ev->event_ptr);
+	return cn9k_cpt_crypto_adapter_enqueue(dws->base[!dws->vws],
+					       ev->event_ptr);
+}
+
+int __rte_hot
+cn9k_sso_hws_dual_profile_switch(void *port, uint8_t profile)
+{
+	struct cn9k_sso_hws_dual *dws = port;
+
+	dws->gw_wdata &= ~(0xFFUL);
+	dws->gw_wdata |= (profile + 1);
+
+	return 0;
 }

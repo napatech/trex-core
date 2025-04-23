@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright 2017,2019-2021 NXP
+ * Copyright 2017,2019-2022 NXP
  */
 
 #include <assert.h>
@@ -14,18 +14,19 @@
 #include <rte_byteorder.h>
 #include <rte_common.h>
 #include <rte_debug.h>
-#include <rte_dev.h>
+#include <dev_driver.h>
 #include <rte_eal.h>
-#include <rte_fslmc.h>
+#include <bus_fslmc_driver.h>
 #include <rte_lcore.h>
 #include <rte_log.h>
 #include <rte_malloc.h>
 #include <rte_memcpy.h>
 #include <rte_memory.h>
 #include <rte_pci.h>
-#include <rte_bus_vdev.h>
+#include <bus_vdev_driver.h>
 #include <ethdev_driver.h>
 #include <cryptodev_pmd.h>
+#include <rte_event_crypto_adapter.h>
 #include <rte_event_eth_rx_adapter.h>
 #include <rte_event_eth_tx_adapter.h>
 
@@ -175,7 +176,7 @@ send_partial:
 				if (retry_count > DPAA2_EV_TX_RETRY_COUNT) {
 					num_tx += loop;
 					nb_events -= loop;
-					return num_tx + loop;
+					return num_tx;
 				}
 			} else {
 				loop += ret;
@@ -403,6 +404,8 @@ dpaa2_eventdev_info_get(struct rte_eventdev *dev,
 		DPAA2_EVENT_MAX_PORT_ENQUEUE_DEPTH;
 	dev_info->max_num_events = DPAA2_EVENT_MAX_NUM_EVENTS;
 	dev_info->event_dev_cap = RTE_EVENT_DEV_CAP_DISTRIBUTED_SCHED |
+		RTE_EVENT_DEV_CAP_ATOMIC |
+		RTE_EVENT_DEV_CAP_PARALLEL |
 		RTE_EVENT_DEV_CAP_BURST_MODE|
 		RTE_EVENT_DEV_CAP_RUNTIME_PORT_LINK |
 		RTE_EVENT_DEV_CAP_MULTIPLE_QUEUE_PORT |
@@ -410,7 +413,7 @@ dpaa2_eventdev_info_get(struct rte_eventdev *dev,
 		RTE_EVENT_DEV_CAP_QUEUE_ALL_TYPES |
 		RTE_EVENT_DEV_CAP_CARRY_FLOW_ID |
 		RTE_EVENT_DEV_CAP_MAINTENANCE_FREE;
-
+	dev_info->max_profiles_per_port = 1;
 }
 
 static int
@@ -865,10 +868,10 @@ static int
 dpaa2_eventdev_crypto_queue_add(const struct rte_eventdev *dev,
 		const struct rte_cryptodev *cryptodev,
 		int32_t rx_queue_id,
-		const struct rte_event *ev)
+		const struct rte_event_crypto_adapter_queue_conf *conf)
 {
 	struct dpaa2_eventdev *priv = dev->data->dev_private;
-	uint8_t ev_qid = ev->queue_id;
+	uint8_t ev_qid = conf->ev.queue_id;
 	struct dpaa2_dpcon_dev *dpcon = priv->evq_info[ev_qid].dpcon;
 	int ret;
 
@@ -876,10 +879,10 @@ dpaa2_eventdev_crypto_queue_add(const struct rte_eventdev *dev,
 
 	if (rx_queue_id == -1)
 		return dpaa2_eventdev_crypto_queue_add_all(dev,
-				cryptodev, ev);
+				cryptodev, &conf->ev);
 
 	ret = dpaa2_sec_eventq_attach(cryptodev, rx_queue_id,
-				      dpcon, ev);
+				      dpcon, &conf->ev);
 	if (ret) {
 		DPAA2_EVENTDEV_ERR(
 			"dpaa2_sec_eventq_attach failed: ret: %d\n", ret);
@@ -1015,9 +1018,7 @@ dpaa2_eventdev_txa_enqueue(void *port,
 		txq[i] = rte_eth_devices[m[i]->port].data->tx_queues[qid];
 	}
 
-	dpaa2_dev_tx_multi_txq_ordered(txq, m, nb_events);
-
-	return nb_events;
+	return dpaa2_dev_tx_multi_txq_ordered(txq, m, nb_events);
 }
 
 static struct eventdev_ops dpaa2_eventdev_ops = {
@@ -1087,7 +1088,7 @@ dpaa2_eventdev_setup_dpci(struct dpaa2_dpci_dev *dpci_dev,
 }
 
 static int
-dpaa2_eventdev_create(const char *name)
+dpaa2_eventdev_create(const char *name, struct rte_vdev_device *vdev)
 {
 	struct rte_eventdev *eventdev;
 	struct dpaa2_eventdev *priv;
@@ -1097,7 +1098,7 @@ dpaa2_eventdev_create(const char *name)
 
 	eventdev = rte_event_pmd_vdev_init(name,
 					   sizeof(struct dpaa2_eventdev),
-					   rte_socket_id());
+					   rte_socket_id(), vdev);
 	if (eventdev == NULL) {
 		DPAA2_EVENTDEV_ERR("Failed to create Event device %s", name);
 		goto fail;
@@ -1142,7 +1143,7 @@ dpaa2_eventdev_create(const char *name)
 		priv->max_event_queues++;
 	} while (dpcon_dev && dpci_dev);
 
-	RTE_LOG(INFO, PMD, "%s eventdev created\n", name);
+	DPAA2_EVENTDEV_INFO("%s eventdev created", name);
 
 done:
 	event_dev_probing_finish(eventdev);
@@ -1179,7 +1180,7 @@ dpaa2_eventdev_destroy(const char *name)
 	}
 	priv->max_event_queues = 0;
 
-	RTE_LOG(INFO, PMD, "%s eventdev cleaned\n", name);
+	DPAA2_EVENTDEV_INFO("%s eventdev cleaned", name);
 	return 0;
 }
 
@@ -1191,7 +1192,7 @@ dpaa2_eventdev_probe(struct rte_vdev_device *vdev)
 
 	name = rte_vdev_device_name(vdev);
 	DPAA2_EVENTDEV_INFO("Initializing %s", name);
-	return dpaa2_eventdev_create(name);
+	return dpaa2_eventdev_create(name, vdev);
 }
 
 static int

@@ -198,6 +198,7 @@ nitrox_sym_dev_qp_setup(struct rte_cryptodev *cdev, uint16_t qp_id,
 		return -ENOMEM;
 	}
 
+	qp->type = NITROX_QUEUE_SE;
 	qp->qno = qp_id;
 	err = nitrox_qp_setup(qp, ndev->bar_addr, cdev->data->name,
 			      qp_conf->nb_descriptors, NPS_PKT_IN_INSTR_SIZE,
@@ -492,7 +493,8 @@ configure_aead_ctx(struct rte_crypto_aead_xform *xform,
 		return -ENOTSUP;
 	}
 
-	if (unlikely(xform->algo != RTE_CRYPTO_AEAD_AES_GCM))
+	if (unlikely(xform->algo != RTE_CRYPTO_AEAD_AES_GCM &&
+		     xform->algo != RTE_CRYPTO_AEAD_AES_CCM))
 		return -ENOTSUP;
 
 	aes_keylen = flexi_aes_keylen(xform->key.length, true);
@@ -506,8 +508,29 @@ configure_aead_ctx(struct rte_crypto_aead_xform *xform,
 	if (unlikely(xform->iv.length > MAX_IV_LEN))
 		return -EINVAL;
 
+	if (xform->algo == RTE_CRYPTO_AEAD_AES_CCM) {
+		int L;
+
+		/* digest_length must be 4, 6, 8, 10, 12, 14, 16 bytes */
+		if (unlikely(xform->digest_length < 4 ||
+			     xform->digest_length > 16 ||
+			     (xform->digest_length & 1) == 1)) {
+			NITROX_LOG(ERR, "Invalid digest length %d\n",
+				   xform->digest_length);
+			return -EINVAL;
+		}
+
+		L = 15 - xform->iv.length;
+		if (unlikely(L < 2 || L > 8)) {
+			NITROX_LOG(ERR, "Invalid iv length %d\n",
+				   xform->iv.length);
+			return -EINVAL;
+		}
+	}
+
 	fctx->flags = rte_be_to_cpu_64(fctx->flags);
-	fctx->w0.cipher_type = CIPHER_AES_GCM;
+	fctx->w0.cipher_type = (xform->algo == RTE_CRYPTO_AEAD_AES_GCM) ?
+				CIPHER_AES_GCM : CIPHER_AES_CCM;
 	fctx->w0.aes_keylen = aes_keylen;
 	fctx->w0.iv_source = IV_FROM_DPTR;
 	fctx->w0.hash_type = AUTH_NULL;
@@ -526,28 +549,21 @@ configure_aead_ctx(struct rte_crypto_aead_xform *xform,
 	ctx->iv.length = xform->iv.length;
 	ctx->digest_length = xform->digest_length;
 	ctx->aad_length = xform->aad_length;
+	ctx->aead_algo = xform->algo;
 	return 0;
 }
 
 static int
-nitrox_sym_dev_sess_configure(struct rte_cryptodev *cdev,
+nitrox_sym_dev_sess_configure(struct rte_cryptodev *cdev __rte_unused,
 			      struct rte_crypto_sym_xform *xform,
-			      struct rte_cryptodev_sym_session *sess,
-			      struct rte_mempool *mempool)
+			      struct rte_cryptodev_sym_session *sess)
 {
-	void *mp_obj;
-	struct nitrox_crypto_ctx *ctx;
+	struct nitrox_crypto_ctx *ctx = CRYPTODEV_GET_SYM_SESS_PRIV(sess);
 	struct rte_crypto_cipher_xform *cipher_xform = NULL;
 	struct rte_crypto_auth_xform *auth_xform = NULL;
 	struct rte_crypto_aead_xform *aead_xform = NULL;
 	int ret = -EINVAL;
 
-	if (rte_mempool_get(mempool, &mp_obj)) {
-		NITROX_LOG(ERR, "Couldn't allocate context\n");
-		return -ENOMEM;
-	}
-
-	ctx = mp_obj;
 	ctx->nitrox_chain = get_crypto_chain_order(xform);
 	switch (ctx->nitrox_chain) {
 	case NITROX_CHAIN_CIPHER_ONLY:
@@ -585,38 +601,23 @@ nitrox_sym_dev_sess_configure(struct rte_cryptodev *cdev,
 		goto err;
 	}
 
-	ctx->iova = rte_mempool_virt2iova(ctx);
-	set_sym_session_private_data(sess, cdev->driver_id, ctx);
+	ctx->iova = CRYPTODEV_GET_SYM_SESS_PRIV_IOVA(sess);
 	return 0;
 err:
-	rte_mempool_put(mempool, mp_obj);
 	return ret;
 }
 
 static void
-nitrox_sym_dev_sess_clear(struct rte_cryptodev *cdev,
-			  struct rte_cryptodev_sym_session *sess)
-{
-	struct nitrox_crypto_ctx *ctx = get_sym_session_private_data(sess,
-							cdev->driver_id);
-	struct rte_mempool *sess_mp;
-
-	if (!ctx)
-		return;
-
-	memset(ctx, 0, sizeof(*ctx));
-	sess_mp = rte_mempool_from_obj(ctx);
-	set_sym_session_private_data(sess, cdev->driver_id, NULL);
-	rte_mempool_put(sess_mp, ctx);
-}
+nitrox_sym_dev_sess_clear(struct rte_cryptodev *cdev __rte_unused,
+			  struct rte_cryptodev_sym_session *sess __rte_unused)
+{}
 
 static struct nitrox_crypto_ctx *
 get_crypto_ctx(struct rte_crypto_op *op)
 {
 	if (op->sess_type == RTE_CRYPTO_OP_WITH_SESSION) {
 		if (likely(op->sym->session))
-			return get_sym_session_private_data(op->sym->session,
-							   nitrox_sym_drv_id);
+			return CRYPTODEV_GET_SYM_SESS_PRIV(op->sym->session);
 	}
 
 	return NULL;

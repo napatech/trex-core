@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright(c) 2010-2014 Intel Corporation.
  * Copyright(c) 2016 6WIND S.A.
+ * Copyright(c) 2022 SmartShare Systems
  */
 
 #include <stdbool.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -26,8 +28,10 @@
 #include <rte_eal_paging.h>
 #include <rte_telemetry.h>
 
+#include "mempool_trace.h"
 #include "rte_mempool.h"
-#include "rte_mempool_trace.h"
+
+RTE_LOG_REGISTER_DEFAULT(rte_mempool_logtype, INFO);
 
 TAILQ_HEAD(rte_mempool_list, rte_tailq_entry);
 
@@ -36,26 +40,24 @@ static struct rte_tailq_elem rte_mempool_tailq = {
 };
 EAL_REGISTER_TAILQ(rte_mempool_tailq)
 
-TAILQ_HEAD(mempool_callback_list, rte_tailq_entry);
+TAILQ_HEAD(mempool_callback_tailq, mempool_callback_data);
 
-static struct rte_tailq_elem callback_tailq = {
-	.name = "RTE_MEMPOOL_CALLBACK",
-};
-EAL_REGISTER_TAILQ(callback_tailq)
+static struct mempool_callback_tailq callback_tailq =
+		TAILQ_HEAD_INITIALIZER(callback_tailq);
 
 /* Invoke all registered mempool event callbacks. */
 static void
 mempool_event_callback_invoke(enum rte_mempool_event event,
 			      struct rte_mempool *mp);
 
-#define CACHE_FLUSHTHRESH_MULTIPLIER 1.5
-#define CALC_CACHE_FLUSHTHRESH(c)	\
-	((typeof(c))((c) * CACHE_FLUSHTHRESH_MULTIPLIER))
+/* Note: avoid using floating point since that compiler
+ * may not think that is constant.
+ */
+#define CALC_CACHE_FLUSHTHRESH(c) (((c) * 3) / 2)
 
 #if defined(RTE_ARCH_X86)
 /*
  * return the greatest common divisor between a and b (fast algorithm)
- *
  */
 static unsigned get_gcd(unsigned a, unsigned b)
 {
@@ -746,6 +748,11 @@ rte_mempool_free(struct rte_mempool *mp)
 static void
 mempool_cache_init(struct rte_mempool_cache *cache, uint32_t size)
 {
+	/* Check that cache have enough space for flush threshold */
+	RTE_BUILD_BUG_ON(CALC_CACHE_FLUSHTHRESH(RTE_MEMPOOL_CACHE_MAX_SIZE) >
+			 RTE_SIZEOF_FIELD(struct rte_mempool_cache, objs) /
+			 RTE_SIZEOF_FIELD(struct rte_mempool_cache, objs[0]));
+
 	cache->size = size;
 	cache->flushthresh = CALC_CACHE_FLUSHTHRESH(size);
 	cache->len = 0;
@@ -769,7 +776,7 @@ rte_mempool_cache_create(uint32_t size, int socket_id)
 	cache = rte_zmalloc_socket("MEMPOOL_CACHE", sizeof(*cache),
 				  RTE_CACHE_LINE_SIZE, socket_id);
 	if (cache == NULL) {
-		RTE_LOG(ERR, MEMPOOL, "Cannot allocate mempool cache.\n");
+		RTE_MEMPOOL_LOG(ERR, "Cannot allocate mempool cache.");
 		rte_errno = ENOMEM;
 		return NULL;
 	}
@@ -814,7 +821,7 @@ rte_mempool_create_empty(const char *name, unsigned n, unsigned elt_size,
 			  RTE_CACHE_LINE_MASK) != 0);
 	RTE_BUILD_BUG_ON((sizeof(struct rte_mempool_cache) &
 			  RTE_CACHE_LINE_MASK) != 0);
-#ifdef RTE_LIBRTE_MEMPOOL_DEBUG
+#ifdef RTE_LIBRTE_MEMPOOL_STATS
 	RTE_BUILD_BUG_ON((sizeof(struct rte_mempool_debug_stats) &
 			  RTE_CACHE_LINE_MASK) != 0);
 	RTE_BUILD_BUG_ON((offsetof(struct rte_mempool, stats) &
@@ -871,7 +878,7 @@ rte_mempool_create_empty(const char *name, unsigned n, unsigned elt_size,
 	/* try to allocate tailq entry */
 	te = rte_zmalloc("MEMPOOL_TAILQ_ENTRY", sizeof(*te), 0);
 	if (te == NULL) {
-		RTE_LOG(ERR, MEMPOOL, "Cannot allocate tailq entry!\n");
+		RTE_MEMPOOL_LOG(ERR, "Cannot allocate tailq entry!");
 		goto exit_unlock;
 	}
 
@@ -909,6 +916,22 @@ rte_mempool_create_empty(const char *name, unsigned n, unsigned elt_size,
 	mp->private_data_size = private_data_size;
 	STAILQ_INIT(&mp->elt_list);
 	STAILQ_INIT(&mp->mem_list);
+
+	/*
+	 * Since we have 4 combinations of the SP/SC/MP/MC examine the flags to
+	 * set the correct index into the table of ops structs.
+	 */
+	if ((flags & RTE_MEMPOOL_F_SP_PUT) && (flags & RTE_MEMPOOL_F_SC_GET))
+		ret = rte_mempool_set_ops_byname(mp, "ring_sp_sc", NULL);
+	else if (flags & RTE_MEMPOOL_F_SP_PUT)
+		ret = rte_mempool_set_ops_byname(mp, "ring_sp_mc", NULL);
+	else if (flags & RTE_MEMPOOL_F_SC_GET)
+		ret = rte_mempool_set_ops_byname(mp, "ring_mp_sc", NULL);
+	else
+		ret = rte_mempool_set_ops_byname(mp, "ring_mp_mc", NULL);
+
+	if (ret)
+		goto exit_unlock;
 
 	/*
 	 * local_cache pointer is set even if cache_size is zero.
@@ -950,29 +973,12 @@ rte_mempool_create(const char *name, unsigned n, unsigned elt_size,
 	rte_mempool_obj_cb_t *obj_init, void *obj_init_arg,
 	int socket_id, unsigned flags)
 {
-	int ret;
 	struct rte_mempool *mp;
 
 	mp = rte_mempool_create_empty(name, n, elt_size, cache_size,
 		private_data_size, socket_id, flags);
 	if (mp == NULL)
 		return NULL;
-
-	/*
-	 * Since we have 4 combinations of the SP/SC/MP/MC examine the flags to
-	 * set the correct index into the table of ops structs.
-	 */
-	if ((flags & RTE_MEMPOOL_F_SP_PUT) && (flags & RTE_MEMPOOL_F_SC_GET))
-		ret = rte_mempool_set_ops_byname(mp, "ring_sp_sc", NULL);
-	else if (flags & RTE_MEMPOOL_F_SP_PUT)
-		ret = rte_mempool_set_ops_byname(mp, "ring_sp_mc", NULL);
-	else if (flags & RTE_MEMPOOL_F_SC_GET)
-		ret = rte_mempool_set_ops_byname(mp, "ring_mp_sc", NULL);
-	else
-		ret = rte_mempool_set_ops_byname(mp, "ring_mp_mc", NULL);
-
-	if (ret)
-		goto fail;
 
 	/* call the mempool priv initializer */
 	if (mp_init)
@@ -1083,16 +1089,16 @@ void rte_mempool_check_cookies(const struct rte_mempool *mp,
 
 		if (free == 0) {
 			if (cookie != RTE_MEMPOOL_HEADER_COOKIE1) {
-				RTE_LOG(CRIT, MEMPOOL,
-					"obj=%p, mempool=%p, cookie=%" PRIx64 "\n",
+				RTE_MEMPOOL_LOG(CRIT,
+					"obj=%p, mempool=%p, cookie=%" PRIx64,
 					obj, (const void *) mp, cookie);
 				rte_panic("MEMPOOL: bad header cookie (put)\n");
 			}
 			hdr->cookie = RTE_MEMPOOL_HEADER_COOKIE2;
 		} else if (free == 1) {
 			if (cookie != RTE_MEMPOOL_HEADER_COOKIE2) {
-				RTE_LOG(CRIT, MEMPOOL,
-					"obj=%p, mempool=%p, cookie=%" PRIx64 "\n",
+				RTE_MEMPOOL_LOG(CRIT,
+					"obj=%p, mempool=%p, cookie=%" PRIx64,
 					obj, (const void *) mp, cookie);
 				rte_panic("MEMPOOL: bad header cookie (get)\n");
 			}
@@ -1100,8 +1106,8 @@ void rte_mempool_check_cookies(const struct rte_mempool *mp,
 		} else if (free == 2) {
 			if (cookie != RTE_MEMPOOL_HEADER_COOKIE1 &&
 			    cookie != RTE_MEMPOOL_HEADER_COOKIE2) {
-				RTE_LOG(CRIT, MEMPOOL,
-					"obj=%p, mempool=%p, cookie=%" PRIx64 "\n",
+				RTE_MEMPOOL_LOG(CRIT,
+					"obj=%p, mempool=%p, cookie=%" PRIx64,
 					obj, (const void *) mp, cookie);
 				rte_panic("MEMPOOL: bad header cookie (audit)\n");
 			}
@@ -1109,8 +1115,8 @@ void rte_mempool_check_cookies(const struct rte_mempool *mp,
 		tlr = rte_mempool_get_trailer(obj);
 		cookie = tlr->cookie;
 		if (cookie != RTE_MEMPOOL_TRAILER_COOKIE) {
-			RTE_LOG(CRIT, MEMPOOL,
-				"obj=%p, mempool=%p, cookie=%" PRIx64 "\n",
+			RTE_MEMPOOL_LOG(CRIT,
+				"obj=%p, mempool=%p, cookie=%" PRIx64,
 				obj, (const void *) mp, cookie);
 			rte_panic("MEMPOOL: bad trailer cookie\n");
 		}
@@ -1195,7 +1201,7 @@ mempool_audit_cache(const struct rte_mempool *mp)
 		const struct rte_mempool_cache *cache;
 		cache = &mp->local_cache[lcore_id];
 		if (cache->len > RTE_DIM(cache->objs)) {
-			RTE_LOG(CRIT, MEMPOOL, "badness on cache[%u]\n",
+			RTE_MEMPOOL_LOG(CRIT, "badness on cache[%u]",
 				lcore_id);
 			rte_panic("MEMPOOL: invalid cache len\n");
 		}
@@ -1217,7 +1223,7 @@ rte_mempool_audit(struct rte_mempool *mp)
 void
 rte_mempool_dump(FILE *f, struct rte_mempool *mp)
 {
-#ifdef RTE_LIBRTE_MEMPOOL_DEBUG
+#ifdef RTE_LIBRTE_MEMPOOL_STATS
 	struct rte_mempool_info info;
 	struct rte_mempool_debug_stats sum;
 	unsigned lcore_id;
@@ -1265,10 +1271,10 @@ rte_mempool_dump(FILE *f, struct rte_mempool *mp)
 	fprintf(f, "  common_pool_count=%u\n", common_count);
 
 	/* sum and dump statistics */
-#ifdef RTE_LIBRTE_MEMPOOL_DEBUG
+#ifdef RTE_LIBRTE_MEMPOOL_STATS
 	rte_mempool_ops_get_info(mp, &info);
 	memset(&sum, 0, sizeof(sum));
-	for (lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++) {
+	for (lcore_id = 0; lcore_id < RTE_MAX_LCORE + 1; lcore_id++) {
 		sum.put_bulk += mp->stats[lcore_id].put_bulk;
 		sum.put_objs += mp->stats[lcore_id].put_objs;
 		sum.put_common_pool_bulk += mp->stats[lcore_id].put_common_pool_bulk;
@@ -1281,6 +1287,15 @@ rte_mempool_dump(FILE *f, struct rte_mempool *mp)
 		sum.get_fail_objs += mp->stats[lcore_id].get_fail_objs;
 		sum.get_success_blks += mp->stats[lcore_id].get_success_blks;
 		sum.get_fail_blks += mp->stats[lcore_id].get_fail_blks;
+	}
+	if (mp->cache_size != 0) {
+		/* Add the statistics stored in the mempool caches. */
+		for (lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++) {
+			sum.put_bulk += mp->local_cache[lcore_id].stats.put_bulk;
+			sum.put_objs += mp->local_cache[lcore_id].stats.put_objs;
+			sum.get_success_bulk += mp->local_cache[lcore_id].stats.get_success_bulk;
+			sum.get_success_objs += mp->local_cache[lcore_id].stats.get_success_objs;
+		}
 	}
 	fprintf(f, "  stats:\n");
 	fprintf(f, "    put_bulk=%"PRIu64"\n", sum.put_bulk);
@@ -1372,6 +1387,7 @@ void rte_mempool_walk(void (*func)(struct rte_mempool *, void *),
 }
 
 struct mempool_callback_data {
+	TAILQ_ENTRY(mempool_callback_data) callbacks;
 	rte_mempool_event_callback *func;
 	void *user_data;
 };
@@ -1380,14 +1396,11 @@ static void
 mempool_event_callback_invoke(enum rte_mempool_event event,
 			      struct rte_mempool *mp)
 {
-	struct mempool_callback_list *list;
-	struct rte_tailq_entry *te;
+	struct mempool_callback_data *cb;
 	void *tmp_te;
 
 	rte_mcfg_tailq_read_lock();
-	list = RTE_TAILQ_CAST(callback_tailq.head, mempool_callback_list);
-	RTE_TAILQ_FOREACH_SAFE(te, list, next, tmp_te) {
-		struct mempool_callback_data *cb = te->data;
+	RTE_TAILQ_FOREACH_SAFE(cb, &callback_tailq, callbacks, tmp_te) {
 		rte_mcfg_tailq_read_unlock();
 		cb->func(event, mp, cb->user_data);
 		rte_mcfg_tailq_read_lock();
@@ -1399,10 +1412,7 @@ int
 rte_mempool_event_callback_register(rte_mempool_event_callback *func,
 				    void *user_data)
 {
-	struct mempool_callback_list *list;
-	struct rte_tailq_entry *te = NULL;
 	struct mempool_callback_data *cb;
-	void *tmp_te;
 	int ret;
 
 	if (func == NULL) {
@@ -1411,36 +1421,23 @@ rte_mempool_event_callback_register(rte_mempool_event_callback *func,
 	}
 
 	rte_mcfg_tailq_write_lock();
-	list = RTE_TAILQ_CAST(callback_tailq.head, mempool_callback_list);
-	RTE_TAILQ_FOREACH_SAFE(te, list, next, tmp_te) {
-		cb = te->data;
+	TAILQ_FOREACH(cb, &callback_tailq, callbacks) {
 		if (cb->func == func && cb->user_data == user_data) {
 			ret = -EEXIST;
 			goto exit;
 		}
 	}
 
-	te = rte_zmalloc("mempool_cb_tail_entry", sizeof(*te), 0);
-	if (te == NULL) {
-		RTE_LOG(ERR, MEMPOOL,
-			"Cannot allocate event callback tailq entry!\n");
-		ret = -ENOMEM;
-		goto exit;
-	}
-
-	cb = rte_malloc("mempool_cb_data", sizeof(*cb), 0);
+	cb = calloc(1, sizeof(*cb));
 	if (cb == NULL) {
-		RTE_LOG(ERR, MEMPOOL,
-			"Cannot allocate event callback!\n");
-		rte_free(te);
+		RTE_MEMPOOL_LOG(ERR, "Cannot allocate event callback!");
 		ret = -ENOMEM;
 		goto exit;
 	}
 
 	cb->func = func;
 	cb->user_data = user_data;
-	te->data = cb;
-	TAILQ_INSERT_TAIL(list, te, next);
+	TAILQ_INSERT_TAIL(&callback_tailq, cb, callbacks);
 	ret = 0;
 
 exit:
@@ -1453,27 +1450,21 @@ int
 rte_mempool_event_callback_unregister(rte_mempool_event_callback *func,
 				      void *user_data)
 {
-	struct mempool_callback_list *list;
-	struct rte_tailq_entry *te = NULL;
 	struct mempool_callback_data *cb;
 	int ret = -ENOENT;
 
 	rte_mcfg_tailq_write_lock();
-	list = RTE_TAILQ_CAST(callback_tailq.head, mempool_callback_list);
-	TAILQ_FOREACH(te, list, next) {
-		cb = te->data;
+	TAILQ_FOREACH(cb, &callback_tailq, callbacks) {
 		if (cb->func == func && cb->user_data == user_data) {
-			TAILQ_REMOVE(list, te, next);
+			TAILQ_REMOVE(&callback_tailq, cb, callbacks);
 			ret = 0;
 			break;
 		}
 	}
 	rte_mcfg_tailq_write_unlock();
 
-	if (ret == 0) {
-		rte_free(te);
-		rte_free(cb);
-	}
+	if (ret == 0)
+		free(cb);
 	rte_errno = -ret;
 	return ret;
 }
@@ -1505,32 +1496,45 @@ mempool_info_cb(struct rte_mempool *mp, void *arg)
 {
 	struct mempool_info_cb_arg *info = (struct mempool_info_cb_arg *)arg;
 	const struct rte_memzone *mz;
+	uint64_t cache_count, common_count;
 
 	if (strncmp(mp->name, info->pool_name, RTE_MEMZONE_NAMESIZE))
 		return;
 
 	rte_tel_data_add_dict_string(info->d, "name", mp->name);
-	rte_tel_data_add_dict_int(info->d, "pool_id", mp->pool_id);
-	rte_tel_data_add_dict_int(info->d, "flags", mp->flags);
+	rte_tel_data_add_dict_uint(info->d, "pool_id", mp->pool_id);
+	rte_tel_data_add_dict_uint(info->d, "flags", mp->flags);
 	rte_tel_data_add_dict_int(info->d, "socket_id", mp->socket_id);
-	rte_tel_data_add_dict_int(info->d, "size", mp->size);
-	rte_tel_data_add_dict_int(info->d, "cache_size", mp->cache_size);
-	rte_tel_data_add_dict_int(info->d, "elt_size", mp->elt_size);
-	rte_tel_data_add_dict_int(info->d, "header_size", mp->header_size);
-	rte_tel_data_add_dict_int(info->d, "trailer_size", mp->trailer_size);
-	rte_tel_data_add_dict_int(info->d, "private_data_size",
+	rte_tel_data_add_dict_uint(info->d, "size", mp->size);
+	rte_tel_data_add_dict_uint(info->d, "cache_size", mp->cache_size);
+	rte_tel_data_add_dict_uint(info->d, "elt_size", mp->elt_size);
+	rte_tel_data_add_dict_uint(info->d, "header_size", mp->header_size);
+	rte_tel_data_add_dict_uint(info->d, "trailer_size", mp->trailer_size);
+	rte_tel_data_add_dict_uint(info->d, "private_data_size",
 				  mp->private_data_size);
 	rte_tel_data_add_dict_int(info->d, "ops_index", mp->ops_index);
-	rte_tel_data_add_dict_int(info->d, "populated_size",
+	rte_tel_data_add_dict_uint(info->d, "populated_size",
 				  mp->populated_size);
+
+	cache_count = 0;
+	if (mp->cache_size > 0) {
+		int lcore_id;
+		for (lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++)
+			cache_count += mp->local_cache[lcore_id].len;
+	}
+	rte_tel_data_add_dict_uint(info->d, "total_cache_count", cache_count);
+	common_count = rte_mempool_ops_get_count(mp);
+	if ((cache_count + common_count) > mp->size)
+		common_count = mp->size - cache_count;
+	rte_tel_data_add_dict_uint(info->d, "common_pool_count", common_count);
 
 	mz = mp->mz;
 	rte_tel_data_add_dict_string(info->d, "mz_name", mz->name);
-	rte_tel_data_add_dict_int(info->d, "mz_len", mz->len);
-	rte_tel_data_add_dict_int(info->d, "mz_hugepage_sz",
+	rte_tel_data_add_dict_uint(info->d, "mz_len", mz->len);
+	rte_tel_data_add_dict_uint(info->d, "mz_hugepage_sz",
 				  mz->hugepage_sz);
 	rte_tel_data_add_dict_int(info->d, "mz_socket_id", mz->socket_id);
-	rte_tel_data_add_dict_int(info->d, "mz_flags", mz->flags);
+	rte_tel_data_add_dict_uint(info->d, "mz_flags", mz->flags);
 }
 
 static int

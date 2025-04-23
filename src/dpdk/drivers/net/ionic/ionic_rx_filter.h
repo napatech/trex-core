@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0)
- * Copyright(c) 2018-2019 Pensando Systems, Inc. All rights reserved.
+/* SPDX-License-Identifier: BSD-3-Clause
+ * Copyright 2018-2022 Advanced Micro Devices, Inc.
  */
 
 #ifndef _IONIC_RX_FILTER_H_
@@ -7,7 +7,6 @@
 
 #include <rte_spinlock.h>
 
-#include "ionic_osdep.h"
 #include "ionic_if.h"
 
 #define IONIC_RXQ_INDEX_ANY		(0xFFFF)

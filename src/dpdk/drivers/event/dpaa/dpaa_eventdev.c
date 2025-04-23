@@ -14,7 +14,7 @@
 #include <rte_byteorder.h>
 #include <rte_common.h>
 #include <rte_debug.h>
-#include <rte_dev.h>
+#include <dev_driver.h>
 #include <rte_eal.h>
 #include <rte_lcore.h>
 #include <rte_log.h>
@@ -26,10 +26,11 @@
 #include <rte_eventdev.h>
 #include <eventdev_pmd_vdev.h>
 #include <rte_ethdev.h>
+#include <rte_event_crypto_adapter.h>
 #include <rte_event_eth_rx_adapter.h>
 #include <rte_event_eth_tx_adapter.h>
 #include <cryptodev_pmd.h>
-#include <rte_dpaa_bus.h>
+#include <bus_dpaa_driver.h>
 #include <rte_dpaa_logs.h>
 #include <rte_cycles.h>
 #include <rte_kvargs.h>
@@ -352,12 +353,15 @@ dpaa_event_dev_info_get(struct rte_eventdev *dev,
 	dev_info->max_num_events =
 		DPAA_EVENT_MAX_NUM_EVENTS;
 	dev_info->event_dev_cap =
+		RTE_EVENT_DEV_CAP_ATOMIC |
+		RTE_EVENT_DEV_CAP_PARALLEL |
 		RTE_EVENT_DEV_CAP_DISTRIBUTED_SCHED |
 		RTE_EVENT_DEV_CAP_BURST_MODE |
 		RTE_EVENT_DEV_CAP_MULTIPLE_QUEUE_PORT |
 		RTE_EVENT_DEV_CAP_NONSEQ_MODE |
 		RTE_EVENT_DEV_CAP_CARRY_FLOW_ID |
 		RTE_EVENT_DEV_CAP_MAINTENANCE_FREE;
+	dev_info->max_profiles_per_port = 1;
 }
 
 static int
@@ -775,10 +779,10 @@ static int
 dpaa_eventdev_crypto_queue_add(const struct rte_eventdev *dev,
 		const struct rte_cryptodev *cryptodev,
 		int32_t rx_queue_id,
-		const struct rte_event *ev)
+		const struct rte_event_crypto_adapter_queue_conf *conf)
 {
 	struct dpaa_eventdev *priv = dev->data->dev_private;
-	uint8_t ev_qid = ev->queue_id;
+	uint8_t ev_qid = conf->ev.queue_id;
 	u16 ch_id = priv->evq_info[ev_qid].ch_id;
 	int ret;
 
@@ -786,10 +790,10 @@ dpaa_eventdev_crypto_queue_add(const struct rte_eventdev *dev,
 
 	if (rx_queue_id == -1)
 		return dpaa_eventdev_crypto_queue_add_all(dev,
-				cryptodev, ev);
+				cryptodev, &conf->ev);
 
 	ret = dpaa_sec_eventq_attach(cryptodev, rx_queue_id,
-			ch_id, ev);
+			ch_id, &conf->ev);
 	if (ret) {
 		DPAA_EVENTDEV_ERR(
 			"dpaa_sec_eventq_attach failed: ret: %d\n", ret);
@@ -992,14 +996,14 @@ dpaa_event_check_flags(const char *params)
 }
 
 static int
-dpaa_event_dev_create(const char *name, const char *params)
+dpaa_event_dev_create(const char *name, const char *params, struct rte_vdev_device *vdev)
 {
 	struct rte_eventdev *eventdev;
 	struct dpaa_eventdev *priv;
 
 	eventdev = rte_event_pmd_vdev_init(name,
 					   sizeof(struct dpaa_eventdev),
-					   rte_socket_id());
+					   rte_socket_id(), vdev);
 	if (eventdev == NULL) {
 		DPAA_EVENTDEV_ERR("Failed to create eventdev vdev %s", name);
 		goto fail;
@@ -1023,7 +1027,7 @@ dpaa_event_dev_create(const char *name, const char *params)
 	eventdev->txa_enqueue = dpaa_eventdev_txa_enqueue;
 	eventdev->txa_enqueue_same_dest	= dpaa_eventdev_txa_enqueue_same_dest;
 
-	RTE_LOG(INFO, PMD, "%s eventdev added", name);
+	DPAA_EVENTDEV_INFO("%s eventdev added", name);
 
 	/* For secondary processes, the primary has done all the work */
 	if (rte_eal_process_type() != RTE_PROC_PRIMARY)
@@ -1049,7 +1053,7 @@ dpaa_event_dev_probe(struct rte_vdev_device *vdev)
 
 	params = rte_vdev_device_args(vdev);
 
-	return dpaa_event_dev_create(name, params);
+	return dpaa_event_dev_create(name, params, vdev);
 }
 
 static int

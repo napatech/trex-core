@@ -6,8 +6,9 @@
 #define _SFC_VDPA_OPS_H
 
 #include <rte_vdpa.h>
+#include <rte_thread.h>
 
-#define SFC_VDPA_MAX_QUEUE_PAIRS		1
+#define SFC_VDPA_MAX_QUEUE_PAIRS		8
 
 enum sfc_vdpa_context {
 	SFC_VDPA_AS_VF
@@ -35,6 +36,7 @@ struct sfc_vdpa_vring_info {
 };
 
 typedef struct sfc_vdpa_vq_context_s {
+	volatile void			*doorbell;
 	uint8_t				enable;
 	uint32_t			pidx;
 	uint32_t			cidx;
@@ -47,7 +49,7 @@ struct sfc_vdpa_ops_data {
 	struct rte_vdpa_device		*vdpa_dev;
 	enum sfc_vdpa_context		vdpa_context;
 	enum sfc_vdpa_state		state;
-	pthread_t			notify_tid;
+	rte_thread_t			notify_tid;
 	bool				is_notify_thread_started;
 
 	uint64_t			dev_features;

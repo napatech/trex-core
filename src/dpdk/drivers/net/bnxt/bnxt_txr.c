@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(c) 2014-2021 Broadcom
+ * Copyright(c) 2014-2023 Broadcom
  * All rights reserved.
  */
 
@@ -116,10 +116,78 @@ bnxt_xmit_need_long_bd(struct rte_mbuf *tx_pkt, struct bnxt_tx_queue *txq)
 				RTE_MBUF_F_TX_VLAN | RTE_MBUF_F_TX_OUTER_IP_CKSUM |
 				RTE_MBUF_F_TX_TUNNEL_GRE | RTE_MBUF_F_TX_TUNNEL_VXLAN |
 				RTE_MBUF_F_TX_TUNNEL_GENEVE | RTE_MBUF_F_TX_IEEE1588_TMST |
-				RTE_MBUF_F_TX_QINQ) ||
+				RTE_MBUF_F_TX_QINQ | RTE_MBUF_F_TX_TUNNEL_VXLAN_GPE |
+				RTE_MBUF_F_TX_UDP_SEG) ||
 	     (BNXT_TRUFLOW_EN(txq->bp) &&
 	      (txq->bp->tx_cfa_action || txq->vfr_tx_cfa_action)))
 		return true;
+	return false;
+}
+
+/* Used for verifying TSO segments during TCP Segmentation Offload or
+ * UDP Fragmentation Offload. tx_pkt->tso_segsz stores the number of
+ * segments or fragments in those cases.
+ */
+static bool
+bnxt_zero_data_len_tso_segsz(struct rte_mbuf *tx_pkt, uint8_t data_len_chk)
+{
+	const char *type_str = "Data len";
+	uint16_t len_to_check = tx_pkt->data_len;
+
+	if (data_len_chk == 0) {
+		type_str = "TSO Seg size";
+		len_to_check = tx_pkt->tso_segsz;
+	}
+
+	if (len_to_check == 0) {
+		PMD_DRV_LOG(ERR, "Error! Tx pkt %s == 0\n", type_str);
+		rte_pktmbuf_dump(stdout, tx_pkt, 64);
+		rte_dump_stack();
+		return true;
+	}
+	return false;
+}
+
+static bool
+bnxt_check_pkt_needs_ts(struct rte_mbuf *m)
+{
+	const struct rte_ether_hdr *eth_hdr;
+	struct rte_ether_hdr _eth_hdr;
+	uint16_t eth_type, proto;
+	uint32_t off = 0;
+	/*
+	 * Check that the received packet is a eCPRI packet
+	 */
+	eth_hdr = rte_pktmbuf_read(m, off, sizeof(_eth_hdr), &_eth_hdr);
+	eth_type = rte_be_to_cpu_16(eth_hdr->ether_type);
+	off += sizeof(*eth_hdr);
+	if (eth_type == RTE_ETHER_TYPE_ECPRI)
+		return true;
+	/* Check for single tagged and double tagged VLANs */
+	if (eth_type == RTE_ETHER_TYPE_VLAN) {
+		const struct rte_vlan_hdr *vh;
+		struct rte_vlan_hdr vh_copy;
+
+		vh = rte_pktmbuf_read(m, off, sizeof(*vh), &vh_copy);
+		if (unlikely(vh == NULL))
+			return false;
+		off += sizeof(*vh);
+		proto = rte_be_to_cpu_16(vh->eth_proto);
+		if (proto == RTE_ETHER_TYPE_ECPRI)
+			return true;
+		if (proto == RTE_ETHER_TYPE_VLAN) {
+			const struct rte_vlan_hdr *vh;
+			struct rte_vlan_hdr vh_copy;
+
+			vh = rte_pktmbuf_read(m, off, sizeof(*vh), &vh_copy);
+			if (unlikely(vh == NULL))
+				return false;
+			off += sizeof(*vh);
+			proto = rte_be_to_cpu_16(vh->eth_proto);
+			if (proto == RTE_ETHER_TYPE_ECPRI)
+				return true;
+		}
+	}
 	return false;
 }
 
@@ -137,6 +205,7 @@ static uint16_t bnxt_start_xmit(struct rte_mbuf *tx_pkt,
 	bool long_bd = false;
 	unsigned short nr_bds;
 	uint16_t prod;
+	bool pkt_needs_ts = 0;
 	struct rte_mbuf *m_seg;
 	struct rte_mbuf **tx_buf;
 	static const uint32_t lhint_arr[4] = {
@@ -179,11 +248,16 @@ static uint16_t bnxt_start_xmit(struct rte_mbuf *tx_pkt,
 	}
 
 	/* Check non zero data_len */
-	RTE_VERIFY(tx_pkt->data_len);
+	if (unlikely(bnxt_zero_data_len_tso_segsz(tx_pkt, 1)))
+		return -EIO;
+
+	if (unlikely(txq->bp->ptp_cfg != NULL && txq->bp->ptp_all_rx_tstamp == 1))
+		pkt_needs_ts = bnxt_check_pkt_needs_ts(tx_pkt);
 
 	prod = RING_IDX(ring, txr->tx_raw_prod);
 	tx_buf = &txr->tx_buf_ring[prod];
 	*tx_buf = tx_pkt;
+	txr->nr_bds[prod] = nr_bds;
 
 	txbd = &txr->tx_desc_ring[prod];
 	txbd->opaque = *coal_pkts;
@@ -239,7 +313,8 @@ static uint16_t bnxt_start_xmit(struct rte_mbuf *tx_pkt,
 		else
 			txbd1->cfa_action = txq->bp->tx_cfa_action;
 
-		if (tx_pkt->ol_flags & RTE_MBUF_F_TX_TCP_SEG) {
+		if (tx_pkt->ol_flags & RTE_MBUF_F_TX_TCP_SEG ||
+		    tx_pkt->ol_flags & RTE_MBUF_F_TX_UDP_SEG) {
 			uint16_t hdr_size;
 
 			/* TSO */
@@ -256,7 +331,8 @@ static uint16_t bnxt_start_xmit(struct rte_mbuf *tx_pkt,
 			 */
 			txbd1->kid_or_ts_low_hdr_size = hdr_size >> 1;
 			txbd1->kid_or_ts_high_mss = tx_pkt->tso_segsz;
-			RTE_VERIFY(txbd1->kid_or_ts_high_mss);
+			if (unlikely(bnxt_zero_data_len_tso_segsz(tx_pkt, 0)))
+				return -EIO;
 
 		} else if ((tx_pkt->ol_flags & PKT_TX_OIP_IIP_TCP_UDP_CKSUM) ==
 			   PKT_TX_OIP_IIP_TCP_UDP_CKSUM) {
@@ -319,7 +395,7 @@ static uint16_t bnxt_start_xmit(struct rte_mbuf *tx_pkt,
 			/* IP CSO */
 			txbd1->lflags |= TX_BD_LONG_LFLAGS_T_IP_CHKSUM;
 		} else if ((tx_pkt->ol_flags & RTE_MBUF_F_TX_IEEE1588_TMST) ==
-			   RTE_MBUF_F_TX_IEEE1588_TMST) {
+			   RTE_MBUF_F_TX_IEEE1588_TMST || pkt_needs_ts) {
 			/* PTP */
 			txbd1->lflags |= TX_BD_LONG_LFLAGS_STAMP;
 		}
@@ -330,7 +406,8 @@ static uint16_t bnxt_start_xmit(struct rte_mbuf *tx_pkt,
 	m_seg = tx_pkt->next;
 	while (m_seg) {
 		/* Check non zero data_len */
-		RTE_VERIFY(m_seg->data_len);
+		if (unlikely(bnxt_zero_data_len_tso_segsz(m_seg, 1)))
+			return -EIO;
 		txr->tx_raw_prod = RING_NEXT(txr->tx_raw_prod);
 
 		prod = RING_IDX(ring, txr->tx_raw_prod);
@@ -404,8 +481,7 @@ static void bnxt_tx_cmp(struct bnxt_tx_queue *txq, int nr_pkts)
 		unsigned short nr_bds;
 
 		tx_buf = &txr->tx_buf_ring[RING_IDX(ring, raw_cons)];
-		nr_bds = (*tx_buf)->nb_segs +
-			 bnxt_xmit_need_long_bd(*tx_buf, txq);
+		nr_bds = txr->nr_bds[RING_IDX(ring, raw_cons)];
 		for (j = 0; j < nr_bds; j++) {
 			mbuf = *tx_buf;
 			*tx_buf = NULL;
@@ -472,7 +548,7 @@ static int bnxt_handle_tx_cp(struct bnxt_tx_queue *txq)
 		if (CMP_TYPE(txcmp) == TX_CMPL_TYPE_TX_L2)
 			nb_tx_pkts += opaque;
 		else
-			RTE_LOG_DP(ERR, PMD,
+			RTE_LOG_DP(ERR, BNXT,
 					"Unhandled CMP type %02x\n",
 					CMP_TYPE(txcmp));
 		raw_cons = NEXT_RAW_CMP(raw_cons);
@@ -492,6 +568,19 @@ static int bnxt_handle_tx_cp(struct bnxt_tx_queue *txq)
 
 uint16_t bnxt_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 			       uint16_t nb_pkts)
+{
+	struct bnxt_tx_queue *txq = tx_queue;
+	uint16_t rc;
+
+	pthread_mutex_lock(&txq->txq_lock);
+	rc = _bnxt_xmit_pkts(tx_queue, tx_pkts, nb_pkts);
+	pthread_mutex_unlock(&txq->txq_lock);
+
+	return rc;
+}
+
+uint16_t _bnxt_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
+			 uint16_t nb_pkts)
 {
 	int rc;
 	uint16_t nb_tx_pkts = 0;
@@ -536,6 +625,12 @@ int bnxt_tx_queue_start(struct rte_eth_dev *dev, uint16_t tx_queue_id)
 	rc = is_bnxt_in_error(bp);
 	if (rc)
 		return rc;
+
+	/* reset the previous stats for the tx_queue since the counters
+	 * will be cleared when the queue is started.
+	 */
+	memset(&bp->prev_tx_ring_stats[tx_queue_id], 0,
+	       sizeof(struct bnxt_ring_stats));
 
 	bnxt_free_hwrm_tx_ring(bp, tx_queue_id);
 	rc = bnxt_alloc_hwrm_tx_ring(bp, tx_queue_id);
@@ -607,3 +702,13 @@ int bnxt_flush_tx_cmp(struct bnxt_cp_ring_info *cpr)
 
 	return 0;
 }
+
+#ifdef TREX_PATCH
+
+uint16_t bnxt_xmit_pkts_vec_avx2(void *tx_queue, struct rte_mbuf **tx_pkts,
+				 uint16_t nb_pkts)
+{
+    return 0;
+}
+
+#endif

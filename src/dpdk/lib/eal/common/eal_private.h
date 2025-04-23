@@ -10,8 +10,9 @@
 #include <stdio.h>
 #include <sys/queue.h>
 
-#include <rte_dev.h>
+#include <dev_driver.h>
 #include <rte_lcore.h>
+#include <rte_log.h>
 #include <rte_memory.h>
 
 #include "eal_internal_cfg.h"
@@ -20,15 +21,15 @@
  * Structure storing internal configuration (per-lcore)
  */
 struct lcore_config {
-	pthread_t thread_id;       /**< pthread identifier */
+	rte_thread_t thread_id;    /**< thread identifier */
 	int pipe_main2worker[2];   /**< communication pipe with main */
 	int pipe_worker2main[2];   /**< communication pipe with main */
 
-	lcore_function_t * volatile f; /**< function to call */
+	RTE_ATOMIC(lcore_function_t *) volatile f; /**< function to call */
 	void * volatile arg;       /**< argument of function */
 	volatile int ret;          /**< return value of function */
 
-	volatile enum rte_lcore_state_t state; /**< lcore state */
+	volatile RTE_ATOMIC(enum rte_lcore_state_t) state; /**< lcore state */
 	unsigned int socket_id;    /**< physical socket id for this lcore */
 	unsigned int core_id;      /**< core number on socket for this lcore */
 	int core_index;            /**< relative index, starting from 0 */
@@ -115,7 +116,8 @@ int rte_eal_memseg_init(void);
  * @return
  *   0 on success, negative on error
  */
-int rte_eal_memory_init(void);
+int rte_eal_memory_init(void)
+	__rte_shared_locks_required(rte_mcfg_mem_get_lock());
 
 /**
  * Configure timers
@@ -151,13 +153,6 @@ int rte_eal_tailqs_init(void);
  *  0 on success, negative on error
  */
 int rte_eal_intr_init(void);
-
-/**
- * Close the default log stream
- *
- * This function is private to EAL.
- */
-void rte_eal_log_cleanup(void);
 
 /**
  * Init alarm mechanism. This is to allow a callback be called after
@@ -440,6 +435,16 @@ int rte_eal_memory_detach(void);
  *   NULL if no bus is able to parse this device.
  */
 struct rte_bus *rte_bus_find_by_device_name(const char *str);
+
+/**
+ * For each device on the buses, call the driver-specific function for
+ * device cleanup.
+ *
+ * @return
+ * 0 for successful cleanup
+ * !0 otherwise
+ */
+int eal_bus_cleanup(void);
 
 /**
  * Create the unix channel for primary/secondary communication.
@@ -742,5 +747,8 @@ int eal_asprintf(char **buffer, const char *format, ...);
 #define asprintf(buffer, format, ...) \
 		eal_asprintf(buffer, format, ##__VA_ARGS__)
 #endif
+
+#define EAL_LOG(level, ...) \
+	RTE_LOG_LINE(level, EAL, "" __VA_ARGS__)
 
 #endif /* _EAL_PRIVATE_H_ */

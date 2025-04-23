@@ -20,12 +20,10 @@ extern "C" {
 
 /* Power Management Environment State */
 enum power_management_env {PM_ENV_NOT_SET, PM_ENV_ACPI_CPUFREQ, PM_ENV_KVM_VM,
-		PM_ENV_PSTATE_CPUFREQ, PM_ENV_CPPC_CPUFREQ};
+		PM_ENV_PSTATE_CPUFREQ, PM_ENV_CPPC_CPUFREQ,
+		PM_ENV_AMD_PSTATE_CPUFREQ};
 
 /**
- * @warning
- * @b EXPERIMENTAL: this API may change, or be removed, without prior notice
- *
  * Check if a specific power management environment type is supported on a
  * currently running system.
  *
@@ -37,7 +35,6 @@ enum power_management_env {PM_ENV_NOT_SET, PM_ENV_ACPI_CPUFREQ, PM_ENV_KVM_VM,
  *   - 0 if unsupported
  *   - -1 if error, with rte_errno indicating reason for error.
  */
-__rte_experimental
 int rte_power_check_env_supported(enum power_management_env env);
 
 /**
@@ -169,14 +166,6 @@ typedef int (*rte_power_freq_change_t)(unsigned int lcore_id);
  * Scale up the frequency of a specific lcore according to the available
  * frequencies.
  * Review each environments specific documentation for usage.
- *
- * @param lcore_id
- *  lcore id.
- *
- * @return
- *  - 1 on success with frequency changed.
- *  - 0 on success without frequency changed.
- *  - Negative on error.
  */
 extern rte_power_freq_change_t rte_power_freq_up;
 
@@ -184,30 +173,13 @@ extern rte_power_freq_change_t rte_power_freq_up;
  * Scale down the frequency of a specific lcore according to the available
  * frequencies.
  * Review each environments specific documentation for usage.
- *
- * @param lcore_id
- *  lcore id.
- *
- * @return
- *  - 1 on success with frequency changed.
- *  - 0 on success without frequency changed.
- *  - Negative on error.
  */
-
 extern rte_power_freq_change_t rte_power_freq_down;
 
 /**
  * Scale up the frequency of a specific lcore to the highest according to the
  * available frequencies.
  * Review each environments specific documentation for usage.
- *
- * @param lcore_id
- *  lcore id.
- *
- * @return
- *  - 1 on success with frequency changed.
- *  - 0 on success without frequency changed.
- *  - Negative on error.
  */
 extern rte_power_freq_change_t rte_power_freq_max;
 
@@ -215,54 +187,24 @@ extern rte_power_freq_change_t rte_power_freq_max;
  * Scale down the frequency of a specific lcore to the lowest according to the
  * available frequencies.
  * Review each environments specific documentation for usage..
- *
- * @param lcore_id
- *  lcore id.
- *
- * @return
- *  - 1 on success with frequency changed.
- *  - 0 on success without frequency changed.
- *  - Negative on error.
  */
 extern rte_power_freq_change_t rte_power_freq_min;
 
 /**
  * Query the Turbo Boost status of a specific lcore.
  * Review each environments specific documentation for usage..
- *
- * @param lcore_id
- *  lcore id.
- *
- * @return
- *  - 1 Turbo Boost is enabled for this lcore.
- *  - 0 Turbo Boost is disabled for this lcore.
- *  - Negative on error.
  */
 extern rte_power_freq_change_t rte_power_turbo_status;
 
 /**
  * Enable Turbo Boost for this lcore.
  * Review each environments specific documentation for usage..
- *
- * @param lcore_id
- *  lcore id.
- *
- * @return
- *  - 0 on success.
- *  - Negative on error.
  */
 extern rte_power_freq_change_t rte_power_freq_enable_turbo;
 
 /**
  * Disable Turbo Boost for this lcore.
  * Review each environments specific documentation for usage..
- *
- * @param lcore_id
- *  lcore id.
- *
- * @return
- *  - 0 on success.
- *  - Negative on error.
  */
 extern rte_power_freq_change_t rte_power_freq_disable_turbo;
 
@@ -270,10 +212,8 @@ extern rte_power_freq_change_t rte_power_freq_disable_turbo;
  * Power capabilities summary.
  */
 struct rte_power_core_capabilities {
-	RTE_STD_C11
 	union {
 		uint64_t capabilities;
-		RTE_STD_C11
 		struct {
 			uint64_t turbo:1;	/**< Turbo can be enabled. */
 			uint64_t priority:1;	/**< SST-BF high freq core */

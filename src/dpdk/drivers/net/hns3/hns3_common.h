@@ -2,8 +2,8 @@
  * Copyright(C) 2021 HiSilicon Limited
  */
 
-#ifndef _HNS3_COMMON_H_
-#define _HNS3_COMMON_H_
+#ifndef HNS3_COMMON_H
+#define HNS3_COMMON_H
 
 #include <sys/time.h>
 
@@ -26,6 +26,8 @@ enum {
 #define HNS3_DEVARG_DEV_CAPS_MASK	"dev_caps_mask"
 
 #define HNS3_DEVARG_MBX_TIME_LIMIT_MS	"mbx_time_limit_ms"
+
+#define HNS3_DEVARG_FDIR_VALN_MATCH_MODE	"fdir_vlan_match_mode"
 
 #define MSEC_PER_SEC              1000L
 #define USEC_PER_MSEC             1000L
@@ -60,5 +62,7 @@ void hns3_unmap_rx_interrupt(struct rte_eth_dev *dev);
 int hns3_restore_rx_interrupt(struct hns3_hw *hw);
 
 int hns3_get_pci_revision_id(struct hns3_hw *hw, uint8_t *revision_id);
+void hns3_set_default_dev_specifications(struct hns3_hw *hw);
+int hns3_query_dev_specifications(struct hns3_hw *hw);
 
-#endif /* _HNS3_COMMON_H_ */
+#endif /* HNS3_COMMON_H */

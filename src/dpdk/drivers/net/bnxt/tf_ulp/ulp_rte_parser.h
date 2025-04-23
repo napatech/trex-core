@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(c) 2014-2021 Broadcom
+ * Copyright(c) 2014-2023 Broadcom
  * All rights reserved.
  */
 
@@ -95,11 +95,6 @@ int32_t
 ulp_rte_port_hdr_handler(const struct rte_flow_item *item,
 			 struct ulp_rte_parser_params *params);
 
-/* Function to handle the parsing of RTE Flow item port Header. */
-int32_t
-ulp_rte_phy_port_hdr_handler(const struct rte_flow_item *item,
-			     struct ulp_rte_parser_params *params);
-
 /* Function to handle the RTE item Ethernet Header. */
 int32_t
 ulp_rte_eth_hdr_handler(const struct rte_flow_item *item,
@@ -152,6 +147,11 @@ ulp_rte_icmp_hdr_handler(const struct rte_flow_item *item,
 /* Function to handle the parsing of RTE Flow item ICMP6 Header. */
 int32_t
 ulp_rte_icmp6_hdr_handler(const struct rte_flow_item *item,
+			  struct ulp_rte_parser_params *params);
+
+/* Function to handle the parsing of RTE Flow item ECPRI Header. */
+int32_t
+ulp_rte_ecpri_hdr_handler(const struct rte_flow_item *item,
 			  struct ulp_rte_parser_params *params);
 
 /* Function to handle the parsing of RTE Flow item void Header. */
@@ -209,11 +209,6 @@ int32_t
 ulp_rte_port_act_handler(const struct rte_flow_action *act_item,
 			 struct ulp_rte_parser_params *params);
 
-/* Function to handle the parsing of RTE Flow action phy_port. */
-int32_t
-ulp_rte_phy_port_act_handler(const struct rte_flow_action *action_item,
-			     struct ulp_rte_parser_params *params);
-
 /* Function to handle the parsing of RTE Flow action pop vlan. */
 int32_t
 ulp_rte_of_pop_vlan_act_handler(const struct rte_flow_action *action_item,
@@ -258,6 +253,15 @@ ulp_rte_set_tp_dst_act_handler(const struct rte_flow_action *action_item,
 int32_t
 ulp_rte_dec_ttl_act_handler(const struct rte_flow_action *action_item,
 			    struct ulp_rte_parser_params *params);
+/* Function to handle the parsing of RTE Flow action set mac src.*/
+int32_t
+ulp_rte_set_mac_src_act_handler(const struct rte_flow_action *action_item,
+				struct ulp_rte_parser_params *params);
+
+/* Function to handle the parsing of RTE Flow action set mac dst.*/
+int32_t
+ulp_rte_set_mac_dst_act_handler(const struct rte_flow_action *action_item,
+				struct ulp_rte_parser_params *params);
 
 /* Function to handle the parsing of RTE Flow action JUMP .*/
 int32_t
@@ -269,7 +273,7 @@ ulp_rte_sample_act_handler(const struct rte_flow_action *action_item,
 			   struct ulp_rte_parser_params *params);
 
 int32_t
-ulp_rte_shared_act_handler(const struct rte_flow_action *action_item,
+ulp_rte_action_hdlr_handler(const struct rte_flow_action *action_item,
 			   struct ulp_rte_parser_params *params);
 
 int32_t
@@ -280,4 +284,22 @@ int32_t
 ulp_rte_vendor_vxlan_decap_hdr_handler(const struct rte_flow_item *item,
 				       struct ulp_rte_parser_params *params);
 
+int32_t
+ulp_rte_queue_act_handler(const struct rte_flow_action *act_item,
+			  struct ulp_rte_parser_params *param);
+
+/* Function to handle the parsing of RTE Flow action set mac src.*/
+int32_t
+ulp_rte_set_mac_src_act_handler(const struct rte_flow_action *action_item,
+				struct ulp_rte_parser_params *params);
+
+/* Function to handle the parsing of RTE Flow action set mac dst.*/
+int32_t
+ulp_rte_set_mac_dst_act_handler(const struct rte_flow_action *action_item,
+				struct ulp_rte_parser_params *params);
+
+/* Function to handle the parsing of RTE Flow action meter. */
+int32_t
+ulp_rte_meter_act_handler(const struct rte_flow_action *action_item,
+			  struct ulp_rte_parser_params *params);
 #endif /* _ULP_RTE_PARSER_H_ */
