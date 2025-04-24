@@ -45,6 +45,7 @@ drivers = [
         'nfb',
         'nfp',
         'ngbe',
+	'ntacc',
         'null',
         'octeontx',
         'octeon_ep',
