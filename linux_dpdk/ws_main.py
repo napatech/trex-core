@@ -151,6 +151,7 @@ def options(opt):
     opt.add_option('--with-ntacc', dest='with_ntacc', default=False, action='store_true', help="Use Napatech dpdk driver. Use with ./b configure --with-ntacc.")    
     opt.add_option('--with-bird', default=False, action='store_true', help="Build Bird server. Use with ./b configure --with-bird.")
     opt.add_option('--new-memory', default=False, action='store_true', help="Build by new DPDK memory subsystem.")
+    opt.add_option('--with-archive', default=False, action='store_true', help="Build with lib archive")
     opt.add_option('--no-ver', action = 'store_true', help = "Don't update version file.")
     opt.add_option('--no-old', action = 'store_true', help = "Don't build old targets.")
     opt.add_option('--private', dest='private', action = 'store_true', help = "private publish, do not replace latest/be_latest image with this image")
@@ -597,28 +598,6 @@ def configure_mlx5 (ctx):
         'enum','MLX5_OPCODE_ACCESS_ASO' ],
 
 
-        [ 'HAVE_SUPPORTED_40000baseKR4_Full', 'linux/ethtool.h',
-        'define', 'SUPPORTED_40000baseKR4_Full' ],
-        [ 'HAVE_SUPPORTED_40000baseCR4_Full', 'linux/ethtool.h',
-        'define', 'SUPPORTED_40000baseCR4_Full' ],
-        [ 'HAVE_SUPPORTED_40000baseSR4_Full', 'linux/ethtool.h',
-        'define', 'SUPPORTED_40000baseSR4_Full' ],
-        [ 'HAVE_SUPPORTED_40000baseLR4_Full', 'linux/ethtool.h',
-        'define', 'SUPPORTED_40000baseLR4_Full' ],
-        [ 'HAVE_SUPPORTED_56000baseKR4_Full', 'linux/ethtool.h',
-        'define', 'SUPPORTED_56000baseKR4_Full' ],
-        [ 'HAVE_SUPPORTED_56000baseCR4_Full', 'linux/ethtool.h',
-        'define', 'SUPPORTED_56000baseCR4_Full' ],
-        [ 'HAVE_SUPPORTED_56000baseSR4_Full', 'linux/ethtool.h',
-        'define', 'SUPPORTED_56000baseSR4_Full' ],
-        [ 'HAVE_SUPPORTED_56000baseLR4_Full', 'linux/ethtool.h',
-        'define', 'SUPPORTED_56000baseLR4_Full' ],
-        [ 'HAVE_ETHTOOL_LINK_MODE_25G', 'linux/ethtool.h',
-        'enum', 'ETHTOOL_LINK_MODE_25000baseCR_Full_BIT' ],
-        [ 'HAVE_ETHTOOL_LINK_MODE_50G', 'linux/ethtool.h',
-        'enum', 'ETHTOOL_LINK_MODE_50000baseCR2_Full_BIT' ],
-        [ 'HAVE_ETHTOOL_LINK_MODE_100G', 'linux/ethtool.h',
-        'enum', 'ETHTOOL_LINK_MODE_100000baseKR4_Full_BIT' ],
         [ 'HAVE_IFLA_NUM_VF', 'linux/if_link.h',
         'enum', 'IFLA_NUM_VF' ],
         [ 'HAVE_IFLA_EXT_MASK', 'linux/if_link.h',
@@ -655,6 +634,36 @@ def configure_mlx5 (ctx):
         'func','mlx5dv_dr_domain_set_reclaim_device_memory'],
         [ 'HAVE_MLX5_DR_CREATE_ACTION_FLOW_SAMPLE', 'infiniband/mlx5dv.h',
         'func','mlx5dv_dr_action_create_flow_sampler'],
+        [ 'HAVE_MLX5DV_FLOW_MATCHER_FT_TYPE', 'infiniband/mlx5dv.h',
+        'field', 'struct mlx5dv_flow_matcher_attr.ft_type' ],
+        [ 'HAVE_IBV_FLOW_SPEC_ESP', 'infiniband/verbs.h',
+        'enum', 'IBV_FLOW_SPEC_ESP' ],
+        [ 'HAVE_IBV_RX_HASH_IPSEC_SPI', 'infiniband/verbs.h',
+        'enum', 'IBV_RX_HASH_IPSEC_SPI' ],
+        [ 'HAVE_MLX5DV_DR_DEVX_PORT_V35', 'infiniband/mlx5dv.h',
+        'func', 'mlx5dv_query_port' ],
+        [ 'HAVE_MLX5DV_DR_CREATE_DEST_IB_PORT', 'infiniband/mlx5dv.h',
+        'func', 'mlx5dv_dr_action_create_dest_ib_port' ],
+        [ 'HAVE_RDMA_NLDEV_ATTR_PORT_STATE', 'rdma/rdma_netlink.h',
+        'enum', 'RDMA_NLDEV_ATTR_PORT_STATE' ],
+        [ 'HAVE_MLX5_UMR_IMKEY', 'infiniband/mlx5dv.h',
+        'enum', 'MLX5_WQE_UMR_CTRL_FLAG_INLINE' ],
+        [ 'HAVE_MLX5_DR_FLOW_DUMP_RULE', 'infiniband/mlx5dv.h',
+        'func', 'mlx5dv_dump_dr_rule' ],
+        [ 'HAVE_MLX5_DR_ACTION_ASO_CT', 'infiniband/mlx5dv.h',
+        'enum', 'MLX5DV_DR_ACTION_FLAGS_ASO_CT_DIRECTION_INITIATOR' ],
+        [ 'HAVE_MLX5_DR_ALLOW_DUPLICATE', 'infiniband/mlx5dv.h',
+        'func', 'mlx5dv_dr_domain_allow_duplicate_rules' ],
+        [ 'HAVE_MLX5_IBV_REG_MR_IOVA', 'infiniband/verbs.h',
+        'func', 'ibv_reg_mr_iova' ],
+        [ 'HAVE_MLX5_IBV_IMPORT_CTX_PD_AND_MR', 'infiniband/verbs.h',
+        'type', 'ibv_import_device' ],
+        [ 'HAVE_MLX5DV_DR_ACTION_CREATE_DEST_ROOT_TABLE', 'infiniband/mlx5dv.h',
+        'func', 'mlx5dv_dr_action_create_dest_root_table' ],
+        [ 'HAVE_MLX5DV_CREATE_STEERING_ANCHOR', 'infiniband/mlx5dv.h',
+        'func', 'mlx5dv_create_steering_anchor'],
+        [ 'HAVE_IBV_FORK_UNNEEDED', 'infiniband/verbs.h',
+        'func', 'ibv_is_fork_initialized'],
 
     ]
     autoconf_script = 'src/dpdk/auto-config-h.sh'
@@ -830,6 +839,7 @@ def configure(conf):
     with_sanitized  = conf.options.sanitized
     new_memory      = conf.options.new_memory
     
+    
     configure_sanitized(conf, with_sanitized)
             
     conf.env.NO_MLX = no_mlx
@@ -887,8 +897,9 @@ def configure(conf):
         write_file(os.path.join(conf.bldnode.abspath(), H_DPDK_CONFIG), s)
 
     conf.env.DPDK_WITH_ARCHIVE = False
-    if conf.check_cxx(lib = 'archive', errmsg = 'Could not find libarchive', mandatory = False):
-        conf.env.DPDK_WITH_ARCHIVE = True
+    if conf.options.with_archive:
+       if conf.check_cxx(lib = 'archive', errmsg = 'Could not find libarchive', mandatory = False):
+           conf.env.DPDK_WITH_ARCHIVE = True
 
 def search_in_paths(paths):
     for path in paths:
@@ -1394,6 +1405,15 @@ dpdk_src_x86_64 = SrcGroup(dir='src/dpdk/',
                  'drivers/net/failsafe/failsafe_flow.c',
                  'drivers/net/failsafe/failsafe_intr.c',
 
+                 #gve
+                 'drivers/net/gve/base/gve_adminq.c',
+                 'drivers/net/gve/gve_rx.c',
+                 'drivers/net/gve/gve_tx.c',
+                 'drivers/net/gve/gve_rx_dqo.c',
+                 'drivers/net/gve/gve_tx_dqo.c',
+                 'drivers/net/gve/gve_ethdev.c',
+                 'drivers/net/gve/gve_version.c',
+                 'drivers/net/gve/gve_rss.c',
 
                  #vdev_netvsc
                  'drivers/net/vdev_netvsc/vdev_netvsc.c',
@@ -2147,6 +2167,8 @@ dpdk_includes_path =''' ../src/
                         ../src/dpdk/drivers/net/enic/base/
                         ../src/dpdk/drivers/net/i40e/
                         ../src/dpdk/drivers/net/i40e/base/
+                        ../src/dpdk/drivers/net/gve/
+                        ../src/dpdk/drivers/net/gve/base/
                         ../src/dpdk/drivers/net/ixgbe/
                         ../src/dpdk/drivers/net/ixgbe/base/
                         ../src/dpdk/drivers/net/igc/
