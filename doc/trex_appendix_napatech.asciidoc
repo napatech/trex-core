@@ -406,3 +406,6 @@ start -p 0 3 -m 99.9% -f stl/bench.py -t size=64
 Results summary:
 
 image:images/napa_table.png[title="Napatech performance summary",align="center"]
+
+=== Advanced Statefull
+In order for advanced statefull til work, promiscuous mode must be enabled by using the --prom commandline option.
