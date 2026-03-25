@@ -20,7 +20,7 @@ _iavf_rxq_rearm(struct ci_rx_queue *rxq)
 	uint16_t rx_id;
 
 	volatile union ci_rx_desc *rxdp;
-	struct rte_mbuf **rxp = &rxq->sw_ring[rxq->rxrearm_start];
+	struct rte_mbuf **rxp = (struct rte_mbuf **)&rxq->sw_ring[rxq->rxrearm_start];
 	struct rte_mbuf *mb0, *mb1;
 	__m128i hdr_room = _mm_set_epi64x(RTE_PKTMBUF_HEADROOM,
 			RTE_PKTMBUF_HEADROOM);

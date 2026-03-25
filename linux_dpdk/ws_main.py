@@ -59,7 +59,9 @@ gcc_flags = ['-Wall',
              '-Wno-sign-compare',
              '-Wno-strict-aliasing',
              '-mrtm',
-             '-Wno-address-of-packed-member']
+             '-Wno-address-of-packed-member',
+             '-Wno-maybe-uninitialized',
+             '-Wno-dangling-pointer']
 
 
 

@@ -2286,6 +2286,8 @@ struct rte_eth_fdir_conf {
 	struct rte_eth_fdir_flex_conf flex_conf;
 };
 
+#endif
+
 /**
  * @internal
  * Fetch from the driver what kind of configuration must be restored by ethdev layer,
@@ -2306,8 +2308,6 @@ __rte_internal
 uint64_t
 rte_eth_get_restore_flags(struct rte_eth_dev *dev,
 			  enum rte_eth_dev_operation op);
-
-#endif
 
 #ifdef __cplusplus
 }
