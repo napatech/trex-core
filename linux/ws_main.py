@@ -531,7 +531,9 @@ cxxflags_base =['-DWIN_UCODE_SIM',
                 '-std=c++0x',
                 '-Wno-sign-compare',
                 '-Wno-strict-aliasing',
-                 '-Wno-address-of-packed-member',]
+                 '-Wno-address-of-packed-member',
+                 '-Wno-maybe-uninitialized',
+                 '-Wno-dangling-pointer',]
 
 cflags_base   =['-DWIN_UCODE_SIM',
                 '-DTREX_SIM',

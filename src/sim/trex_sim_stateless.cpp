@@ -111,7 +111,7 @@ public:
         return true;
     }
 
-    void Delete() {
+    void Delete(int timeout_sec = 0) {
 
     }
 
