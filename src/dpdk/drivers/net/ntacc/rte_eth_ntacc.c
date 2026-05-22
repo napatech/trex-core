@@ -99,7 +99,7 @@ struct supportedDriver_s supportedDriver = {3, 11, 0};
 #define PCI_DEVICE_ID_NT40A11  0x0225
 #define PCI_DEVICE_ID_NT400D13 0x0295
 #define PCI_DEVICE_ID_F2070    0x0255
-#define PCI_DEVICE_ID_F3070    0x0415
+#define PCI_DEVICE_ID_F3070    0x0285
 
 
 #define PCI_VENDOR_ID_INTEL          0x8086
